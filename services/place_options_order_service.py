@@ -22,6 +22,7 @@ from database.settings_db import get_analyze_mode
 from extensions import socketio
 from services.option_symbol_service import get_option_symbol
 from services.place_order_service import place_order
+from services.quotes_service import get_quotes
 from services.telegram_alert_service import telegram_alert_service
 from utils.logging import get_logger
 
@@ -30,6 +31,10 @@ logger = get_logger(__name__)
 
 # Maximum number of split orders allowed
 MAX_SPLIT_ORDERS = 100
+
+# Maximum adjustment limits for price discovery
+MAX_ADJUSTMENT_PERCENT = 10.0
+MAX_ADJUSTMENT_ABSOLUTE = 10.0
 
 
 # Get rate limit from environment (default: 10 per second)
@@ -210,6 +215,7 @@ def place_options_order(
         resolved_symbol = symbol_response.get("symbol")
         resolved_exchange = symbol_response.get("exchange")
         underlying_ltp = symbol_response.get("underlying_ltp")
+        tick_size = symbol_response.get("tick_size", 0.05)  # Get tick_size with fallback
 
         if not resolved_symbol or not resolved_exchange:
             return (
@@ -223,8 +229,161 @@ def place_options_order(
 
         logger.info(
             f"Resolved option symbol: {resolved_symbol} on {resolved_exchange}, "
-            f"Underlying LTP: {underlying_ltp}"
+            f"Underlying LTP: {underlying_ltp}, Tick Size: {tick_size}"
         )
+
+        # Price Discovery: If pricetype is LIMIT and price is 0.0, fetch option LTP
+        pricetype = options_data.get("pricetype", "MARKET")
+        price = options_data.get("price", 0.0)
+        action = options_data.get("action", "BUY").upper()
+
+        if pricetype == "LIMIT" and price == 0.0:
+            logger.info(f"Price discovery triggered for {resolved_symbol}")
+
+            # Fetch option quotes (includes LTP, bid, ask)
+            success, quote_response, status_code = get_quotes(
+                symbol=resolved_symbol, exchange=resolved_exchange, api_key=symbol_api_key
+            )
+
+            if not success:
+                error_msg = quote_response.get("message", "Unknown error")
+                logger.error(f"Price discovery failed for {resolved_symbol}: {error_msg}")
+                return (
+                    False,
+                    {
+                        "status": "error",
+                        "message": f"Failed to fetch option price for {resolved_symbol}. {error_msg}",
+                    },
+                    status_code,
+                )
+
+            # Extract quote data
+            option_ltp = quote_response.get("data", {}).get("ltp")
+            option_bid = quote_response.get("data", {}).get("bid", 0)
+            option_ask = quote_response.get("data", {}).get("ask", 0)
+
+            # Log quote data for audit trail
+            logger.info(
+                f"PRICE_DISCOVERY_QUOTES: symbol={resolved_symbol}, "
+                f"ltp={option_ltp}, bid={option_bid}, ask={option_ask}, action={action}"
+            )
+
+            # Determine base price based on action
+            # BUY: Use ask price (what sellers are asking)
+            # SELL: Use bid price (what buyers are bidding)
+            if action == "BUY":
+                if option_ask and option_ask > 0:
+                    base_price = option_ask
+                    price_source = "ask"
+                else:
+                    # Fallback to LTP if ask not available
+                    base_price = option_ltp
+                    price_source = "ltp_fallback"
+            else:  # SELL
+                if option_bid and option_bid > 0:
+                    base_price = option_bid
+                    price_source = "bid"
+                else:
+                    # Fallback to LTP if bid not available
+                    base_price = option_ltp
+                    price_source = "ltp_fallback"
+
+            if not base_price or base_price <= 0:
+                logger.error(f"Invalid base price for {resolved_symbol}: {base_price}")
+                return (
+                    False,
+                    {"status": "error", "message": f"Invalid option price received: {base_price}"},
+                    400,
+                )
+
+            # Get adjustment parameters
+            adjustment_type = options_data.get("price_adjustment_type")
+            adjustment_value = options_data.get("price_adjustment_value", 0.0)
+
+            # Validate adjustment limits
+            if adjustment_type == "percentage":
+                if adjustment_value > MAX_ADJUSTMENT_PERCENT:
+                    return (
+                        False,
+                        {
+                            "status": "error",
+                            "message": f"Adjustment value {adjustment_value}% exceeds maximum allowed {MAX_ADJUSTMENT_PERCENT}%",
+                        },
+                        400,
+                    )
+            elif adjustment_type == "absolute":
+                if adjustment_value > MAX_ADJUSTMENT_ABSOLUTE:
+                    return (
+                        False,
+                        {
+                            "status": "error",
+                            "message": f"Absolute adjustment value {adjustment_value} exceeds maximum allowed {MAX_ADJUSTMENT_ABSOLUTE}",
+                        },
+                        400,
+                    )
+
+            # Log adjustment parameters for audit trail
+            logger.info(
+                f"PRICE_DISCOVERY_ADJUSTMENT: symbol={resolved_symbol}, "
+                f"adjustment_type={adjustment_type}, adjustment_value={adjustment_value}, "
+                f"base_price={base_price}, price_source={price_source}"
+            )
+
+            # Apply adjustment to base price
+            if adjustment_type == "percentage":
+                # BUY: Add premium (pay more), SELL: Reduce price (receive less)
+                if action == "BUY":
+                    discovered_price = base_price * (1 + adjustment_value / 100)
+                else:  # SELL
+                    discovered_price = base_price * (1 - adjustment_value / 100)
+            elif adjustment_type == "absolute":
+                # BUY: Add amount, SELL: Subtract amount
+                if action == "BUY":
+                    discovered_price = base_price + adjustment_value
+                else:  # SELL
+                    discovered_price = base_price - adjustment_value
+            else:
+                # No adjustment
+                discovered_price = base_price
+
+            # Round to tick size from database
+            if tick_size and tick_size > 0:
+                discovered_price = round(discovered_price / tick_size) * tick_size
+            else:
+                # Fallback to 2 decimal places if tick_size not available
+                discovered_price = round(discovered_price, 2)
+
+            # Validate final price
+            if discovered_price <= 0:
+                logger.error(
+                    f"Invalid discovered price for {resolved_symbol}: {discovered_price} "
+                    f"(Base: {base_price}, Action: {action}, Adjustment: {adjustment_type}:{adjustment_value})"
+                )
+                return (
+                    False,
+                    {
+                        "status": "error",
+                        "message": f"Invalid discovered price: {discovered_price}. "
+                        f"Adjustment too large for {action} order.",
+                    },
+                    400,
+                )
+
+            # Override price parameter with discovered price
+            options_data["price"] = discovered_price
+
+            # Log final result for audit trail
+            logger.info(
+                f"PRICE_DISCOVERY_COMPLETE: symbol={resolved_symbol}, action={action}, "
+                f"base_price={base_price}, price_source={price_source}, "
+                f"adjustment_type={adjustment_type}, adjustment_value={adjustment_value}, "
+                f"tick_size={tick_size}, final_price={discovered_price}"
+            )
+        else:
+            logger.debug(
+                f"Price discovery not needed: pricetype={pricetype}, price={price} "
+                f"(discovery only for LIMIT orders with price=0.0)"
+            )
 
         # Check if split order is requested
         splitsize = options_data.get("splitsize", 0) or 0

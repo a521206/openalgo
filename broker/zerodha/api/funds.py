@@ -36,6 +36,7 @@ def get_margin_data(auth_token):
         logger.error(f"Error fetching margin data: {error_message}")
         return {}
 
+    logger.debug(f"Funds Details: {margin_data}")
     if margin_data.get("status") == "error":
         logger.error(f"Error fetching margin data: {margin_data.get('errors')}")
         return {}

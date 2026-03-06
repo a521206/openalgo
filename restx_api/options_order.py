@@ -7,6 +7,15 @@ Places option orders by resolving option symbol based on underlying and offset,
 then placing the order. Works in both live and analyze (sandbox) mode.
 Supports order splitting via optional splitsize parameter.
 
+PRICE DISCOVERY FEATURE:
+For LIMIT orders, set price=0.0 to automatically fetch the option's current market data
+and use bid/ask prices for better fill rates. Optionally apply adjustments.
+
+Price Discovery Behavior:
+- BUY orders: Uses ask price (what sellers are asking) + adjustment
+- SELL orders: Uses bid price (what buyers are bidding) - adjustment
+- Falls back to LTP if bid/ask not available
+
 Request Body:
 {
     "apikey": "your_api_key",
@@ -22,10 +31,35 @@ Request Body:
     "splitsize": 0,  // Optional: If > 0, splits order into multiple orders of this size
     "pricetype": "MARKET",  // or "LIMIT", "SL", "SL-M"
     "product": "MIS",  // or "NRML"
-    "price": 0.0,  // For LIMIT orders
+    "price": 0.0,  // For LIMIT orders. Set to 0.0 to trigger automatic price discovery
     "trigger_price": 0.0,  // For SL/SL-M orders
-    "disclosed_quantity": 0
+    "disclosed_quantity": 0,
+
+    // PRICE DISCOVERY ADJUSTMENT (Optional - only used when price=0.0 and pricetype=LIMIT)
+    "price_adjustment_type": "percentage",  // "percentage" or "absolute" or null (default: "percentage")
+    "price_adjustment_value": 2.0           // Adjustment amount (0-10, default: 2.0)
+                                            // BUY: adds to base price, SELL: subtracts from base price
 }
+
+Price Discovery Examples:
+1. BUY with defaults: price=0.0
+   → Uses ask price + 2% adjustment
+   → If ask=102, final price = 102 + 2% = 104.04
+
+2. SELL with defaults: price=0.0
+   → Uses bid price - 2% adjustment
+   → If bid=98, final price = 98 - 2% = 96.04
+
+3. No adjustment: price=0.0, price_adjustment_type=null, price_adjustment_value=0.0
+   → BUY: Uses ask price directly, SELL: Uses bid price directly
+
+4. BUY with ₹5 premium: price=0.0, price_adjustment_type="absolute", price_adjustment_value=5.0
+   → If ask=100, final price = 100 + 5 = 105
+
+5. SELL with ₹5 discount: price=0.0, price_adjustment_type="absolute", price_adjustment_value=5.0
+   → If bid=100, final price = 100 - 5 = 95
+
+Note: Adjustment value is capped at 10 (10% for percentage, ₹10 for absolute).
 
 Response (Success - Live Mode - Regular Order):
 {

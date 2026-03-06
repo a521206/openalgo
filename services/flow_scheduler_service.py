@@ -228,6 +228,7 @@ class FlowScheduler:
         """Shutdown the scheduler"""
         if self._scheduler:
             self._scheduler.shutdown(wait=False)
+            self._scheduler = None
             self._initialized = False
             logger.info("Flow Scheduler shutdown")
 

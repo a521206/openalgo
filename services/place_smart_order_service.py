@@ -9,6 +9,12 @@ from database.apilog_db import async_log_order, executor
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
 from extensions import socketio
+from services.quotes_service import get_quotes
+from services.smart_trade_rules_service import (
+    PositionFetchResult,
+    PositionFetchStatus,
+    validate_against_smart_trade_rules,
+)
 from services.telegram_alert_service import telegram_alert_service
 from utils.api_analyzer import analyze_request, generate_order_id
 from utils.constants import (
@@ -25,6 +31,10 @@ logger = get_logger(__name__)
 
 # Smart order delay
 SMART_ORDER_DELAY = "0.5"  # Default value, can be overridden by environment variable
+
+# Position fetch configuration
+POSITION_FETCH_MAX_RETRIES = 2
+POSITION_FETCH_RETRY_DELAY = 0.5
 
 
 def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dict[str, Any]:
@@ -74,6 +84,63 @@ def import_broker_module(broker_name: str) -> Any | None:
     except ImportError as error:
         logger.error(f"Error importing broker module '{module_path}': {error}")
         return None
+
+
+def _fetch_position_for_validation(
+    broker: str,
+    order_data: dict[str, Any],
+    auth_token: str,
+) -> PositionFetchResult:
+    """
+    Fetch current position with retry logic and proper error handling.
+
+    Args:
+        broker: Broker name
+        order_data: Order data containing symbol, exchange, product_type
+        auth_token: Broker authentication token
+
+    Returns:
+        PositionFetchResult with quantity, status, and error message
+    """
+    broker_module = import_broker_module(broker)
+
+    if not broker_module or not hasattr(broker_module, "get_open_position"):
+        logger.info(f"Broker {broker} does not support position fetching")
+        return PositionFetchResult(
+            quantity=0,
+            status=PositionFetchStatus.NOT_SUPPORTED,
+            error_message="Position fetch not supported for this broker",
+        )
+
+    last_error = None
+    for attempt in range(POSITION_FETCH_MAX_RETRIES + 1):
+        try:
+            position_qty_str = broker_module.get_open_position(
+                order_data.get("symbol"),
+                order_data.get("exchange"),
+                order_data.get("product_type"),
+                auth_token,
+            )
+            quantity = int(position_qty_str) if position_qty_str else 0
+            logger.debug(
+                f"Position fetch successful: {quantity} for {order_data.get('symbol')}"
+            )
+            return PositionFetchResult(quantity=quantity, status=PositionFetchStatus.SUCCESS)
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"Position fetch attempt {attempt + 1} failed for {order_data.get('symbol')}: {e}"
+            )
+            if attempt < POSITION_FETCH_MAX_RETRIES:
+                time.sleep(POSITION_FETCH_RETRY_DELAY)
+
+    # All retries failed
+    logger.error(
+        f"Position fetch failed after {POSITION_FETCH_MAX_RETRIES + 1} attempts: {last_error}"
+    )
+    return PositionFetchResult(
+        quantity=0, status=PositionFetchStatus.FAILED, error_message=str(last_error)
+    )
 
 
 def validate_smart_order(order_data: dict[str, Any]) -> tuple[bool, str | None]:
@@ -147,9 +214,28 @@ def place_smart_order_with_auth(
     # Validate order data
     is_valid, error_message = validate_smart_order(order_data)
     if not is_valid:
+        # Provide fallback for error_message if None
+        error_msg = error_message or "Validation failed"
         if get_analyze_mode():
-            return False, emit_analyzer_error(original_data, error_message), 400
-        error_response = {"status": "error", "message": error_message}
+            return False, emit_analyzer_error(original_data, error_msg), 400
+        error_response = {"status": "error", "message": error_msg}
+        executor.submit(async_log_order, "placesmartorder", original_data, error_response)
+        return False, error_response, 400
+
+    # Get current position with fail-safe handling
+    position_result = _fetch_position_for_validation(broker, order_data, auth_token)
+
+    # Validate against smart trade rules
+    is_valid, error_message = validate_against_smart_trade_rules(
+        order_data, position_result, broker
+    )
+
+    if not is_valid:
+        # Provide fallback for error_message if None
+        error_msg = error_message or "Validation failed"
+        if get_analyze_mode():
+            return False, emit_analyzer_error(original_data, error_msg), 400
+        error_response = {"status": "error", "message": error_msg}
         executor.submit(async_log_order, "placesmartorder", original_data, error_response)
         return False, error_response, 400
 
@@ -200,6 +286,50 @@ def place_smart_order_with_auth(
         error_response = {"status": "error", "message": "Broker-specific module not found"}
         executor.submit(async_log_order, "placesmartorder", original_data, error_response)
         return False, error_response, 404
+
+    # Price Discovery: If pricetype is LIMIT and price is 0, fetch latest quote
+    pricetype = order_data.get("pricetype", "MARKET")
+    price = order_data.get("price", 0)
+    if pricetype == "LIMIT" and price == 0:
+        action = order_data.get("action", "BUY").upper()
+        logger.info(
+            f"Price discovery triggered for {order_data.get('symbol')} "
+            f"on {order_data.get('exchange')}"
+        )
+        
+        api_key = original_data.get("apikey")
+        success, quote_response, _ = get_quotes(
+            symbol=order_data.get("symbol"),
+            exchange=order_data.get("exchange"),
+            api_key=api_key,
+        )
+        
+        if success:
+            quote_data = quote_response.get("data", {})
+            quote_ltp = quote_data.get("ltp", 0)
+            quote_bid = quote_data.get("bid", 0)
+            quote_ask = quote_data.get("ask", 0)
+            
+            # BUY: Use ask, SELL: Use bid, fallback to LTP
+            discovered_price = quote_ask if action == "BUY" and quote_ask > 0 else (
+                quote_bid if action == "SELL" and quote_bid > 0 else quote_ltp
+            )
+            
+            if discovered_price and discovered_price > 0:
+                order_data["price"] = discovered_price
+                logger.info(
+                    f"Price discovered for {order_data.get('symbol')}: "
+                    f"{discovered_price} ({action})"
+                )
+            else:
+                logger.warning(
+                    f"Invalid price from quote for {order_data.get('symbol')}: {discovered_price}"
+                )
+        else:
+            logger.warning(
+                f"Price discovery failed for {order_data.get('symbol')}: "
+                f"{quote_response.get('message', 'Unknown error')}"
+            )
 
     try:
         res, response_data, order_id = broker_module.place_smartorder_api(order_data, auth_token)

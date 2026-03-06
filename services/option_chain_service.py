@@ -50,8 +50,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from database.auth_db import get_auth_token_broker
 from database.symbol import SymToken, db_session
 from services.option_symbol_service import (
-    construct_option_symbol,
     find_atm_strike_from_actual,
+    find_option_symbol_by_strike,
+    find_option_symbols_by_strikes_batch,
     get_available_strikes,
     get_option_exchange,
     parse_underlying_symbol,
@@ -124,7 +125,13 @@ def get_option_symbols_for_chain(
     base_symbol: str, expiry_date: str, strikes_with_labels: list[dict[str, Any]], exchange: str
 ) -> list[dict[str, Any]]:
     """
-    Get CE and PE symbols for each strike from database.
+    Get CE and PE symbols for each strike from database using batch query.
+
+    This function uses batch querying to eliminate N+1 query problems.
+    Instead of querying the database for each strike individually, it:
+    1. Extracts all strikes from the input
+    2. Makes a single batch query to fetch all option symbols
+    3. Maps the results back to the original strike list
 
     Args:
         base_symbol: Base symbol (e.g., NIFTY)
@@ -135,80 +142,39 @@ def get_option_symbols_for_chain(
     Returns:
         List of dicts with strike, ce (with label), pe (with label), and metadata
     """
+    # Extract all strikes for batch query
+    strikes = [s["strike"] for s in strikes_with_labels]
+
+    # Single batch query for all strikes (eliminates N+1 problem)
+    batch_results = find_option_symbols_by_strikes_batch(base_symbol, expiry_date, strikes, exchange)
+
+    # Build result list using batch query results
     chain_symbols = []
-
-    # Convert expiry format for database lookup (DDMMMYY -> DD-MMM-YY)
-    # e.g., "28FEB25" -> "28-FEB-25"
-    expiry_db_fmt = f"{expiry_date[:2]}-{expiry_date[2:5]}-{expiry_date[5:]}".upper()
-
     for strike_info in strikes_with_labels:
         strike = strike_info["strike"]
         ce_label = strike_info["ce_label"]
         pe_label = strike_info["pe_label"]
 
-        if exchange.upper() in CRYPTO_EXCHANGES:
-            # CRYPTO canonical format: BTC28FEB2580000CE / BTC28FEB2580000PE
-            # (Indian F&O-style, no dashes — prefix-match on base symbol)
-            underlying_pattern = f"{base_symbol.upper()}%"
-            ce_record = (
-                db_session.query(SymToken)
-                .filter(
-                    SymToken.symbol.like(underlying_pattern),
-                    SymToken.expiry == expiry_db_fmt,
-                    SymToken.strike == strike,
-                    SymToken.instrumenttype == "CE",
-                    SymToken.exchange.in_(CRYPTO_EXCHANGES),
-                )
-                .first()
-            )
-            pe_record = (
-                db_session.query(SymToken)
-                .filter(
-                    SymToken.symbol.like(underlying_pattern),
-                    SymToken.expiry == expiry_db_fmt,
-                    SymToken.strike == strike,
-                    SymToken.instrumenttype == "PE",
-                    SymToken.exchange.in_(CRYPTO_EXCHANGES),
-                )
-                .first()
-            )
-            strike_int = int(strike) if strike == int(strike) else strike
-            ce_symbol = ce_record.symbol if ce_record else f"{base_symbol}-UNKNOWN-{strike_int}-CE"
-            pe_symbol = pe_record.symbol if pe_record else f"{base_symbol}-UNKNOWN-{strike_int}-PE"
-        else:
-            # Construct symbol names (Indian FNO format)
-            ce_symbol = construct_option_symbol(base_symbol, expiry_date, strike, "CE")
-            pe_symbol = construct_option_symbol(base_symbol, expiry_date, strike, "PE")
-
-            # Query database for both CE and PE
-            ce_record = (
-                db_session.query(SymToken)
-                .filter(SymToken.symbol == ce_symbol, SymToken.exchange == exchange)
-                .first()
-            )
-
-            pe_record = (
-                db_session.query(SymToken)
-                .filter(SymToken.symbol == pe_symbol, SymToken.exchange == exchange)
-                .first()
-            )
+        # Get CE and PE data from batch results
+        ce_data = batch_results.get((strike, "CE"), {})
+        pe_data = batch_results.get((strike, "PE"), {})
 
         chain_symbols.append(
             {
                 "strike": strike,
                 "ce": {
-                    "symbol": ce_symbol,
+                    "symbol": ce_data.get("symbol"),
                     "label": ce_label,
-                    "exists": ce_record is not None,
-                    "lotsize": ce_record.lotsize if ce_record else None,
-                    "tick_size": ce_record.tick_size if ce_record else None,
+                    "exists": ce_data.get("exists", False),
+                    "lotsize": ce_data.get("lotsize"),
+                    "tick_size": ce_data.get("tick_size"),
                 },
                 "pe": {
-                    "symbol": pe_symbol,
+                    "symbol": pe_data.get("symbol"),
                     "label": pe_label,
-                    "exists": pe_record is not None,
-                    "lotsize": pe_record.lotsize if pe_record else None,
-                    "tick_size": pe_record.tick_size if pe_record else None,
+                    "exists": pe_data.get("exists", False),
+                    "lotsize": pe_data.get("lotsize"),
+                    "tick_size": pe_data.get("tick_size"),
                 },
             }
         )

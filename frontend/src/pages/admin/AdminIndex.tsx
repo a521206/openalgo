@@ -62,6 +62,15 @@ export default function AdminIndex() {
       color: 'bg-purple-500',
     },
     {
+      title: 'Smart Trade Rules',
+      description: 'Configure automated trading rules and risk controls',
+      icon: Zap,
+      href: '/admin/smart-trade-rules',
+      count: 8,
+      countLabel: 'rules',
+      color: 'bg-orange-500',
+    },
+    {
       title: 'Security Dashboard',
       description: 'Monitor IP bans, API abuse, and security threats',
       icon: Shield,
@@ -163,6 +172,10 @@ export default function AdminIndex() {
             <li>
               <strong>Market Timings:</strong> Configure trading session timings for each exchange,
               including special sessions like Muhurat trading.
+            </li>
+            <li>
+              <strong>Smart Trade Rules:</strong> Set up automated trading rules like preventing
+              duplicate positions, limiting order values, and controlling product types (MIS/CNC/NRML).
             </li>
           </ul>
         </CardContent>

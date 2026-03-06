@@ -26,15 +26,17 @@ class ZerodhaAPIError(Exception):
     pass
 
 
-def get_api_response(endpoint, auth, method="GET", payload=None):
+def get_api_response(endpoint, auth, method="GET", payload=None, max_retries=3):
     """
     Make an API request to Zerodha's API using shared httpx client with connection pooling.
+    Includes automatic retry with exponential backoff for rate limit errors.
 
     Args:
         endpoint (str): API endpoint (e.g., '/quote')
         auth (str): Authentication token
         method (str): HTTP method (GET, POST, etc.)
         payload (dict, optional): Request payload for POST requests
+        max_retries (int): Maximum number of retries for rate limit errors (default: 3)
 
     Returns:
         dict: API response data
@@ -58,62 +60,82 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
     # Keep query params in URL to preserve duplicate keys (e.g., multiple i= for quotes)
     url = f"{base_url}{endpoint}"
 
-    try:
-        # Log the complete request details for debugging
-        # logger.info("=== API Request Details ===")
-        # logger.info(f"URL: {url}")
-        # logger.info(f"Method: {method}")
-        # logger.info(f"Headers: {json.dumps(headers, indent=2)}")
-        if payload:
-            logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
-
-        # Make the request using the shared client
-        if method.upper() == "GET":
-            response = client.get(url, headers=headers)
-        elif method.upper() == "POST":
-            headers["Content-Type"] = "application/json"
-            response = client.post(url, headers=headers, json=payload)
-        else:
-            raise ZerodhaAPIError(f"Unsupported HTTP method: {method}")
-
-        # Log the complete response
-        # logger.info("=== API Response Details ===")
-        logger.debug(f"Status Code: {response.status_code}")
-        logger.debug(f"Response Headers: {dict(response.headers)}")
-        logger.debug(f"Response Body: {response.text}")
-
-        # Parse JSON response
-        response_data = response.json()
-
-        # Check for permission errors
-        if response_data.get("status") == "error":
-            error_type = response_data.get("error_type")
-            error_message = response_data.get("message", "Unknown error")
-
-            if error_type == "PermissionException" or "permission" in error_message.lower():
-                raise ZerodhaPermissionError(f"API Permission denied: {error_message}.")
-            else:
-                raise ZerodhaAPIError(f"API Error: {error_message}")
-
-        return response_data
-
-    except ZerodhaPermissionError:
-        raise
-    except ZerodhaAPIError:
-        raise
-    except Exception as e:
-        error_msg = str(e)
-        logger.exception(f"API request failed: {error_msg}")
-
-        # Try to extract more error details if available
+    for attempt in range(max_retries + 1):
         try:
-            if hasattr(e, "response") and e.response is not None:
-                error_detail = e.response.json()
-                error_msg = error_detail.get("message", error_msg)
-        except:
-            pass
+            # Log the complete request details for debugging
+            # logger.info("=== API Request Details ===")
+            # logger.info(f"URL: {url}")
+            # logger.info(f"Method: {method}")
+            # logger.info(f"Headers: {json.dumps(headers, indent=2)}")
+            if payload:
+                logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
 
-        raise ZerodhaAPIError(f"API request failed: {error_msg}")
+            # Make the request using the shared client
+            if method.upper() == "GET":
+                response = client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                headers["Content-Type"] = "application/json"
+                response = client.post(url, headers=headers, json=payload)
+            else:
+                raise ZerodhaAPIError(f"Unsupported HTTP method: {method}")
+
+            # Log the complete response
+            # logger.info("=== API Response Details ===")
+            logger.debug(f"Status Code: {response.status_code}")
+            logger.debug(f"Response Headers: {dict(response.headers)}")
+            logger.debug(f"Response Body: {response.text}")
+
+            # Parse JSON response
+            response_data = response.json()
+
+            # Check for permission errors
+            if response_data.get("status") == "error":
+                error_type = response_data.get("error_type")
+                error_message = response_data.get("message", "Unknown error")
+
+                # Check for rate limit errors - retry with exponential backoff
+                if "Too many requests" in error_message or response.status_code == 429:
+                    if attempt < max_retries:
+                        # Exponential backoff: 1s, 2s, 4s
+                        delay = 2**attempt
+                        logger.warning(
+                            f"Rate limit hit (Too many requests), retrying in {delay}s... (attempt {attempt + 1}/{max_retries})"
+                        )
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(
+                            f"Rate limit exceeded after {max_retries} retries. Endpoint: {endpoint}"
+                        )
+                        raise ZerodhaAPIError(f"Rate limit exceeded: {error_message}")
+
+                if error_type == "PermissionException" or "permission" in error_message.lower():
+                    raise ZerodhaPermissionError(f"API Permission denied: {error_message}.")
+                else:
+                    raise ZerodhaAPIError(f"API Error: {error_message}")
+
+            return response_data
+
+        except ZerodhaPermissionError:
+            raise
+        except ZerodhaAPIError:
+            raise
+        except Exception as e:
+            error_msg = str(e)
+            logger.exception(f"API request failed: {error_msg}")
+
+            # Try to extract more error details if available
+            try:
+                if hasattr(e, "response") and e.response is not None:
+                    error_detail = e.response.json()
+                    error_msg = error_detail.get("message", error_msg)
+            except:
+                pass
+
+            raise ZerodhaAPIError(f"API request failed: {error_msg}")
+
+    # Should not reach here, but just in case
+    raise ZerodhaAPIError("Max retries exceeded")
 
 
 class BrokerData:
@@ -344,7 +366,7 @@ class BrokerData:
         response = get_api_response(endpoint, self.auth_token)
         logger.info(f"Zerodha API response status: {response.get('status')}")
         logger.info(f"Zerodha API response data keys: {list(response.get('data', {}).keys())[:10]}")
-        logger.info(f"Full Zerodha response: {json.dumps(response, indent=2)[:1000]}...")
+        logger.debug(f"Full Zerodha response: {json.dumps(response, indent=2)[:1000]}...")
 
         # Parse response and build results
         results = []
@@ -441,6 +463,9 @@ class BrokerData:
             # Initialize empty list to store DataFrames
             dfs = []
 
+            # Rate limit delay between 60-day chunks (Zerodha historical API rate limit)
+            CHUNK_DELAY = 0.5  # 500ms between chunks to avoid rate limiting
+
             # Process data in 60-day chunks
             current_start = start_date
             while current_start <= end_date:
@@ -460,7 +485,7 @@ class BrokerData:
                 endpoint = f"/instruments/historical/{instrument_token}/{resolution}?from={from_str}&to={to_str}&oi=1"
                 logger.debug(f"Making request to endpoint: {endpoint}")
 
-                # Use get_api_response
+                # Use get_api_response with retry logic for rate limits
                 response = get_api_response(endpoint, self.auth_token)
 
                 if not response or response.get("status") != "success":
@@ -480,6 +505,10 @@ class BrokerData:
 
                 # Move to next chunk
                 current_start = current_end + timedelta(days=1)
+
+                # Add delay between chunks to prevent rate limiting (skip after last chunk)
+                if current_start <= end_date:
+                    time.sleep(CHUNK_DELAY)
 
             # If no data was found, return empty DataFrame
             if not dfs:

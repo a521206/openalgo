@@ -46,84 +46,70 @@ def should_start_websocket():
 
 
 def cleanup_websocket_server():
-    """Clean up WebSocket server resources - cross-platform compatible"""
+    """Clean up WebSocket server resources - safe to call multiple times
+    
+    Called by:
+    1. Flask app teardown (primary cleanup)
+    2. atexit handler (fallback cleanup)
+    3. Signal handler (immediate shutdown)
+    """
     global _websocket_proxy_instance, _websocket_thread
 
-    try:
-        logger.info("Cleaning up WebSocket server...")
-
-        if _websocket_proxy_instance:
-            # For Windows compatibility, set a shutdown flag instead of trying to
-            # manipulate the event loop from a different thread
+    if _websocket_proxy_instance:
+        try:
             _websocket_proxy_instance.running = False
+        except Exception:
+            pass
 
-            # Try to close the server gracefully
-            try:
-                if (
-                    hasattr(_websocket_proxy_instance, "server")
-                    and _websocket_proxy_instance.server
-                ):
-                    try:
-                        _websocket_proxy_instance.server.close()
-                    except Exception as e:
-                        logger.warning(f"Error closing server handle: {e}")
+        try:
+            if hasattr(_websocket_proxy_instance, "server") and _websocket_proxy_instance.server:
+                try:
+                    _websocket_proxy_instance.server.close()
+                except Exception:
+                    pass
 
-                # Close ZMQ resources immediately
-                if (
-                    hasattr(_websocket_proxy_instance, "socket")
-                    and _websocket_proxy_instance.socket
-                ):
-                    try:
-                        import zmq
+            if hasattr(_websocket_proxy_instance, "socket") and _websocket_proxy_instance.socket:
+                try:
+                    import zmq
+                    _websocket_proxy_instance.socket.setsockopt(zmq.LINGER, 0)
+                    _websocket_proxy_instance.socket.close()
+                except Exception:
+                    pass
 
-                        _websocket_proxy_instance.socket.setsockopt(zmq.LINGER, 0)
-                        _websocket_proxy_instance.socket.close()
-                    except Exception as e:
-                        logger.warning(f"Error closing ZMQ socket: {e}")
+            if hasattr(_websocket_proxy_instance, "context") and _websocket_proxy_instance.context:
+                try:
+                    _websocket_proxy_instance.context.term()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            _websocket_proxy_instance = None
 
-                if (
-                    hasattr(_websocket_proxy_instance, "context")
-                    and _websocket_proxy_instance.context
-                ):
-                    try:
-                        _websocket_proxy_instance.context.term()
-                    except Exception as e:
-                        logger.warning(f"Error terminating ZMQ context: {e}")
-
-            except Exception as e:
-                logger.exception(f"Error during WebSocket cleanup: {e}")
-            finally:
-                _websocket_proxy_instance = None
-
-        if _websocket_thread and _websocket_thread.is_alive():
-            logger.info("Waiting for WebSocket thread to finish...")
-            _websocket_thread.join(timeout=5.0)  # Increased timeout for slow broker disconnects
-            if _websocket_thread.is_alive():
-                logger.warning("WebSocket thread did not finish gracefully")
+    if _websocket_thread and _websocket_thread.is_alive():
+        try:
+            _websocket_thread.join(timeout=2.0)  # Reduced timeout for faster shutdown
+        except Exception:
+            pass
+        finally:
             _websocket_thread = None
 
-        # Clean up shared ZMQ context (handles app restart without process exit)
-        try:
-            from .base_adapter import BaseBrokerWebSocketAdapter
-            BaseBrokerWebSocketAdapter.cleanup_shared_context()
-            logger.info("Shared ZMQ context cleaned up")
-        except Exception as e:
-            logger.warning(f"Error cleaning up shared ZMQ context: {e}")
+    try:
+        from .base_adapter import BaseBrokerWebSocketAdapter
+        BaseBrokerWebSocketAdapter.cleanup_shared_context()
+    except Exception:
+        pass
 
-        logger.info("WebSocket server cleanup completed")
-
-    except Exception as e:
-        logger.exception(f"Error during WebSocket cleanup: {e}")
-        # Last resort: force cleanup
-        _websocket_proxy_instance = None
-        _websocket_thread = None
+    logger.debug("WebSocket server cleanup completed")
 
 
 def signal_handler(signum, frame):
     """Handle SIGINT (Ctrl+C) and SIGTERM signals"""
     logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-    cleanup_websocket_server()
-    # Use os._exit() for immediate termination across all platforms
+    try:
+        cleanup_websocket_server()
+    except Exception:
+        pass
     os._exit(0)
 
 
@@ -181,9 +167,10 @@ def start_websocket_server():
                     logger.warning(f"Error closing event loop: {loop_err}")
 
     # Start the WebSocket server in a daemon thread
+    # (Cleanup happens in Flask teardown, not during thread.join())
     _websocket_thread = threading.Thread(
         target=run_websocket_server,
-        daemon=False,  # Changed to False so we can properly clean up
+        daemon=True,
     )
     _websocket_thread.start()
 

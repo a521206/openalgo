@@ -379,6 +379,12 @@ def react_admin_timings():
     return serve_react_app()
 
 
+# Admin - Smart Trade Rules
+@react_bp.route("/admin/smart-trade-rules", strict_slashes=False)
+def react_admin_smart_trade_rules():
+    return serve_react_app()
+
+
 # Telegram - Dashboard
 @react_bp.route("/telegram", strict_slashes=False)
 def react_telegram_index():

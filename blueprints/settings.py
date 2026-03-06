@@ -2,7 +2,12 @@
 
 from flask import Blueprint, jsonify, request
 
-from database.settings_db import get_analyze_mode, set_analyze_mode
+from database.settings_db import (
+    get_analyze_mode,
+    get_smart_trade_rules,
+    set_analyze_mode,
+    set_smart_trade_rules,
+)
 from sandbox.execution_thread import start_execution_engine, stop_execution_engine
 from utils.logging import get_logger
 from utils.session import check_session_validity
@@ -57,3 +62,54 @@ def set_mode(mode):
     except Exception as e:
         logger.exception(f"Error setting analyze mode: {str(e)}")
         return jsonify({"error": "Failed to set analyze mode"}), 500
+
+
+@settings_bp.route("/smart-trade-rules", methods=["GET"])
+@check_session_validity
+def get_smart_trade_rules_api():
+    """Get smart trade rules configuration"""
+    try:
+        rules = get_smart_trade_rules()
+        return jsonify({"status": "success", "data": rules})
+    except Exception as e:
+        logger.exception(f"Error getting smart trade rules: {str(e)}")
+        return jsonify({"status": "error", "message": "Failed to get smart trade rules"}), 500
+
+
+@settings_bp.route("/smart-trade-rules", methods=["POST"])
+@check_session_validity
+def update_smart_trade_rules_api():
+    """Update smart trade rules configuration"""
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"status": "error", "message": "No data provided"}), 400
+
+        # Extract and validate parameters
+        smart_trade_enabled = data.get("smart_trade_enabled")
+        prevent_duplicate_buy = data.get("prevent_duplicate_buy")
+        prevent_duplicate_sell = data.get("prevent_duplicate_sell")
+        max_position_size = data.get("max_position_size")
+        max_order_value = data.get("max_order_value")
+        allow_intraday_only = data.get("allow_intraday_only")
+        block_cnc_orders = data.get("block_cnc_orders")
+        block_nrml_orders = data.get("block_nrml_orders")
+
+        # Update settings
+        set_smart_trade_rules(
+            smart_trade_enabled=smart_trade_enabled,
+            prevent_duplicate_buy=prevent_duplicate_buy,
+            prevent_duplicate_sell=prevent_duplicate_sell,
+            max_position_size=max_position_size,
+            max_order_value=max_order_value,
+            allow_intraday_only=allow_intraday_only,
+            block_cnc_orders=block_cnc_orders,
+            block_nrml_orders=block_nrml_orders,
+        )
+
+        return jsonify(
+            {"status": "success", "message": "Smart trade rules updated successfully"}
+        )
+    except Exception as e:
+        logger.exception(f"Error updating smart trade rules: {str(e)}")
+        return jsonify({"status": "error", "message": "Failed to update smart trade rules"}), 500

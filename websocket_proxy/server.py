@@ -1,5 +1,6 @@
 import asyncio as aio
 import json
+import logging
 import os
 import signal
 import socket
@@ -24,6 +25,39 @@ from .port_check import find_available_port, is_port_in_use
 
 # Initialize logger
 logger = get_logger("websocket_proxy")
+
+
+# Filter to suppress benign WebSocket handshake errors
+class WebSocketHandshakeFilter(logging.Filter):
+    """
+    Filter out benign WebSocket handshake errors that occur when:
+    - Health check probes connect and disconnect immediately
+    - Port scanners check if the port is open
+    - Browsers make speculative connections
+    - Network monitoring tools probe the service
+
+    These are normal and don't indicate a problem with the WebSocket server.
+    """
+
+    def filter(self, record):
+        # Ignore EOFError during handshake - typically health checks or port scans
+        if "opening handshake failed" in record.getMessage():
+            msg = record.getMessage()
+            if any(
+                phrase in msg
+                for phrase in [
+                    "EOFError",
+                    "connection closed while reading HTTP request line",
+                    "stream ends after 0 bytes",
+                ]
+            ):
+                return False  # Suppress this log message
+        return True  # Allow all other messages
+
+
+# Apply filter to websockets loggers to reduce noise from benign connection attempts
+logging.getLogger("websockets.server").addFilter(WebSocketHandshakeFilter())
+logging.getLogger("websockets").addFilter(WebSocketHandshakeFilter())
 
 
 class WebSocketProxy:
@@ -227,11 +261,11 @@ class WebSocketProxy:
             # Wait for all connections to close with timeout
             if close_tasks:
                 try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*close_tasks, return_exceptions=True),
+                    await aio.wait_for(
+                        aio.gather(*close_tasks, return_exceptions=True),
                         timeout=2.0,  # 2 second timeout
                     )
-                except asyncio.TimeoutError:
+                except aio.TimeoutError:
                     logger.warning("Timeout waiting for client connections to close")
 
             # Disconnect all broker adapters

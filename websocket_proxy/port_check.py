@@ -6,7 +6,7 @@ from utils.logging import get_logger
 logger = get_logger("websocket_proxy")
 
 
-def is_port_in_use(host, port, wait_time=0):
+def is_port_in_use(host: str, port: int, wait_time: float = 0) -> bool:
     """
     Check if a port is already in use on a specific host
 

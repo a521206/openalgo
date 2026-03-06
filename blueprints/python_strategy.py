@@ -2468,13 +2468,17 @@ def save_strategy(strategy_id):
 
 # Cleanup on shutdown
 def cleanup_on_exit():
-    """Clean up all running processes on application exit"""
+    """Clean up running processes on application exit (fallback cleanup via atexit)
+    
+    Note: Scheduler shutdown is handled by Flask teardown (app.py::shutdown_schedulers).
+    This function focuses on stopping strategy processes as a fallback.
+    """
     logger.info("Cleaning up running strategies...")
     with PROCESS_LOCK:
         for strategy_id in list(RUNNING_STRATEGIES.keys()):
             try:
                 stop_strategy_process(strategy_id)
-            except:
+            except Exception:
                 pass
     logger.info("Cleanup complete")
 

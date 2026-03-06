@@ -46,6 +46,9 @@ class SymToken(Base):
         Index("idx_symbol_exchange", "symbol", "exchange"),
         Index("idx_symbol_name", "symbol", "name"),
         Index("idx_brsymbol_exchange", "brsymbol", "exchange"),
+        # Optimized index for strike-based option lookups
+        # Used by find_option_symbol_by_strike and option chain queries
+        Index("idx_strike_lookup", "exchange", "expiry", "strike", "instrumenttype"),
     )
 
 

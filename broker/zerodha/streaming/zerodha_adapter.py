@@ -439,7 +439,11 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
                                 subscribed_modes.add(mode_num)
 
                     if not subscription_exchange:
-                        self.logger.warning(f"No subscription info found for token: {token}")
+                        # This can happen during unsubscribe or reconnection - not an error
+                        self.logger.debug(
+                            f"No active subscription found for instrument_token {token} "
+                            f"(symbol: {symbol}, likely unsubscribed or reconnecting)"
+                        )
                         continue
 
                     # Set the data exchange field
@@ -511,7 +515,12 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # Get symbol info
             symbol_info = self.token_to_symbol.get(token)
             if not symbol_info:
-                self.logger.warning(f"No symbol mapping for token: {token}")
+                # This is normal - can happen during unsubscribe or reconnection
+                # Only log at debug level to avoid cluttering logs
+                self.logger.debug(
+                    f"Received tick for unmapped instrument_token {token} "
+                    f"(likely unsubscribed or reconnection in progress)"
+                )
                 return None
 
             symbol, exchange = symbol_info

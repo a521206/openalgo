@@ -189,8 +189,9 @@ class Ticker(Resource):
                 if response_format == "txt":
                     response = TextResponse("Invalid openalgo apikey\n")
                     response.content_type = "text/plain"
+                    response.status_code = 403
                     response.json = {"request_id": f"ticker_{symbol}_{history_data['interval']}"}
-                    return response, 403
+                    return response
                 return make_response(
                     jsonify({"status": "error", "message": "Invalid openalgo apikey"}), 403
                 )
@@ -200,8 +201,9 @@ class Ticker(Resource):
                 if response_format == "txt":
                     response = TextResponse("Broker-specific module not found\n")
                     response.content_type = "text/plain"
+                    response.status_code = 404
                     response.json = {"request_id": f"ticker_{symbol}_{history_data['interval']}"}
-                    return response, 404
+                    return response
                 return make_response(
                     jsonify({"status": "error", "message": "Broker-specific module not found"}), 404
                 )
@@ -249,6 +251,7 @@ class Ticker(Resource):
                     # Create plain text response
                     response = TextResponse("\n".join(text_output))
                     response.content_type = "text/plain"
+                    response.status_code = 200
                     response.json = {"request_id": f"ticker_{symbol}_{history_data['interval']}"}
                     return response
                 else:
@@ -262,24 +265,27 @@ class Ticker(Resource):
                 if response_format == "txt":
                     response = TextResponse(str(e))
                     response.content_type = "text/plain"
+                    response.status_code = 500
                     response.json = {"request_id": f"ticker_{symbol}_{history_data['interval']}"}
-                    return response, 500
+                    return response
                 return make_response(jsonify({"status": "error", "message": str(e)}), 500)
 
         except ValidationError as err:
             if response_format == "txt":
                 response = TextResponse(str(err.messages))
                 response.content_type = "text/plain"
+                response.status_code = 400
                 response.json = {"request_id": "ticker_validation_error"}
-                return response, 400
+                return response
             return make_response(jsonify({"status": "error", "message": err.messages}), 400)
         except Exception as e:
             logger.exception(f"Unexpected error in ticker endpoint: {e}")
             if response_format == "txt":
                 response = TextResponse("An unexpected error occurred")
                 response.content_type = "text/plain"
+                response.status_code = 500
                 response.json = {"request_id": "ticker_unknown_error"}
-                return response, 500
+                return response
             return make_response(
                 jsonify({"status": "error", "message": "An unexpected error occurred"}), 500
             )

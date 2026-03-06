@@ -209,6 +209,27 @@ class OptionsOrderSchema(Schema):
         missing=0,
         validate=validate.Range(min=0, error="Disclosed quantity must be a non-negative integer."),
     )
+    # Price discovery adjustment parameters
+    price_adjustment_type = fields.Str(
+        missing="percentage",
+        validate=validate.OneOf(["percentage", "absolute", None]),
+        allow_none=True,
+        metadata={
+            "description": "Type of price adjustment for price discovery: 'percentage' or 'absolute'. "
+            "For BUY orders, adjustment is added to base price. For SELL orders, adjustment is subtracted from base price. "
+            "Default: 'percentage'"
+        },
+    )
+    price_adjustment_value = fields.Float(
+        missing=2.0,
+        validate=validate.Range(min=0, max=10.0, error="Adjustment value must be between 0 and 10."),
+        metadata={
+            "description": "Adjustment value (percentage or absolute amount). "
+            "Maximum allowed: 10 for percentage, 10.0 for absolute. "
+            "Always specify as positive value - direction is determined by order action (BUY/SELL). "
+            "Default: 2.0 (2% when using percentage type)"
+        },
+    )
 
 
 class OptionsMultiOrderLegSchema(Schema):

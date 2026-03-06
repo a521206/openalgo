@@ -93,11 +93,41 @@ def track_latency(api_type):
                 tracker.start_stage("broker_response")
 
                 # Get response data
+                # Check if response is a Flask Response object (including TextResponse)
                 if hasattr(response, "json"):
-                    response_data = response.json
+                    json_attr = response.json
+                    # Check if json is a method (callable) or a property
+                    if callable(json_attr):
+                        try:
+                            response_data = json_attr()
+                        except Exception:
+                            response_data = {}
+                    else:
+                        # json is a property - use it if it's a dict
+                        response_data = json_attr if isinstance(json_attr, dict) else {}
                 elif isinstance(response, tuple) and len(response) > 0:
-                    response_data = response[0]
+                    first_element = response[0]
+                    # Check if the first element is a Flask Response object
+                    if hasattr(first_element, "json"):
+                        json_attr = first_element.json
+                        if callable(json_attr):
+                            try:
+                                response_data = json_attr()
+                            except Exception:
+                                response_data = {}
+                        else:
+                            # json is a property - use it if it's a dict
+                            response_data = json_attr if isinstance(json_attr, dict) else {}
+                    elif isinstance(first_element, dict):
+                        response_data = first_element
+                    else:
+                        # For Response objects without json property, use empty dict
+                        response_data = {}
                 else:
+                    response_data = {}
+
+                # Ensure response_data is a dict for .get() to work
+                if not isinstance(response_data, dict):
                     response_data = {}
 
                 # End response processing stage
@@ -183,8 +213,17 @@ def track_latency(api_type):
 
                 # Get broker name from auth_db using API key if available
                 broker_name = None
-                if "request_data" in locals() and "apikey" in request_data:
+                if "request_data" in locals() and isinstance(request_data, dict) and "apikey" in request_data:
                     broker_name = get_broker_name(request_data["apikey"])
+                elif request.is_json:
+                    request_data = request.get_json() if request.is_json else {}
+                    if "apikey" in request_data:
+                        broker_name = get_broker_name(request_data["apikey"])
+                else:
+                    request_data = {}
+
+                # Use empty dict for response_data in error case
+                response_data = {}
 
                 OrderLatency.log_latency(
                     order_id="error",

@@ -52,8 +52,19 @@ import { onModeChange } from '@/stores/themeStore'
 import type { Order, OrderStats } from '@/types/trading'
 
 function formatTime(timestamp: string): string {
+  if (!timestamp) return ''
+
+  // If timestamp is already "HH:MM:SS" (time-only from brokers like Zebu, Shoonya), return as-is
+  if (/^[0-9]{1,2}:[0-9]{2}:[0-9]{2}$/.test(timestamp)) {
+    return timestamp
+  }
+
   try {
-    return new Date(timestamp).toLocaleTimeString('en-IN', {
+    const date = new Date(timestamp)
+    if (isNaN(date.getTime())) {
+      return timestamp
+    }
+    return date.toLocaleTimeString('en-IN', {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',

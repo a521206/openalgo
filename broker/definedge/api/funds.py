@@ -40,7 +40,7 @@ def get_margin_data(auth_token):
         response.raise_for_status()  # Raise exception for error status codes
 
         response_data = response.json()
-        logger.info(f"Funds Details: {json.dumps(response_data, indent=2)}")
+        logger.debug(f"Funds Details: {json.dumps(response_data, indent=2)}")
 
         # Check if the response is successful - Definedge returns SUCCESS status
         if response_data.get("status") == "SUCCESS" or "cash" in response_data:

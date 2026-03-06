@@ -73,7 +73,7 @@ def get_margin_data(auth_token):
         # Parse the response JSON
         margin_data = response.json()
 
-        logger.info(f"Funds Details: {margin_data}")
+        logger.debug(f"Funds Details: {margin_data}")
 
         # Check if the response was successful
         if margin_data.get("status") != "success":

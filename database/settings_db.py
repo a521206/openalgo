@@ -56,6 +56,16 @@ class Settings(Base):
     security_api_ban_duration = Column(Integer, default=48)  # Ban duration in hours
     security_repeat_offender_limit = Column(Integer, default=3)  # Bans before permanent ban
 
+    # Smart Trade Rules
+    smart_trade_enabled = Column(Boolean, default=True)  # Master switch for smart trade rules
+    prevent_duplicate_buy = Column(Boolean, default=True)  # Prevent BUY if position exists
+    prevent_duplicate_sell = Column(Boolean, default=True)  # Prevent SELL if no position exists
+    max_position_size = Column(Integer, nullable=True)  # Maximum position size per symbol (lots for F&O, qty for equity)
+    max_order_value = Column(Integer, nullable=True)  # Maximum order value in INR
+    allow_intraday_only = Column(Boolean, default=False)  # Only allow MIS orders
+    block_cnc_orders = Column(Boolean, default=False)  # Block CNC (delivery) orders
+    block_nrml_orders = Column(Boolean, default=False)  # Block NRML (carryforward) orders
+
 
 def init_db():
     """Initialize the settings database"""
@@ -267,3 +277,76 @@ def clear_settings_cache():
     """
     _settings_cache.clear()
     logger.info("Settings cache cleared")
+
+
+def get_smart_trade_rules():
+    """Get smart trade rules configuration (cached for 1 hour)"""
+    cache_key = "smart_trade_rules"
+
+    # Check cache first
+    if cache_key in _settings_cache:
+        return _settings_cache[cache_key]
+
+    # Cache miss - query database
+    settings = Settings.query.first()
+    if not settings:
+        # Create with defaults
+        settings = Settings(analyze_mode=False)
+        db_session.add(settings)
+        db_session.commit()
+
+    result = {
+        "smart_trade_enabled": settings.smart_trade_enabled or False,
+        "prevent_duplicate_buy": settings.prevent_duplicate_buy or False,
+        "prevent_duplicate_sell": settings.prevent_duplicate_sell or False,
+        "max_position_size": settings.max_position_size,
+        "max_order_value": settings.max_order_value,
+        "allow_intraday_only": settings.allow_intraday_only or False,
+        "block_cnc_orders": settings.block_cnc_orders or False,
+        "block_nrml_orders": settings.block_nrml_orders or False,
+    }
+
+    # Store in cache
+    _settings_cache[cache_key] = result
+    return result
+
+
+def set_smart_trade_rules(
+    smart_trade_enabled=None,
+    prevent_duplicate_buy=None,
+    prevent_duplicate_sell=None,
+    max_position_size=None,
+    max_order_value=None,
+    allow_intraday_only=None,
+    block_cnc_orders=None,
+    block_nrml_orders=None,
+):
+    """Set smart trade rules configuration"""
+    settings = Settings.query.first()
+    if not settings:
+        settings = Settings(analyze_mode=False)
+        db_session.add(settings)
+
+    if smart_trade_enabled is not None:
+        settings.smart_trade_enabled = smart_trade_enabled
+    if prevent_duplicate_buy is not None:
+        settings.prevent_duplicate_buy = prevent_duplicate_buy
+    if prevent_duplicate_sell is not None:
+        settings.prevent_duplicate_sell = prevent_duplicate_sell
+    if max_position_size is not None:
+        settings.max_position_size = max_position_size if max_position_size > 0 else None
+    if max_order_value is not None:
+        settings.max_order_value = max_order_value if max_order_value > 0 else None
+    if allow_intraday_only is not None:
+        settings.allow_intraday_only = allow_intraday_only
+    if block_cnc_orders is not None:
+        settings.block_cnc_orders = block_cnc_orders
+    if block_nrml_orders is not None:
+        settings.block_nrml_orders = block_nrml_orders
+
+    db_session.commit()
+    logger.info("Smart trade rules updated successfully")
+
+    # Invalidate cache after update
+    if "smart_trade_rules" in _settings_cache:
+        del _settings_cache["smart_trade_rules"]

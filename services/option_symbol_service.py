@@ -53,6 +53,13 @@ logger = get_logger(__name__)
 _STRIKES_CACHE: dict[tuple[str, str, str, str], list[float]] = {}
 _CACHE_STATS = {"hits": 0, "misses": 0, "total_queries": 0}
 
+# ============================================================================
+# SYMBOL CACHE - In-Memory Cache for Symbol Lookups by Strike
+# ============================================================================
+# Cache structure: {(base_symbol, expiry, strike, option_type, exchange): symbol}
+_SYMBOL_CACHE: dict[tuple[str, str, float, str, str], str | None] = {}
+_SYMBOL_CACHE_STATS = {"hits": 0, "misses": 0, "total_queries": 0}
+
 
 def get_strikes_cache_stats() -> dict:
     """Get cache statistics for monitoring"""
@@ -67,12 +74,27 @@ def get_strikes_cache_stats() -> dict:
     }
 
 
+def get_symbol_cache_stats() -> dict:
+    """Get symbol cache statistics for monitoring"""
+    total = _SYMBOL_CACHE_STATS["total_queries"]
+    hit_rate = (_SYMBOL_CACHE_STATS["hits"] / total * 100) if total > 0 else 0.0
+    return {
+        "hits": _SYMBOL_CACHE_STATS["hits"],
+        "misses": _SYMBOL_CACHE_STATS["misses"],
+        "total_queries": _SYMBOL_CACHE_STATS["total_queries"],
+        "hit_rate": f"{hit_rate:.2f}%",
+        "cached_entries": len(_SYMBOL_CACHE),
+    }
+
+
 def clear_strikes_cache():
-    """Clear the strikes cache (call when master contracts are updated)"""
-    global _STRIKES_CACHE, _CACHE_STATS
+    """Clear the strikes and symbol caches (call when master contracts are updated)"""
+    global _STRIKES_CACHE, _CACHE_STATS, _SYMBOL_CACHE, _SYMBOL_CACHE_STATS
     _STRIKES_CACHE.clear()
     _CACHE_STATS = {"hits": 0, "misses": 0, "total_queries": 0}
-    logger.info("Strikes cache cleared")
+    _SYMBOL_CACHE.clear()
+    _SYMBOL_CACHE_STATS = {"hits": 0, "misses": 0, "total_queries": 0}
+    logger.info("Strikes and symbol caches cleared")
 
 
 def parse_underlying_symbol(underlying: str) -> tuple[str, str | None]:
@@ -274,6 +296,203 @@ def find_option_in_database(option_symbol: str, exchange: str) -> dict[str, Any]
     except Exception as e:
         logger.exception(f"Error querying database for option symbol: {e}")
         return None
+
+
+def find_option_symbol_by_strike(
+    base_symbol: str, expiry_date: str, strike: float, option_type: str, exchange: str
+) -> str | None:
+    """
+    Find the option symbol by exact strike price from database.
+    Uses in-memory cache for ultra-fast repeated lookups.
+
+    Args:
+        base_symbol: Base symbol like "NIFTY", "BANKNIFTY", "RELIANCE"
+        expiry_date: Expiry in DDMMMYY format like "28OCT25"
+        strike: Strike price to find (e.g., 23500)
+        option_type: "CE" or "PE"
+        exchange: Options exchange like "NFO", "BFO", etc.
+
+    Returns:
+        Option symbol string or None if not found
+
+    Example:
+        find_option_symbol_by_strike("NIFTY", "28OCT25", 23500, "CE", "NFO")
+        -> "NIFTY28OCT2523500CE"
+    """
+    global _SYMBOL_CACHE, _SYMBOL_CACHE_STATS
+
+    try:
+        # Normalize inputs for cache key
+        cache_key = (
+            base_symbol.upper(),
+            expiry_date.upper(),
+            strike,
+            option_type.upper(),
+            exchange.upper(),
+        )
+
+        # Update query stats
+        _SYMBOL_CACHE_STATS["total_queries"] += 1
+
+        # Check cache first (O(1) lookup)
+        if cache_key in _SYMBOL_CACHE:
+            _SYMBOL_CACHE_STATS["hits"] += 1
+            symbol = _SYMBOL_CACHE[cache_key]
+            logger.debug(f"Symbol cache HIT: {symbol} for strike {strike}")
+            return symbol
+
+        # Cache miss - query database
+        _SYMBOL_CACHE_STATS["misses"] += 1
+
+        # Convert expiry from DDMMMYY to DD-MMM-YY format used in database
+        expiry_formatted = f"{expiry_date[:2]}-{expiry_date[2:5]}-{expiry_date[5:]}"
+
+        # Query database using direct filters on indexed columns (no LIKE)
+        # This leverages the idx_strike_lookup composite index for O(log n) lookups
+        result = (
+            db_session.query(SymToken.symbol)
+            .filter(
+                SymToken.name == base_symbol.upper(),
+                SymToken.expiry == expiry_formatted.upper(),
+                SymToken.strike == strike,
+                SymToken.instrumenttype == option_type.upper(),
+                SymToken.exchange == exchange.upper(),
+            )
+            .first()
+        )
+
+        if result:
+            # Cache the result
+            _SYMBOL_CACHE[cache_key] = result.symbol
+            logger.info(f"Found option symbol for strike {strike}: {result.symbol}")
+            return result.symbol
+        else:
+            # Cache the negative result (None) to avoid repeated failed lookups
+            _SYMBOL_CACHE[cache_key] = None
+            logger.warning(
+                f"Option symbol not found: {base_symbol} {expiry_date} {strike} {option_type} on {exchange}"
+            )
+            return None
+
+    except Exception as e:
+        logger.exception(f"Error finding option symbol by strike: {e}")
+        return None
+
+
+def find_option_symbols_by_strikes_batch(
+    base_symbol: str, expiry_date: str, strikes: list[float], exchange: str
+) -> dict[tuple[float, str], dict[str, Any]]:
+    """
+    Fetch all option symbols for multiple strikes in a single batch query.
+    This eliminates N+1 query problem when building option chains.
+
+    Args:
+        base_symbol: Base symbol like "NIFTY", "BANKNIFTY", "RELIANCE"
+        expiry_date: Expiry in DDMMMYY format like "28OCT25"
+        strikes: List of strike prices to find (e.g., [23500, 23600, 23700])
+        exchange: Options exchange like "NFO", "BFO", etc.
+
+    Returns:
+        Dictionary mapping (strike, option_type) to symbol details:
+        {
+            (23500, "CE"): {"symbol": "NIFTY28OCT2523500CE", "token": "12345", ...},
+            (23500, "PE"): {"symbol": "NIFTY28OCT2523500PE", "token": "12346", ...},
+            ...
+        }
+
+    Example:
+        find_option_symbols_by_strikes_batch("NIFTY", "28OCT25", [23500, 23600], "NFO")
+    """
+    global _SYMBOL_CACHE, _SYMBOL_CACHE_STATS
+
+    if not strikes:
+        return {}
+
+    try:
+        # Convert expiry from DDMMMYY to DD-MMM-YY format used in database
+        expiry_formatted = f"{expiry_date[:2]}-{expiry_date[2:5]}-{expiry_date[5:]}"
+
+        # Check which strikes are already cached
+        cached_results: dict[tuple[float, str], dict[str, Any]] = {}
+        uncached_strikes = set(strikes)
+
+        for strike in strikes:
+            for opt_type in ["CE", "PE"]:
+                cache_key = (base_symbol.upper(), expiry_date.upper(), strike, opt_type, exchange.upper())
+                if cache_key in _SYMBOL_CACHE:
+                    _SYMBOL_CACHE_STATS["total_queries"] += 1
+                    _SYMBOL_CACHE_STATS["hits"] += 1
+                    symbol = _SYMBOL_CACHE[cache_key]
+                    if symbol is not None:
+                        cached_results[(strike, opt_type)] = {"symbol": symbol, "exists": True}
+                    else:
+                        cached_results[(strike, opt_type)] = {"exists": False}
+
+        # Batch query for uncached strikes
+        if uncached_strikes:
+            _SYMBOL_CACHE_STATS["total_queries"] += 1
+            _SYMBOL_CACHE_STATS["misses"] += 1
+
+            results = (
+                db_session.query(SymToken)
+                .filter(
+                    SymToken.name == base_symbol.upper(),
+                    SymToken.expiry == expiry_formatted.upper(),
+                    SymToken.strike.in_(list(uncached_strikes)),
+                    SymToken.exchange == exchange.upper(),
+                    SymToken.instrumenttype.in_(["CE", "PE"]),
+                )
+                .all()
+            )
+
+            # Process results and update cache
+            for r in results:
+                # r is a SymToken model instance with actual values at runtime
+                # Pylance incorrectly infers Column types, but this works at runtime
+                strike_val = r.strike  # type: ignore[assignment]
+                inst_type = r.instrumenttype  # type: ignore[assignment]
+                key = (strike_val, inst_type)  # type: ignore[misc]
+                cached_results[key] = {  # type: ignore[index]
+                    "symbol": r.symbol,
+                    "brsymbol": r.brsymbol,
+                    "token": r.token,
+                    "lotsize": r.lotsize,
+                    "tick_size": r.tick_size,
+                    "exists": True,
+                }
+                # Update the symbol cache
+                cache_key = (
+                    base_symbol.upper(),
+                    expiry_date.upper(),
+                    strike_val,
+                    inst_type,
+                    exchange.upper(),
+                )
+                _SYMBOL_CACHE[cache_key] = r.symbol  # type: ignore[assignment]
+
+            # Cache negative results for strikes not found
+            found_keys = {(r.strike, r.instrumenttype) for r in results}
+            for strike in uncached_strikes:
+                for opt_type in ["CE", "PE"]:
+                    if (strike, opt_type) not in found_keys:
+                        cache_key = (
+                            base_symbol.upper(),
+                            expiry_date.upper(),
+                            strike,
+                            opt_type,
+                            exchange.upper(),
+                        )
+                        _SYMBOL_CACHE[cache_key] = None
+
+        logger.info(
+            f"Batch query: Found {len(cached_results)} symbols for {len(strikes)} strikes "
+            f"({base_symbol} {expiry_date} on {exchange})"
+        )
+        return cached_results
+
+    except Exception as e:
+        logger.exception(f"Error in batch option symbol lookup: {e}")
+        return {}
 
 
 def get_available_strikes(

@@ -745,10 +745,39 @@ def _restore_caches_background():
 threading.Thread(target=_restore_caches_background, daemon=True).start()
 
 
+# ============================================================================
+# APPLICATION SHUTDOWN FLOW
+# ============================================================================
+# 
+# When Flask app context is torn down (on shutdown):
+# 
+# 1. shutdown_schedulers()              (LIFO order #2 - runs FIRST)
+#    - Shuts down Flow scheduler        (dependent on DB)
+#    - Shuts down Historify scheduler   (dependent on DB)
+#    - Shuts down Python Strategy scheduler (local)
+#    - Shuts down WebSocket server      (independent)
+#
+# 2. shutdown_database_sessions()       (LIFO order #1 - runs SECOND)
+#    - Removes all scoped database sessions
+#    - Safe because schedulers are already shut down
+#
+# IMPORTANT: Teardown handlers execute in LIFO (Last-In-First-Out) order
+#            SQLAlchemy scoped sessions must be removed AFTER all DB access
+#
+# Fallback cleanup via atexit handlers (only if Flask teardown doesn't complete):
+#   - cleanup_websocket_server()  (from app_integration.py)
+#   - cleanup_on_exit()            (from python_strategy.py - stops processes)
+#
+# ============================================================================
+
 # Database session cleanup (teardown handler)
 @app.teardown_appcontext
 def shutdown_database_sessions(exception=None):
-    """Remove scoped sessions after each request to prevent FD leaks"""
+    """Remove scoped sessions after each request to prevent FD leaks
+    
+    Runs SECOND (after shutdown_schedulers) due to LIFO teardown order.
+    All schedulers and DB-dependent services must be shut down first.
+    """
     try:
         from database.auth_db import db_session
         db_session.remove()
@@ -778,6 +807,64 @@ def shutdown_database_sessions(exception=None):
         health_session.remove()
     except Exception as e:
         logger.error(f"Error removing health_session: {e}")
+
+
+@app.teardown_appcontext
+def shutdown_schedulers(exception=None):
+    """Unified scheduler and WebSocket shutdown on app context teardown
+    
+    Runs FIRST (before shutdown_database_sessions) due to LIFO teardown order.
+    This ensures all DB access is complete before database sessions are removed.
+    
+    Shuts down (in order):
+    1. Flow scheduler        - Stops any pending workflow jobs
+    2. Historify scheduler   - Stops any pending data download jobs
+    3. Python Strategy scheduler - Stops scheduled strategy execution
+    4. WebSocket server      - Closes all WebSocket connections and sockets
+    
+    All exceptions are silently caught to prevent interrupting app shutdown.
+    """
+    # Shutdown Flow Scheduler
+    try:
+        from services.flow_scheduler_service import get_flow_scheduler
+        scheduler = get_flow_scheduler()
+        if scheduler and hasattr(scheduler, 'shutdown'):
+            try:
+                scheduler.shutdown()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Shutdown Historify Scheduler
+    try:
+        from services.historify_scheduler_service import get_historify_scheduler
+        scheduler = get_historify_scheduler()
+        if scheduler and hasattr(scheduler, 'shutdown'):
+            try:
+                scheduler.shutdown()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Shutdown Python Strategy Scheduler
+    try:
+        from blueprints.python_strategy import SCHEDULER
+        if SCHEDULER:
+            try:
+                SCHEDULER.shutdown(wait=False)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Shutdown WebSocket server (can happen during app context)
+    try:
+        from websocket_proxy.app_integration import cleanup_websocket_server
+        cleanup_websocket_server()
+    except Exception:
+        pass
 
 
 # Integrate the WebSocket proxy server with the Flask app
