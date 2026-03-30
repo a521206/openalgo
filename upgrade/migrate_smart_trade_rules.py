@@ -64,6 +64,7 @@ def migrate_settings_table():
             ("allow_intraday_only", "BOOLEAN DEFAULT 0"),
             ("block_cnc_orders", "BOOLEAN DEFAULT 0"),
             ("block_nrml_orders", "BOOLEAN DEFAULT 0"),
+            ("liquidity_fallback", "BOOLEAN DEFAULT 1"),
         ]
 
         columns_added = 0

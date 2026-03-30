@@ -65,6 +65,7 @@ class Settings(Base):
     allow_intraday_only = Column(Boolean, default=False)  # Only allow MIS orders
     block_cnc_orders = Column(Boolean, default=False)  # Block CNC (delivery) orders
     block_nrml_orders = Column(Boolean, default=False)  # Block NRML (carryforward) orders
+    liquidity_fallback = Column(Boolean, default=True)  # Auto-select best liquid strike for illiquid options
 
 
 def init_db():
@@ -304,6 +305,7 @@ def get_smart_trade_rules():
         "allow_intraday_only": settings.allow_intraday_only or False,
         "block_cnc_orders": settings.block_cnc_orders or False,
         "block_nrml_orders": settings.block_nrml_orders or False,
+        "liquidity_fallback": settings.liquidity_fallback if settings.liquidity_fallback is not None else True,
     }
 
     # Store in cache
@@ -320,6 +322,7 @@ def set_smart_trade_rules(
     allow_intraday_only=None,
     block_cnc_orders=None,
     block_nrml_orders=None,
+    liquidity_fallback=None,
 ):
     """Set smart trade rules configuration"""
     settings = Settings.query.first()
@@ -343,6 +346,8 @@ def set_smart_trade_rules(
         settings.block_cnc_orders = block_cnc_orders
     if block_nrml_orders is not None:
         settings.block_nrml_orders = block_nrml_orders
+    if liquidity_fallback is not None:
+        settings.liquidity_fallback = liquidity_fallback
 
     db_session.commit()
     logger.info("Smart trade rules updated successfully")

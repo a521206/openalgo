@@ -94,6 +94,7 @@ def update_smart_trade_rules_api():
         allow_intraday_only = data.get("allow_intraday_only")
         block_cnc_orders = data.get("block_cnc_orders")
         block_nrml_orders = data.get("block_nrml_orders")
+        liquidity_fallback = data.get("liquidity_fallback")
 
         # Update settings
         set_smart_trade_rules(
@@ -105,6 +106,7 @@ def update_smart_trade_rules_api():
             allow_intraday_only=allow_intraday_only,
             block_cnc_orders=block_cnc_orders,
             block_nrml_orders=block_nrml_orders,
+            liquidity_fallback=liquidity_fallback,
         )
 
         return jsonify(
