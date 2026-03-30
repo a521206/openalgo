@@ -18,6 +18,7 @@ interface SmartTradeRulesConfig {
   allow_intraday_only: boolean
   block_cnc_orders: boolean
   block_nrml_orders: boolean
+  liquidity_fallback: boolean
 }
 
 export default function SmartTradeRules() {
@@ -33,6 +34,7 @@ export default function SmartTradeRules() {
   const [allowIntradayOnly, setAllowIntradayOnly] = useState(false)
   const [blockCncOrders, setBlockCncOrders] = useState(false)
   const [blockNrmlOrders, setBlockNrmlOrders] = useState(false)
+  const [liquidityFallback, setLiquidityFallback] = useState(true)
 
   useEffect(() => {
     fetchConfig()
@@ -53,6 +55,7 @@ export default function SmartTradeRules() {
       setAllowIntradayOnly(configData.allow_intraday_only)
       setBlockCncOrders(configData.block_cnc_orders)
       setBlockNrmlOrders(configData.block_nrml_orders)
+      setLiquidityFallback(configData.liquidity_fallback)
     } catch (error) {
       console.error('Error fetching config:', error)
       toast.error('Failed to load configuration')
@@ -73,6 +76,7 @@ export default function SmartTradeRules() {
         allow_intraday_only: allowIntradayOnly,
         block_cnc_orders: blockCncOrders,
         block_nrml_orders: blockNrmlOrders,
+        liquidity_fallback: liquidityFallback,
       }
 
       const response = await webClient.post<{ status: string; message: string }>(
@@ -262,6 +266,21 @@ export default function SmartTradeRules() {
                 checked={blockNrmlOrders}
                 onCheckedChange={setBlockNrmlOrders}
                 disabled={!smartTradeEnabled || allowIntradayOnly}
+              />
+            </div>
+
+            {/* Liquidity Fallback */}
+            <div className="flex items-center justify-between">
+              <div>
+                <Label>Liquidity Fallback</Label>
+                <p className="text-sm text-muted-foreground">
+                  Auto-select most liquid strike when requested option has no buyers/sellers
+                </p>
+              </div>
+              <Switch
+                checked={liquidityFallback}
+                onCheckedChange={setLiquidityFallback}
+                disabled={!smartTradeEnabled}
               />
             </div>
           </CardContent>

@@ -51,6 +51,7 @@ def add_smart_trade_columns():
             ("allow_intraday_only", "INTEGER DEFAULT 0"),
             ("block_cnc_orders", "INTEGER DEFAULT 0"),
             ("block_nrml_orders", "INTEGER DEFAULT 0"),
+            ("liquidity_fallback", "INTEGER DEFAULT 1"),
         ]
 
         # Add each column if it doesn't exist
