@@ -219,10 +219,36 @@ class BrokerData:
             if not quote:
                 raise ZerodhaAPIError("No quote data found")
 
+            # Extract depth data for debugging
+            depth = quote.get("depth", {})
+            sell_depth = depth.get("sell", [])
+            buy_depth = depth.get("buy", [])
+            
+            # Log depth structure for debugging zero ask/bid prices
+            if not sell_depth or not buy_depth:
+                logger.warning(
+                    f"Depth data missing for {exchange}:{br_symbol}. "
+                    f"Sell depth: {len(sell_depth)} levels, Buy depth: {len(buy_depth)} levels. "
+                    f"Full quote keys: {list(quote.keys())}"
+                )
+            
+            # Log raw depth data if ask or bid is 0
+            ask_price = sell_depth[0].get("price", 0) if sell_depth else 0
+            bid_price = buy_depth[0].get("price", 0) if buy_depth else 0
+            
+            if ask_price == 0 or bid_price == 0:
+                logger.info(
+                    f"QUOTE_DEBUG: {exchange}:{br_symbol} - "
+                    f"ask={ask_price}, bid={bid_price}, ltp={quote.get('last_price', 0)}. "
+                    f"Sell depth: {sell_depth[:2] if sell_depth else 'empty'}, "
+                    f"Buy depth: {buy_depth[:2] if buy_depth else 'empty'}. "
+                    f"Quote keys: {list(quote.keys())}"
+                )
+            
             # Return quote data
             return {
-                "ask": quote.get("depth", {}).get("sell", [{}])[0].get("price", 0),
-                "bid": quote.get("depth", {}).get("buy", [{}])[0].get("price", 0),
+                "ask": ask_price,
+                "bid": bid_price,
                 "high": quote.get("ohlc", {}).get("high", 0),
                 "low": quote.get("ohlc", {}).get("low", 0),
                 "ltp": quote.get("last_price", 0),
@@ -387,13 +413,39 @@ class BrokerData:
                 )
                 continue
 
+            # Extract depth data for debugging
+            depth = quote.get("depth", {})
+            sell_depth = depth.get("sell", [])
+            buy_depth = depth.get("buy", [])
+            
+            ask_price = sell_depth[0].get("price", 0) if sell_depth else 0
+            bid_price = buy_depth[0].get("price", 0) if buy_depth else 0
+            
+            # Log depth structure for debugging zero ask/bid prices
+            if not sell_depth or not buy_depth:
+                logger.warning(
+                    f"Depth data missing for {original['exchange']}:{original['symbol']}. "
+                    f"Sell depth: {len(sell_depth)} levels, Buy depth: {len(buy_depth)} levels. "
+                    f"Full quote keys: {list(quote.keys())}"
+                )
+            
+            # Log raw depth data if ask or bid is 0
+            if ask_price == 0 or bid_price == 0:
+                logger.info(
+                    f"QUOTE_DEBUG: {original['exchange']}:{original['symbol']} - "
+                    f"ask={ask_price}, bid={bid_price}, ltp={quote.get('last_price', 0)}. "
+                    f"Sell depth: {sell_depth[:2] if sell_depth else 'empty'}, "
+                    f"Buy depth: {buy_depth[:2] if buy_depth else 'empty'}. "
+                    f"Quote keys: {list(quote.keys())}"
+                )
+            
             # Parse and format quote data
             result_item = {
                 "symbol": original["symbol"],
                 "exchange": original["exchange"],
                 "data": {
-                    "ask": quote.get("depth", {}).get("sell", [{}])[0].get("price", 0),
-                    "bid": quote.get("depth", {}).get("buy", [{}])[0].get("price", 0),
+                    "ask": ask_price,
+                    "bid": bid_price,
                     "high": quote.get("ohlc", {}).get("high", 0),
                     "low": quote.get("ohlc", {}).get("low", 0),
                     "ltp": quote.get("last_price", 0),
