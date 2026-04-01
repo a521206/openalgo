@@ -86,3 +86,4 @@ yarn-error.log*
 
 # Windows NUL file
 nul
+utils/traffic_logger.py
