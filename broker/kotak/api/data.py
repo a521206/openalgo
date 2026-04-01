@@ -430,7 +430,6 @@ class BrokerData:
         # Build comma-separated query string
         combined_query = ",".join(queries)
 
-        logger.info(f"Requesting quotes for {len(queries)} instruments")
         logger.debug(
             f"Combined query: {combined_query[:200]}..."
             if len(combined_query) > 200
