@@ -375,13 +375,11 @@ class BrokerData:
         endpoint = f"/quote?{query_params}"
 
         # Log the instruments being requested
-        logger.info(f"Requesting quotes for {len(instruments)} instruments")
         logger.info(
-            f"Instruments: {instruments[:5]}..."
+            f"Requesting quotes for: {instruments[:5]}..."
             if len(instruments) > 5
-            else f"Instruments: {instruments}"
+            else f"Requesting quotes for: {instruments}"
         )
-        logger.info(f"Endpoint length: {len(endpoint)} characters")
         logger.info(
             f"Full endpoint: {endpoint}"
             if len(instruments) <= 10
