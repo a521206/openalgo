@@ -65,11 +65,19 @@ class TrafficLoggerMiddleware:
         try:
             return self.app(environ, custom_start_response)
         except Exception as e:
-            # Log error and re-raise
+            # Socket.IO polling for an already-disconnected session —
+            # return 400 instead of propagating to Gunicorn's error log.
+            if isinstance(e, KeyError) and str(e) == "'Session is disconnected'":
+                try:
+                    log_request(400, "Session is disconnected")
+                except Exception:
+                    pass
+                start_response("400 Bad Request", [("Content-Type", "text/plain")])
+                return [b"Session is disconnected"]
             try:
                 log_request(500, str(e))
-            except Exception as log_error:
-                logger.exception(f"Error logging exception: {log_error}")
+            except Exception:
+                pass
             raise
 
 
