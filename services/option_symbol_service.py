@@ -222,17 +222,15 @@ def construct_option_symbol(
         option_type: "CE" or "PE"
 
     Returns:
-        Option symbol like "NIFTY28OCT2523500CE" or "VEDL25APR24292.5CE"
+        Option symbol like "NIFTY28OCT2523500CE" or "VEDL25APR24292CE"
 
     Examples:
         construct_option_symbol("NIFTY", "28MAR24", 20800, "CE") -> "NIFTY28MAR2420800CE"
-        construct_option_symbol("VEDL", "25APR24", 292.5, "CE") -> "VEDL25APR24292.5CE"
+        construct_option_symbol("VEDL", "25APR24", 292.5, "CE") -> "VEDL25APR24292CE"
     """
-    # Format strike: Remove .0 if it's a whole number, otherwise keep decimal
-    if strike == int(strike):
-        strike_str = str(int(strike))
-    else:
-        strike_str = str(strike)
+    # Format strike: Always convert to int (remove decimal part)
+    # e.g., 292.5 -> "292", 292.0 -> "292"
+    strike_str = str(int(strike))
 
     option_symbol = f"{base_symbol}{expiry_date}{strike_str}{option_type.upper()}"
     logger.info(f"Constructed option symbol: {option_symbol}")
@@ -418,7 +416,13 @@ def find_option_symbols_by_strikes_batch(
 
         for strike in strikes:
             for opt_type in ["CE", "PE"]:
-                cache_key = (base_symbol.upper(), expiry_date.upper(), strike, opt_type, exchange.upper())
+                cache_key = (
+                    base_symbol.upper(),
+                    expiry_date.upper(),
+                    strike,
+                    opt_type,
+                    exchange.upper(),
+                )
                 if cache_key in _SYMBOL_CACHE:
                     _SYMBOL_CACHE_STATS["total_queries"] += 1
                     _SYMBOL_CACHE_STATS["hits"] += 1
