@@ -1,8 +1,8 @@
 import copy
 import importlib
-import os
 import time
 import traceback
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Optional, Tuple
 
 from database.analyzer_db import async_log_analyzer
@@ -18,6 +18,7 @@ from services.smart_trade_rules_service import (
 )
 from services.telegram_alert_service import telegram_alert_service
 from utils.api_analyzer import analyze_request, generate_order_id
+from utils.config import get_execution_buffer
 from utils.constants import (
     REQUIRED_SMART_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -310,7 +311,7 @@ def place_smart_order_with_auth(
             quote_ask = quote_data.get("ask", 0)
 
             # BUY: Use ask + buffer%, SELL: Use bid - buffer%, fallback to LTP
-            execution_buffer = float(os.getenv("EXECUTION_BUFFER", "0.05"))
+            execution_buffer = get_execution_buffer()
             if action == "BUY" and quote_ask > 0:
                 discovered_price = quote_ask * (1 + execution_buffer)
             elif action == "SELL" and quote_bid > 0:
@@ -319,11 +320,13 @@ def place_smart_order_with_auth(
                 discovered_price = quote_ltp
 
             if discovered_price and discovered_price > 0:
-                order_data["price"] = discovered_price
-                buffer_pct = int(execution_buffer * 100)
+                order_data["price"] = float(
+                    Decimal(str(discovered_price)).quantize(Decimal("0.05"), rounding=ROUND_HALF_UP)
+                )
+                buffer_pct = round(execution_buffer * 100, 1)
                 logger.info(
                     f"Price discovered for {order_data.get('symbol')}: "
-                    f"{discovered_price} ({action}, buffer={buffer_pct}%)"
+                    f"{order_data['price']} ({action}, buffer={buffer_pct}%)"
                 )
             else:
                 logger.warning(

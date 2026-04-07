@@ -12,6 +12,7 @@ Supports both live trading and sandbox (analyze) mode, just like place_order_ser
 import copy
 import os
 import time
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 from database.analyzer_db import async_log_analyzer
@@ -31,6 +32,7 @@ from services.option_symbol_service import (
 from services.place_order_service import place_order
 from services.quotes_service import get_multiquotes, get_quotes
 from services.telegram_alert_service import telegram_alert_service
+from utils.config import get_execution_buffer
 from utils.logging import get_logger
 
 # Initialize logger
@@ -526,8 +528,9 @@ def place_options_order(
             # Determine base price based on action with configurable execution buffer
             # BUY: Use ask + buffer% (what sellers are asking)
             # SELL: Use bid - buffer% (what buyers are bidding)
-            execution_buffer = float(os.getenv("EXECUTION_BUFFER", "0.05"))
-            buffer_pct = int(execution_buffer * 100)
+            execution_buffer = get_execution_buffer()
+            buffer_pct = round(execution_buffer * 100, 1)
+            price_discovered = price == 0  # Track if price was auto-discovered
             if action == "BUY":
                 if option_ask and option_ask > 0:
                     base_price = option_ask * (1 + execution_buffer)
@@ -581,10 +584,15 @@ def place_options_order(
             logger.info(
                 f"PRICE_DISCOVERY_ADJUSTMENT: symbol={resolved_symbol}, "
                 f"adjustment_type={adjustment_type}, adjustment_value={adjustment_value}, "
-                f"base_price={base_price}, price_source={price_source}"
+                f"execution_buffer={execution_buffer}, base_price={base_price}, price_source={price_source}"
             )
 
             # Apply adjustment to base price
+            # Skip if price was auto-discovered (execution_buffer already applied)
+            if price_discovered:
+                adjustment_type = None
+                adjustment_value = 0
+
             if adjustment_type == "percentage":
                 # BUY: Add premium (pay more), SELL: Reduce price (receive less)
                 if action == "BUY":
