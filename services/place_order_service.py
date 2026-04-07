@@ -2,7 +2,6 @@ import copy
 import importlib
 import time
 import traceback
-from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Optional, Tuple
 
 from database.analyzer_db import async_log_analyzer
@@ -12,7 +11,6 @@ from database.settings_db import get_analyze_mode
 from extensions import socketio
 from restx_api.schemas import OrderSchema
 from services.quotes_service import get_quotes
-from utils.config import get_execution_buffer
 from services.smart_trade_rules_service import (
     PositionFetchResult,
     PositionFetchStatus,
@@ -20,6 +18,7 @@ from services.smart_trade_rules_service import (
 )
 from services.telegram_alert_service import telegram_alert_service
 from utils.api_analyzer import analyze_request, generate_order_id
+from utils.config import get_execution_buffer
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -28,6 +27,7 @@ from utils.constants import (
     VALID_PRODUCT_TYPES,
 )
 from utils.logging import get_logger
+from utils.price_utils import round_price_to_tick_size
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -274,6 +274,20 @@ def place_order_with_auth(
             f"on {order_data.get('exchange')}"
         )
 
+        # Inline import to avoid circular import with options_multiorder_service
+        from services.symbol_service import get_symbol_info_with_auth
+
+        symbol = order_data.get("symbol")
+        exchange = order_data.get("exchange")
+        symbol_success, symbol_response, _ = get_symbol_info_with_auth(
+            symbol, exchange, auth_token, broker
+        )
+
+        tick_size = 0.05
+        if symbol_success:
+            symbol_data = symbol_response.get("data", {})
+            tick_size = symbol_data.get("tick_size", 0.05)
+
         api_key = original_data.get("apikey")
         success, quote_response, _ = get_quotes(
             symbol=order_data.get("symbol"),
@@ -297,9 +311,8 @@ def place_order_with_auth(
                 discovered_price = quote_ltp
 
             if discovered_price and discovered_price > 0:
-                order_data["price"] = float(
-                    Decimal(str(discovered_price)).quantize(Decimal("0.05"), rounding=ROUND_HALF_UP)
-                )
+                # Use utility function for price rounding
+                order_data["price"] = round_price_to_tick_size(discovered_price, tick_size)
                 buffer_pct = round(execution_buffer * 100, 1)
                 logger.info(
                     f"Price discovered for {order_data.get('symbol')}: "

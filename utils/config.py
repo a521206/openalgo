@@ -1,5 +1,6 @@
 # utils/config.py
 
+import functools
 import os
 
 from dotenv import load_dotenv
@@ -28,20 +29,15 @@ def get_host_server():
     return os.getenv("HOST_SERVER", "http://127.0.0.1:5000")
 
 
-EXECUTION_BUFFER_CACHE = None
-
-
+@functools.lru_cache(maxsize=None)
 def get_execution_buffer():
-    global EXECUTION_BUFFER_CACHE
-    if EXECUTION_BUFFER_CACHE is not None:
-        return EXECUTION_BUFFER_CACHE
-
+    """Return the execution buffer as a validated float.
+    """
     try:
         value = os.getenv("EXECUTION_BUFFER", "0.05")
         buffer = float(value)
         if buffer < 0 or buffer > 0.50:
             return 0.05
-        EXECUTION_BUFFER_CACHE = buffer
         return buffer
     except (ValueError, TypeError):
         return 0.05
