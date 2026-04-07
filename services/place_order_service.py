@@ -1,5 +1,6 @@
 import copy
 import importlib
+import os
 import time
 import traceback
 from typing import Any, Dict, Optional, Tuple
@@ -93,9 +94,7 @@ def _fetch_position_for_validation(
                 auth_token,
             )
             quantity = int(position_qty_str) if position_qty_str else 0
-            logger.debug(
-                f"Position fetch successful: {quantity} for {order_data.get('symbol')}"
-            )
+            logger.debug(f"Position fetch successful: {quantity} for {order_data.get('symbol')}")
             return PositionFetchResult(quantity=quantity, status=PositionFetchStatus.SUCCESS)
         except Exception as e:
             last_error = e
@@ -273,30 +272,35 @@ def place_order_with_auth(
             f"Price discovery triggered for {order_data.get('symbol')} "
             f"on {order_data.get('exchange')}"
         )
-        
+
         api_key = original_data.get("apikey")
         success, quote_response, _ = get_quotes(
             symbol=order_data.get("symbol"),
             exchange=order_data.get("exchange"),
             api_key=api_key,
         )
-        
+
         if success:
             quote_data = quote_response.get("data", {})
             quote_ltp = quote_data.get("ltp", 0)
             quote_bid = quote_data.get("bid", 0)
             quote_ask = quote_data.get("ask", 0)
-            
-            # BUY: Use ask, SELL: Use bid, fallback to LTP
-            discovered_price = quote_ask if action == "BUY" and quote_ask > 0 else (
-                quote_bid if action == "SELL" and quote_bid > 0 else quote_ltp
-            )
-            
+
+            # BUY: Use ask + buffer%, SELL: Use bid - buffer%, fallback to LTP
+            execution_buffer = float(os.getenv("EXECUTION_BUFFER", "0.05"))
+            if action == "BUY" and quote_ask > 0:
+                discovered_price = quote_ask * (1 + execution_buffer)
+            elif action == "SELL" and quote_bid > 0:
+                discovered_price = quote_bid * (1 - execution_buffer)
+            else:
+                discovered_price = quote_ltp
+
             if discovered_price and discovered_price > 0:
                 order_data["price"] = discovered_price
+                buffer_pct = int(execution_buffer * 100)
                 logger.info(
                     f"Price discovered for {order_data.get('symbol')}: "
-                    f"{discovered_price} ({action})"
+                    f"{discovered_price} ({action}, buffer={buffer_pct}%)"
                 )
             else:
                 logger.warning(
@@ -418,9 +422,7 @@ def place_order(
             # Skip logging for invalid API keys to prevent database flooding
             return False, error_response, 403
 
-        return place_order_with_auth(
-            order_data, AUTH_TOKEN, broker_name, original_data, emit_event
-        )
+        return place_order_with_auth(order_data, AUTH_TOKEN, broker_name, original_data, emit_event)
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:

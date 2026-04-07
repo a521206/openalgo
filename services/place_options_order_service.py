@@ -142,15 +142,24 @@ def select_best_liquid_strike(
         base_symbol, final_expiry, option_type, options_exchange
     )
     if not available_strikes:
-        return False, {"status": "error", "message": "No strikes available for liquidity selection"}, 404
+        return (
+            False,
+            {"status": "error", "message": "No strikes available for liquidity selection"},
+            404,
+        )
 
     # Get underlying LTP
     if underlying_ltp is not None:
         ltp = underlying_ltp
     else:
         success, symbol_resp, _ = get_option_symbol(
-            underlying=underlying, exchange=exchange, expiry_date=expiry_date,
-            strike_int=None, offset="ATM", option_type=option_type, api_key=api_key,
+            underlying=underlying,
+            exchange=exchange,
+            expiry_date=expiry_date,
+            strike_int=None,
+            offset="ATM",
+            option_type=option_type,
+            api_key=api_key,
         )
         if not success:
             return False, {"status": "error", "message": "Failed to fetch underlying LTP"}, 500
@@ -191,12 +200,20 @@ def select_best_liquid_strike(
             symbols_to_fetch.append({"symbol": sym, "exchange": options_exchange})
 
     if not symbols_to_fetch:
-        return False, {"status": "error", "message": "No valid option symbols found for candidate strikes"}, 404
+        return (
+            False,
+            {"status": "error", "message": "No valid option symbols found for candidate strikes"},
+            404,
+        )
 
     # Fetch all quotes in one call
     success, quotes_response, _ = get_multiquotes(symbols=symbols_to_fetch, api_key=api_key)
     if not success:
-        return False, {"status": "error", "message": "Failed to fetch quotes for liquidity evaluation"}, 500
+        return (
+            False,
+            {"status": "error", "message": "Failed to fetch quotes for liquidity evaluation"},
+            500,
+        )
 
     # Score and select
     best_score = -1
@@ -208,7 +225,17 @@ def select_best_liquid_strike(
 
         # Skip error entries from multiquotes
         if "error" in result and "data" not in result:
-            evaluated.append({"symbol": sym, "oi": 0, "volume": 0, "bid": 0, "ask": 0, "score": 0, "error": result["error"]})
+            evaluated.append(
+                {
+                    "symbol": sym,
+                    "oi": 0,
+                    "volume": 0,
+                    "bid": 0,
+                    "ask": 0,
+                    "score": 0,
+                    "error": result["error"],
+                }
+            )
             continue
 
         data = result.get("data", result)
@@ -218,7 +245,16 @@ def select_best_liquid_strike(
         volume = data.get("volume", 0) or 0
         score = (oi * 0.7) + (volume * 0.3)
 
-        evaluated.append({"symbol": sym, "oi": int(oi), "volume": int(volume), "bid": bid, "ask": ask, "score": score})
+        evaluated.append(
+            {
+                "symbol": sym,
+                "oi": int(oi),
+                "volume": int(volume),
+                "bid": bid,
+                "ask": ask,
+                "score": score,
+            }
+        )
 
         if bid > 0 and ask > 0 and score > best_score:
             best_score = score
@@ -231,10 +267,18 @@ def select_best_liquid_strike(
             }
 
     if best_result is None:
-        logger.warning(f"Liquidity selection: no valid strikes for {underlying} {option_type_upper} - evaluated: {evaluated}")
-        return False, {"status": "error", "message": "No strikes with valid bid/ask prices found"}, 400
+        logger.warning(
+            f"Liquidity selection: no valid strikes for {underlying} {option_type_upper} - evaluated: {evaluated}"
+        )
+        return (
+            False,
+            {"status": "error", "message": "No strikes with valid bid/ask prices found"},
+            400,
+        )
 
-    logger.info(f"Liquidity selection: best={best_result['symbol']} score={best_score}, evaluated={evaluated}")
+    logger.info(
+        f"Liquidity selection: best={best_result['symbol']} score={best_score}, evaluated={evaluated}"
+    )
     return True, {"status": "success", **best_result, "evaluated_strikes": evaluated}, 200
 
 
@@ -409,7 +453,11 @@ def place_options_order(
             liquidity_fallback_enabled = smart_rules.get("liquidity_fallback", True)
 
             if liquidity_fallback_enabled:
-                should_fallback = (offset.upper() == "ATM") or (not option_bid or option_bid <= 0) or (not option_ask or option_ask <= 0)
+                should_fallback = (
+                    (offset.upper() == "ATM")
+                    or (not option_bid or option_bid <= 0)
+                    or (not option_ask or option_ask <= 0)
+                )
 
                 if should_fallback:
                     logger.info(
@@ -445,7 +493,9 @@ def place_options_order(
 
                         # Re-fetch quotes for the selected symbol
                         success, quote_response, status_code = get_quotes(
-                            symbol=resolved_symbol, exchange=resolved_exchange, api_key=symbol_api_key
+                            symbol=resolved_symbol,
+                            exchange=resolved_exchange,
+                            api_key=symbol_api_key,
                         )
                         if not success:
                             return (
@@ -461,7 +511,9 @@ def place_options_order(
                         option_ask = quote_response.get("data", {}).get("ask", 0)
                     else:
                         # Fallback failed
-                        if (not option_bid or option_bid <= 0) or (not option_ask or option_ask <= 0):
+                        if (not option_bid or option_bid <= 0) or (
+                            not option_ask or option_ask <= 0
+                        ):
                             return (
                                 False,
                                 {
@@ -471,23 +523,23 @@ def place_options_order(
                                 fb_status if fb_status != 200 else 400,
                             )
 
-            # Determine base price based on action
-            # BUY: Use ask price (what sellers are asking)
-            # SELL: Use bid price (what buyers are bidding)
+            # Determine base price based on action with configurable execution buffer
+            # BUY: Use ask + buffer% (what sellers are asking)
+            # SELL: Use bid - buffer% (what buyers are bidding)
+            execution_buffer = float(os.getenv("EXECUTION_BUFFER", "0.05"))
+            buffer_pct = int(execution_buffer * 100)
             if action == "BUY":
                 if option_ask and option_ask > 0:
-                    base_price = option_ask
-                    price_source = "ask"
+                    base_price = option_ask * (1 + execution_buffer)
+                    price_source = f"ask+{buffer_pct}%"
                 else:
-                    # Fallback to LTP if ask not available
                     base_price = option_ltp
                     price_source = "ltp_fallback"
             else:  # SELL
                 if option_bid and option_bid > 0:
-                    base_price = option_bid
-                    price_source = "bid"
+                    base_price = option_bid * (1 - execution_buffer)
+                    price_source = f"bid-{buffer_pct}%"
                 else:
-                    # Fallback to LTP if bid not available
                     base_price = option_ltp
                     price_source = "ltp_fallback"
 
