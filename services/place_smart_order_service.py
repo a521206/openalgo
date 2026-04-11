@@ -2,7 +2,7 @@ import copy
 import importlib
 import time
 import traceback
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from database.analyzer_db import async_log_analyzer
 from database.apilog_db import async_log_order, executor
@@ -17,7 +17,6 @@ from services.smart_trade_rules_service import (
 )
 from services.symbol_service import get_symbol_info_with_auth
 from services.telegram_alert_service import telegram_alert_service
-from utils.api_analyzer import analyze_request, generate_order_id
 from utils.config import get_execution_buffer
 from utils.constants import (
     REQUIRED_SMART_ORDER_FIELDS,
@@ -144,6 +143,16 @@ def _fetch_position_for_validation(
     )
 
 
+def _build_error_response(
+    original_data: dict[str, Any], error_message: str
+) -> tuple[bool, dict[str, Any], int]:
+    if get_analyze_mode():
+        return False, emit_analyzer_error(original_data, error_message), 400
+    error_response = {"status": "error", "message": error_message}
+    executor.submit(async_log_order, "placesmartorder", original_data, error_response)
+    return False, error_response, 400
+
+
 def validate_smart_order(order_data: dict[str, Any]) -> tuple[bool, str | None]:
     """
     Validate smart order data
@@ -175,11 +184,11 @@ def validate_smart_order(order_data: dict[str, Any]) -> tuple[bool, str | None]:
             )
 
     # Validate price type if provided
-    if "price_type" in order_data and order_data["price_type"] not in VALID_PRICE_TYPES:
+    if "pricetype" in order_data and order_data["pricetype"] not in VALID_PRICE_TYPES:
         return False, f"Invalid price type. Must be one of: {', '.join(VALID_PRICE_TYPES)}"
 
     # Validate product type if provided
-    if "product_type" in order_data and order_data["product_type"] not in VALID_PRODUCT_TYPES:
+    if "product" in order_data and order_data["product"] not in VALID_PRODUCT_TYPES:
         return False, f"Invalid product type. Must be one of: {', '.join(VALID_PRODUCT_TYPES)}"
 
     return True, None
@@ -209,22 +218,36 @@ def place_smart_order_with_auth(
         - HTTP status code (int)
     """
     order_request_data = copy.deepcopy(original_data)
-    if "apikey" in order_request_data:
-        order_request_data.pop("apikey", None)
+    order_request_data.pop("apikey", None)
 
     # Validate order data
     is_valid, error_message = validate_smart_order(order_data)
     if not is_valid:
-        # Provide fallback for error_message if None
-        error_msg = error_message or "Validation failed"
-        if get_analyze_mode():
-            return False, emit_analyzer_error(original_data, error_msg), 400
-        error_response = {"status": "error", "message": error_msg}
-        executor.submit(async_log_order, "placesmartorder", original_data, error_response)
-        return False, error_response, 400
+        return _build_error_response(original_data, error_message or "Validation failed")
 
     # Get current position with fail-safe handling
     position_result = _fetch_position_for_validation(broker, order_data, auth_token)
+    current_position = position_result.quantity
+
+    # Calculate target position_size for scale-out (single location)
+    scale_pct = int(order_data.get("scale_pct", 0) or 0)
+    scale_qty = int(order_data.get("scale_qty", 0) or 0)
+    position_size = int(order_data.get("position_size", 0))
+
+    if position_size == 0 and current_position != 0 and (scale_pct > 0 or scale_qty > 0):
+        if scale_pct > 0:
+            position_size = int(current_position * (100 - scale_pct) / 100)
+        else:
+            if current_position > 0:
+                # Long position: reduce by scale_qty, floor at 0
+                position_size = max(0, current_position - scale_qty)
+            else:
+                # Short position: reduce exposure by scale_qty, ceil at 0
+                position_size = min(0, current_position + scale_qty)
+        order_data["position_size"] = str(position_size)
+        logger.info(
+            f"Scale-out: current={current_position}, scale={scale_pct or scale_qty}, target={position_size}"
+        )
 
     # Validate against smart trade rules
     is_valid, error_message = validate_against_smart_trade_rules(
@@ -232,13 +255,7 @@ def place_smart_order_with_auth(
     )
 
     if not is_valid:
-        # Provide fallback for error_message if None
-        error_msg = error_message or "Validation failed"
-        if get_analyze_mode():
-            return False, emit_analyzer_error(original_data, error_msg), 400
-        error_response = {"status": "error", "message": error_msg}
-        executor.submit(async_log_order, "placesmartorder", original_data, error_response)
-        return False, error_response, 400
+        return _build_error_response(original_data, error_message or "Validation failed")
 
     # If in analyze mode, route to sandbox for virtual trading
     if get_analyze_mode():
@@ -311,8 +328,8 @@ def place_smart_order_with_auth(
 
         api_key = original_data.get("apikey")
         success, quote_response, _ = get_quotes(
-            symbol=order_data.get("symbol"),
-            exchange=order_data.get("exchange"),
+            symbol=symbol,
+            exchange=exchange,
             api_key=api_key,
         )
 
@@ -335,16 +352,16 @@ def place_smart_order_with_auth(
                 order_data["price"] = round_price_to_tick_size(discovered_price, tick_size)
                 buffer_pct = round(execution_buffer * 100, 1)
                 logger.info(
-                    f"Price discovered for {order_data.get('symbol')}: "
+                    f"Price discovered for {symbol}: "
                     f"{order_data['price']} ({action}, buffer={buffer_pct}%)"
                 )
             else:
                 logger.warning(
-                    f"Invalid price from quote for {order_data.get('symbol')}: {discovered_price}"
+                    f"Invalid price from quote for {symbol}: {discovered_price}"
                 )
         else:
             logger.warning(
-                f"Price discovery failed for {order_data.get('symbol')}: "
+                f"Price discovery failed for {symbol}: "
                 f"{quote_response.get('message', 'Unknown error')}"
             )
 
@@ -411,6 +428,13 @@ def place_smart_order_with_auth(
                     "mode": "live",
                 },
             )
+            # Apply rate-limiting delay before returning
+            try:
+                time.sleep(float(smart_order_delay))
+            except Exception:
+                logger.error(f"Invalid SMART_ORDER_DELAY value: {smart_order_delay}")
+                traceback.print_exc()
+            return True, order_response_data, 200
 
     except Exception as e:
         logger.error(f"Error in broker_module.place_smartorder_api: {e}")
@@ -422,25 +446,15 @@ def place_smart_order_with_auth(
         executor.submit(async_log_order, "placesmartorder", original_data, error_response)
         return False, error_response, 500
 
-    # Add delay if needed
-    try:
-        time.sleep(float(smart_order_delay))
-    except Exception:
-        logger.error(f"Invalid SMART_ORDER_DELAY value: {smart_order_delay}")
-        traceback.print_exc()
-
-    if res and res.status == 200:
-        return True, order_response_data, 200
-    else:
-        message = (
-            response_data.get("message", "Failed to place smart order")
-            if isinstance(response_data, dict)
-            else "Failed to place smart order"
-        )
-        error_response = {"status": "error", "message": message}
-        executor.submit(async_log_order, "placesmartorder", original_data, error_response)
-        status_code = res.status if res and hasattr(res, "status") else 500
-        return False, error_response, status_code
+    message = (
+        response_data.get("message", "Failed to place smart order")
+        if isinstance(response_data, dict)
+        else "Failed to place smart order"
+    )
+    error_response = {"status": "error", "message": message}
+    executor.submit(async_log_order, "placesmartorder", original_data, error_response)
+    status_code = res.status if res and hasattr(res, "status") else 500
+    return False, error_response, status_code
 
 
 def place_smart_order(

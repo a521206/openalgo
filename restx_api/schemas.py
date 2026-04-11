@@ -43,6 +43,14 @@ class SmartOrderSchema(Schema):
         validate=validate.Range(min=0, error="Quantity must be a non-negative integer."),
     )
     position_size = fields.Int(required=True)
+    scale_pct = fields.Int(
+        missing=0,
+        validate=validate.Range(min=0, max=100, error="Scale percentage must be 0-100."),
+    )
+    scale_qty = fields.Int(
+        missing=0,
+        validate=validate.Range(min=0, error="Scale quantity must be a non-negative integer."),
+    )
     pricetype = fields.Str(
         missing="MARKET", validate=validate.OneOf(["MARKET", "LIMIT", "SL", "SL-M"])
     )
@@ -172,7 +180,9 @@ class OptionsOrderSchema(Schema):
     underlying = fields.Str(
         required=True
     )  # Underlying symbol (NIFTY, BANKNIFTY, RELIANCE, or NIFTY28NOV24FUT)
-    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE, NFO, BFO)
+    exchange = fields.Str(
+        required=True, validate=validate.OneOf(VALID_EXCHANGES)
+    )  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE, NFO, BFO)
     expiry_date = fields.Str(
         required=False
     )  # Optional if underlying includes expiry (DDMMMYY format)
@@ -222,7 +232,9 @@ class OptionsOrderSchema(Schema):
     )
     price_adjustment_value = fields.Float(
         missing=2.0,
-        validate=validate.Range(min=0, max=10.0, error="Adjustment value must be between 0 and 10."),
+        validate=validate.Range(
+            min=0, max=10.0, error="Adjustment value must be between 0 and 10."
+        ),
         metadata={
             "description": "Adjustment value (percentage or absolute amount). "
             "Maximum allowed: 10 for percentage, 10.0 for absolute. "
@@ -276,7 +288,9 @@ class OptionsMultiOrderSchema(Schema):
     apikey = fields.Str(required=True)
     strategy = fields.Str(required=True)
     underlying = fields.Str(required=True)  # Underlying symbol (NIFTY, BANKNIFTY, RELIANCE)
-    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE)
+    exchange = fields.Str(
+        required=True, validate=validate.OneOf(VALID_EXCHANGES)
+    )  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE)
     expiry_date = fields.Str(
         required=False
     )  # Optional if underlying includes expiry (DDMMMYY format)
@@ -295,7 +309,9 @@ class SyntheticFutureSchema(Schema):
 
     apikey = fields.Str(required=True)
     underlying = fields.Str(required=True)  # Underlying symbol (NIFTY, BANKNIFTY, RELIANCE)
-    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE)
+    exchange = fields.Str(
+        required=True, validate=validate.OneOf(VALID_EXCHANGES)
+    )  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE)
     expiry_date = fields.Str(required=True)  # Expiry date in DDMMMYY format (e.g., 28OCT25)
 
 
@@ -308,9 +324,7 @@ class MarginPositionSchema(Schema):
             min=1, max=50, error="Symbol must be between 1 and 50 characters."
         ),
     )
-    exchange = fields.Str(
-        required=True, validate=validate.OneOf(VALID_EXCHANGES)
-    )
+    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
     action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
     quantity = fields.Str(required=True)  # String to match API contract, validated in service layer
     product = fields.Str(required=True, validate=validate.OneOf(["MIS", "NRML", "CNC"]))
