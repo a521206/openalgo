@@ -56,6 +56,8 @@ class TelegramBotService:
         self.bot_loop = None  # Store the bot's event loop
         self.sdk_clients = {}  # Cache for OpenAlgo SDK clients per user
         self._stop_event = original_threading.Event()  # Thread-safe stop signal
+        self._consecutive_network_errors = 0
+        self._max_consecutive_errors = 5
 
     def _get_sdk_client(self, telegram_id: int) -> openalgo_api | None:
         """Get or create OpenAlgo SDK client for a user"""
@@ -595,20 +597,32 @@ class TelegramBotService:
 
         error = context.error
 
-        # Handle specific Telegram API errors
-        if isinstance(error, telegram.error.NetworkError):
-            logger.warning(f"Telegram NetworkError: {error}. Will retry automatically.")
+        if isinstance(error, (telegram.error.NetworkError, telegram.error.TimedOut)):
+            self._consecutive_network_errors += 1
+            error_name = type(error).__name__
+            logger.warning(
+                f"Telegram {error_name} (recoverable, consecutive: {self._consecutive_network_errors}): {error}. "
+                "Bot will retry automatically."
+            )
+            if self._consecutive_network_errors >= self._max_consecutive_errors:
+                logger.error(
+                    f"Too many consecutive {error_name} errors in handle_error. Stopping bot."
+                )
+                self.is_running = False
+                self._stop_event.set()
         elif isinstance(error, telegram.error.Conflict):
             logger.error("Another instance of the bot is running! Please stop other instances.")
             self.is_running = False
-        elif isinstance(error, telegram.error.TimedOut):
-            logger.warning("Request to Telegram timed out. Will retry automatically.")
         elif isinstance(error, telegram.error.BadRequest):
             logger.error(f"Bad request to Telegram API: {error}")
+        elif isinstance(error, telegram.error.Forbidden):
+            logger.warning(f"Bot access forbidden (user blocked or chat left): {error}")
+        elif isinstance(error, telegram.error.RetryAfter):
+            retry_after = getattr(error, "retry_after", 60)
+            logger.warning(f"Rate limited by Telegram. PTB will handle retry after {retry_after}s.")
         else:
             logger.error(f"Unhandled error in Telegram bot: {error}", exc_info=error)
 
-        # If we have an update, try to inform the user (if possible)
         if update and hasattr(update, "effective_chat"):
             try:
                 await context.bot.send_message(
@@ -616,7 +630,7 @@ class TelegramBotService:
                     text="⚠️ An error occurred. Please try again later.",
                 )
             except:
-                pass  # If we can't send the message, just ignore
+                pass
 
     async def _start_bot_isolated(self):
         """Start the bot with proper handlers and network error handling"""
@@ -628,104 +642,94 @@ class TelegramBotService:
             CommandHandler,
         )
 
-        retry_count = 0
-        max_retries = 5
-        base_delay = 5  # seconds
-
-        while retry_count < max_retries:
+        while not self._stop_event.is_set():
             try:
-                # Create application
-                self.application = Application.builder().token(self.bot_token).build()
+                if self.application is None:
+                    self.application = Application.builder().token(self.bot_token).build()
+                    self.application.add_handler(CommandHandler("start", self.cmd_start))
+                    self.application.add_handler(CommandHandler("help", self.cmd_help))
+                    self.application.add_handler(CommandHandler("link", self.cmd_link))
+                    self.application.add_handler(CommandHandler("unlink", self.cmd_unlink))
+                    self.application.add_handler(CommandHandler("status", self.cmd_status))
+                    self.application.add_handler(CommandHandler("orderbook", self.cmd_orderbook))
+                    self.application.add_handler(CommandHandler("tradebook", self.cmd_tradebook))
+                    self.application.add_handler(CommandHandler("positions", self.cmd_positions))
+                    self.application.add_handler(CommandHandler("holdings", self.cmd_holdings))
+                    self.application.add_handler(CommandHandler("funds", self.cmd_funds))
+                    self.application.add_handler(CommandHandler("pnl", self.cmd_pnl))
+                    self.application.add_handler(CommandHandler("quote", self.cmd_quote))
+                    self.application.add_handler(CommandHandler("chart", self.cmd_chart))
+                    self.application.add_handler(CommandHandler("menu", self.cmd_menu))
+                    self.application.add_handler(CallbackQueryHandler(self.button_callback))
+                    self.application.add_error_handler(self.handle_error)
+                    await self.application.initialize()
+                    await self.application.start()
 
-                # Add command handlers
-                self.application.add_handler(CommandHandler("start", self.cmd_start))
-                self.application.add_handler(CommandHandler("help", self.cmd_help))
-                self.application.add_handler(CommandHandler("link", self.cmd_link))
-                self.application.add_handler(CommandHandler("unlink", self.cmd_unlink))
-                self.application.add_handler(CommandHandler("status", self.cmd_status))
-                self.application.add_handler(CommandHandler("orderbook", self.cmd_orderbook))
-                self.application.add_handler(CommandHandler("tradebook", self.cmd_tradebook))
-                self.application.add_handler(CommandHandler("positions", self.cmd_positions))
-                self.application.add_handler(CommandHandler("holdings", self.cmd_holdings))
-                self.application.add_handler(CommandHandler("funds", self.cmd_funds))
-                self.application.add_handler(CommandHandler("pnl", self.cmd_pnl))
-                self.application.add_handler(CommandHandler("quote", self.cmd_quote))
-                self.application.add_handler(CommandHandler("chart", self.cmd_chart))
-                self.application.add_handler(CommandHandler("menu", self.cmd_menu))
-
-                # Add callback query handler for inline buttons
-                self.application.add_handler(CallbackQueryHandler(self.button_callback))
-
-                # Add error handler for network issues
-                self.application.add_error_handler(self.handle_error)
-
-                # Initialize
-                await self.application.initialize()
-                await self.application.start()
-
-                # Configure polling with better error handling
                 logger.debug("Starting bot in polling mode...")
+
                 await self.application.updater.start_polling(
-                    drop_pending_updates=True,  # Ignore old messages
+                    drop_pending_updates=True,
                     allowed_updates=Update.ALL_TYPES,
+                    poll_interval=1.0,
+                    timeout=30,
                 )
 
                 self.is_running = True
                 update_bot_config({"is_active": True})
                 logger.debug("Telegram bot started successfully and is polling for updates")
-
-                # Reset retry count on successful connection
-                retry_count = 0
-
-                # Keep running until stop signal
-                while not self._stop_event.is_set():
-                    await asyncio.sleep(1)
-
-                # Stop signal received - clean shutdown
-                logger.debug("Stop signal received, shutting down bot...")
-                self.is_running = False
-
-                # Stop the updater and wait for tasks to complete
-                if self.application and self.application.updater.running:
-                    await self.application.updater.stop()
-                    await self.application.stop()
-                    await self.application.shutdown()
-                    # Give tasks a moment to clean up
-                    await asyncio.sleep(0.5)
-
-                # Clean shutdown when is_running becomes False
-                logger.debug("Bot stopping gracefully...")
-                break
+                self._consecutive_network_errors = 0
 
             except (
                 httpx.ConnectError,
                 httpx.NetworkError,
                 httpx.TimeoutException,
                 telegram.error.NetworkError,
+                telegram.error.TimedOut,
             ) as e:
-                retry_count += 1
-                delay = base_delay * (2**retry_count)  # Exponential backoff
+                self._consecutive_network_errors += 1
+                delay = min(60, 5 * (2**self._consecutive_network_errors))
+
                 logger.warning(
-                    f"Network error while connecting to Telegram (attempt {retry_count}/{max_retries}): {type(e).__name__}"
+                    f"Network error during polling (attempt {self._consecutive_network_errors}): {type(e).__name__}"
                 )
                 logger.debug(f"Network error details: {str(e)}")
 
-                if retry_count < max_retries:
-                    logger.info(f"Retrying in {delay} seconds...")
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error("Max retries reached. Unable to connect to Telegram servers.")
-                    logger.info(
-                        "This might be due to: 1) No internet connection, 2) Telegram blocked by firewall/ISP, 3) DNS issues"
-                    )
+                if self._consecutive_network_errors >= self._max_consecutive_errors:
+                    logger.error("Too many consecutive network errors. Stopping bot.")
                     self.is_running = False
                     break
 
+                logger.info(f"Retrying polling in {delay} seconds...")
+
+                if self.application and self.application.updater:
+                    try:
+                        await self.application.updater.stop()
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(delay)
+                continue
+
             except Exception as e:
-                # For non-network errors, log and stop
                 logger.exception(f"Unexpected error in bot operation: {e}")
                 self.is_running = False
+                self.application = None
                 break
+
+            while not self._stop_event.is_set():
+                await asyncio.sleep(1)
+
+            logger.debug("Stop signal received, shutting down bot...")
+            self.is_running = False
+
+            if self.application and self.application.updater.running:
+                await self.application.updater.stop()
+                await self.application.stop()
+                await self.application.shutdown()
+                await asyncio.sleep(0.5)
+
+            logger.debug("Bot stopping gracefully...")
+            break
 
         # Cleanup after the retry loop
         if (
@@ -752,6 +756,9 @@ class TelegramBotService:
 
             # Reset stop event
             self._stop_event.clear()
+
+            # Reset error counter for fresh start
+            self._consecutive_network_errors = 0
 
             # Start bot in separate thread with isolated event loop
             self.bot_thread = original_threading.Thread(
@@ -1108,7 +1115,9 @@ class TelegramBotService:
             try:
                 price = float(order.get("price", 0))
                 price_str = (
-                    "Market" if price == 0 and order.get("pricetype") == "MARKET" else f"{cs}{price}"
+                    "Market"
+                    if price == 0 and order.get("pricetype") == "MARKET"
+                    else f"{cs}{price}"
                 )
             except (ValueError, TypeError):
                 price_str = f"{cs}{order.get('price', 0)}"
@@ -1823,7 +1832,7 @@ class TelegramBotService:
 
         log_command(user.id, "menu", update.effective_chat.id)
 
-    def _format_orderbook(self, response: dict, cs: str = '₹') -> str:
+    def _format_orderbook(self, response: dict, cs: str = "₹") -> str:
         """Format orderbook response into message"""
         if not response or response.get("status") != "success":
             return "❌ Failed to fetch orderbook"
@@ -1863,7 +1872,7 @@ class TelegramBotService:
             message += f"_... and {len(orders) - 10} more orders_"
         return message
 
-    def _format_tradebook(self, response: dict, cs: str = '₹') -> str:
+    def _format_tradebook(self, response: dict, cs: str = "₹") -> str:
         """Format tradebook response into message"""
         if not response or response.get("status") != "success":
             return "❌ Failed to fetch tradebook"
@@ -1893,7 +1902,7 @@ class TelegramBotService:
             message += f"_... and {len(trades) - 10} more trades_"
         return message
 
-    def _format_positions(self, response: dict, cs: str = '₹') -> str:
+    def _format_positions(self, response: dict, cs: str = "₹") -> str:
         """Format positions response into message"""
         if not response or response.get("status") != "success":
             return "❌ Failed to fetch positions"
@@ -1920,7 +1929,7 @@ class TelegramBotService:
             message += f"_... and {len(active_positions) - 10} more positions_"
         return message
 
-    def _format_holdings(self, response: dict, cs: str = '₹') -> str:
+    def _format_holdings(self, response: dict, cs: str = "₹") -> str:
         """Format holdings response into message"""
         if not response or response.get("status") != "success":
             return "❌ Failed to fetch holdings"
@@ -1943,7 +1952,7 @@ class TelegramBotService:
             message += f"_... and {len(holdings) - 10} more holdings_"
         return message
 
-    def _format_funds(self, response: dict, cs: str = '₹') -> str:
+    def _format_funds(self, response: dict, cs: str = "₹") -> str:
         """Format funds response into message"""
         if not response or response.get("status") != "success":
             return "❌ Failed to fetch funds"
@@ -1964,7 +1973,7 @@ class TelegramBotService:
             f"💼 Total: {cs}{(available + collateral):,.2f}"
         )
 
-    def _format_pnl(self, response: dict, cs: str = '₹') -> str:
+    def _format_pnl(self, response: dict, cs: str = "₹") -> str:
         """Format P&L response into message (uses positionbook data)"""
         if not response or response.get("status") != "success":
             return "❌ Failed to fetch P&L"
@@ -1979,7 +1988,9 @@ class TelegramBotService:
                 pass
 
         pnl_emoji = "🟢" if total_pnl > 0 else "🔴" if total_pnl < 0 else "⚪"
-        return f"💹 *PROFIT & LOSS*\n━━━━━━━━━━━━━━━\n\n{pnl_emoji} *Day P&L*\n└ {cs}{total_pnl:,.2f}"
+        return (
+            f"💹 *PROFIT & LOSS*\n━━━━━━━━━━━━━━━\n\n{pnl_emoji} *Day P&L*\n└ {cs}{total_pnl:,.2f}"
+        )
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle inline button callbacks"""
@@ -2136,7 +2147,9 @@ class TelegramBotService:
                         # Add small delay to avoid rate limits
                         await asyncio.sleep(0.1)
                 except Exception as e:
-                    logger.exception(f"Failed to send broadcast to {user.get('telegram_id')}: {str(e)}")
+                    logger.exception(
+                        f"Failed to send broadcast to {user.get('telegram_id')}: {str(e)}"
+                    )
                     fail_count += 1
 
             logger.debug(f"Broadcast complete: {success_count} success, {fail_count} failed")
