@@ -101,12 +101,7 @@ class TelegramBotService:
             pass
         if hasattr(self, "bot_loop") and self.bot_loop:
             return self.bot_loop
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            return loop
-        except RuntimeError:
-            return None
+        return None
 
     async def _make_sdk_call(self, telegram_id: int, method: str, **kwargs) -> dict | None:
         """Make an SDK call in async context"""
