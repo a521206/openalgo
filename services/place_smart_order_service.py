@@ -228,22 +228,40 @@ def place_smart_order_with_auth(
     # Get current position with fail-safe handling
     position_result = _fetch_position_for_validation(broker, order_data, auth_token)
     current_position = position_result.quantity
+    logger.info(
+        f"DIAG: Position fetch - symbol={order_data.get('symbol')}, exchange={order_data.get('exchange')}, "
+        f"product={order_data.get('product')}, current_position={current_position}, status={position_result.status}, "
+        f"error={position_result.error_message}"
+    )
 
     # Calculate target position_size for scale-out (single location)
     scale_pct = int(order_data.get("scale_pct", 0) or 0)
     scale_qty = int(order_data.get("scale_qty", 0) or 0)
     position_size = int(order_data.get("position_size", 0))
+    logger.info(
+        f"DIAG: Scale inputs - position_size={position_size}, scale_pct={scale_pct}, scale_qty={scale_qty}"
+    )
 
-    if position_size == 0 and current_position != 0 and (scale_pct > 0 or scale_qty > 0):
+    # Scale condition check
+    scale_condition_met = (
+        position_size == 0 and current_position != 0 and (scale_pct > 0 or scale_qty > 0)
+    )
+    logger.info(
+        f"DIAG: Scale condition check - pos_size_z={position_size == 0}, curr_pos_nz={current_position != 0}, scale_pct_z={scale_pct > 0}, scale_qty_z={scale_qty > 0} => {scale_condition_met}"
+    )
+
+    if scale_condition_met:
+        logger.info(
+            f"DIAG: Scale calculation START - current={current_position}, scale_pct={scale_pct}"
+        )
         if scale_pct > 0:
             position_size = int(current_position * (100 - scale_pct) / 100)
         else:
             if current_position > 0:
-                # Long position: reduce by scale_qty, floor at 0
                 position_size = max(0, current_position - scale_qty)
             else:
-                # Short position: reduce exposure by scale_qty, ceil at 0
                 position_size = min(0, current_position + scale_qty)
+        logger.info(f"DIAG: Scale calculation DONE - new target position_size={position_size}")
         order_data["position_size"] = str(position_size)
         logger.info(
             f"Scale-out: current={current_position}, scale={scale_pct or scale_qty}, target={position_size}"
@@ -356,9 +374,7 @@ def place_smart_order_with_auth(
                     f"{order_data['price']} ({action}, buffer={buffer_pct}%)"
                 )
             else:
-                logger.warning(
-                    f"Invalid price from quote for {symbol}: {discovered_price}"
-                )
+                logger.warning(f"Invalid price from quote for {symbol}: {discovered_price}")
         else:
             logger.warning(
                 f"Price discovery failed for {symbol}: "

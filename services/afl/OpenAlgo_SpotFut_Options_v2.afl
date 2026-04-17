@@ -88,10 +88,10 @@ function PostOptionOrder( offset_val, opt_type, act, qty, apikey_val, strategy_v
 {
 
     url = host_val + "/api/" + ver_val + "/optionsorder";
-    _TRACEF( "PostOptionOrder: quantity = %g\n", qty );
-
+	_TRACEF( "PostOptionOrder: quantity = %g\n", qty );
     if( LastValue( qty ) == 0 )
         _TRACE( "Quantity is Zero" );
+
 
     /* Construct JSON request body */
     body = "{\"apikey\": \"" + apikey_val + "\", " +
@@ -141,9 +141,10 @@ function PostOptionOrder( offset_val, opt_type, act, qty, apikey_val, strategy_v
 }
 
 /* Function to exit position using placesmartorder with quantity=0 and position_size=0 */
-function ExitPosition( sym, exch, product_type, apikey_val, strategy_val, host_val, ver_val, scale_pct_val, scale_qty_val )
+function ExitPosition( sym, exch, product_type, apikey_val, strategy_val, host_val, ver_val )
 {
     pricetype_val = "LIMIT";
+    printf( ", pricetype_val = %s\n", pricetype_val );
 
     /* Build postData for smart exit */
     postData = "{\"apikey\": \"" + apikey_val + "\", " +
@@ -154,18 +155,7 @@ function ExitPosition( sym, exch, product_type, apikey_val, strategy_val, host_v
                "\"pricetype\": \"" + pricetype_val + "\", " +
                "\"product\": \"" + product_type + "\", " +
                "\"quantity\": \"0\", " +
-               "\"position_size\": \"0\"";
-
-    /* Add scale params if provided */
-    if( scale_pct_val > 0 )
-        postData = postData +
-                   ", \"scale_pct\": \"" + NumToStr( scale_pct_val, 1.0, False ) + "\"}";
-    else
-        if( scale_qty_val > 0 )
-            postData = postData +
-                       ", \"scale_qty\":\"" + NumToStr( scale_qty_val, 1.0, False ) + "\"}";
-        else
-            postData = postData + "}";
+               "\"position_size\": \"0\"}";
 
     headers = "Content-Type: application/json\r\n";
     InternetSetHeaders( headers );
@@ -242,6 +232,7 @@ else
     PE_offset = ParamStr( "PE Offset", "ATM" ); /* ATM, ITM1, ITM2, OTM1, OTM2, etc. */
 
     /* Order Settings */
+    LotSize 	= RoundLotSize;
     // quantity 	= IIf(StrFind( Name(), "NIFTY" ) > 0, IIf( Buy, bLots, IIf( Short, sLots, 0) ), 1) * RoundLotSize; // Only 1 lots for other stocks for now
     quantity 	= 2 * IIf( Buy, bLots, IIf( Short, sLots, 0 ) ) * RoundLotSize;
 
@@ -252,11 +243,6 @@ else
     /* Alert and Timing Settings */
     VoiceAlert = ParamList( "Voice Alert", "Disable|Enable", 1 );
     EnableAlgo = ParamList( "AlgoStatus", "Disable|Enable|LongOnly|ShortOnly", 1 );
-
-    /* Scale Out Settings */
-    ScaleOutMode    = "Percentage";
-    ScaleOutPct     = 50;
-    ScaleOutLots    = 0;
 
     /* --------------------------------------------------------------------------
        Static Variable Names for Tracking
@@ -273,10 +259,6 @@ else
     static_PE_order = static_name_ + "_PE_order";
     static_PE_symbol = static_name_ + "_PE_symbol";
     static_PE_exchange = static_name_ + "_PE_exchange";
-
-    /* Scale out tracking */
-    static_scaleout_algo = static_name_ + "_scaleout_algo";
-    static_scaleout_barvalue = static_name_ + "_scaleout_barvalue";
 
     /* --------------------------------------------------------------------------
        OpenAlgo Dashboard Display
@@ -355,15 +337,61 @@ else
         btnRefreshMemory = IDset;
         GuiSetColors( btnRefreshMemory, btnRefreshMemory, 1, colorWhite, colorDarkTeal, colorWhite );
     */
+    /* Process Button Click Events */
+    for( i = 0; ( cid = GuiGetEvent( i, 0 ) ) > 0; i++ )
+    {
+        if( GuiGetEvent( i, 1 ) == notifyClicked )
+        {
+            if( cid == btnRefreshMemory )
+            {
+                _TRACE( "=== REFRESH MEMORY BUTTON CLICKED ===" );
+
+                /* Clear CE Position Tracking */
+                StaticVarSet( static_CE_order, 0, True );
+                StaticVarSetText( static_CE_symbol, "", True );
+                StaticVarSetText( static_CE_exchange, "", True );
+
+                /* Clear PE Position Tracking */
+                StaticVarSet( static_PE_order, 0, True );
+                StaticVarSetText( static_PE_symbol, "", True );
+                StaticVarSetText( static_PE_exchange, "", True );
+
+                /* Clear All Signal Tracking Variables */
+                StaticVarSet( static_name_ + "buyCoverAlgo", 0, True );
+                StaticVarSetText( static_name_ + "buyCoverAlgo_barvalue", "", True );
+
+                StaticVarSet( static_name_ + "buyAlgo", 0, True );
+                StaticVarSetText( static_name_ + "buyAlgo_barvalue", "", True );
+
+                StaticVarSet( static_name_ + "sellAlgo", 0, True );
+                StaticVarSetText( static_name_ + "sellAlgo_barvalue", "", True );
+
+                StaticVarSet( static_name_ + "ShortSellAlgo", 0, True );
+                StaticVarSetText( static_name_ + "ShortSellAlgo_barvalue", "", True );
+
+                StaticVarSet( static_name_ + "ShortAlgo", 0, True );
+                StaticVarSetText( static_name_ + "ShortAlgo_barvalue", "", True );
+
+                StaticVarSet( static_name_ + "CoverAlgo", 0, True );
+                StaticVarSetText( static_name_ + "CoverAlgo_barvalue", "", True );
+
+                _TRACE( "All Static Variables Cleared Successfully" );
+
+                if( VoiceAlert == "Enable" )
+                {
+                    Say( "Memory Refreshed" );
+                }
+            }
+        }
+    }
 
     /* --------------------------------------------------------------------------
        Trading Signal Variables
        -------------------------------------------------------------------------- */
-    AlgoBuy	  = LastValue( Buy ) == 1;
+    AlgoBuy	  = LastValue( Buy );
     AlgoSell  = LastValue( Sell );
     AlgoShort = LastValue( Short );
     AlgoCover = LastValue( Cover );
-    AlgoScaleOut = LastValue( Buy ) == sigScaleOut;
 
     printf( "quantity = %g\n", quantity );
 
@@ -381,6 +409,7 @@ else
            ======================================================================== */
 
         /* Buy + Cover (Reversal from Short to Long) */
+        AlgoCondition = AlgoBuy == True AND AlgoCover == True AND StaticVarGet( static_name_ + "buyCoverAlgo" ) == 0 AND StaticVarGetText( static_name_ + "buyCoverAlgo_barvalue" ) != lasttime;
 
         if( AlgoBuy == True AND AlgoCover == True AND StaticVarGet( static_name_ + "buyCoverAlgo" ) == 0 AND StaticVarGetText( static_name_ + "buyCoverAlgo_barvalue" ) != lasttime )
         {
@@ -393,7 +422,7 @@ else
                 if( exit_symbol != "" AND Nz( StaticVarGet( static_PE_order ), 0 ) == 1 )
                 {
                     _TRACE( "Exiting PE Position for Reversal: " + exit_symbol );
-                    response = ExitPosition( exit_symbol, exit_exchange, product, apikey, strategy, host, ver, 0, 0 );
+                    response = ExitPosition( exit_symbol, exit_exchange, product, apikey, strategy, host, ver );
 
                     has_success = StrFind( response, "\"status\":\"success\"" ) >= 0;
 
@@ -410,7 +439,7 @@ else
                 if( tradetype == "BUY" )
                 {
                     /* Option Buyer: Buy CE */
-                    _TRACEF( "Option Buyer: Buy CE: quantity = %g\n", quantity );
+					_TRACEF( "Option Buyer: Buy CE: quantity = %g\n", quantity );
                     response = PostOptionOrder( CE_offset, "CE", "BUY", quantity, apikey, strategy, underlying, exchange, expiry, pricetype, product, host, ver );
                 }
                 else
@@ -456,7 +485,7 @@ else
                 if( tradetype == "BUY" )
                 {
                     /* Option Buyer: Buy CE */
-                    _TRACEF( "Buy Only (Fresh Long Entry): quantity = %g\n", quantity );
+					_TRACEF( "Buy Only (Fresh Long Entry): quantity = %g\n", quantity );
                     response = PostOptionOrder( CE_offset, "CE", "BUY", quantity, apikey, strategy, underlying, exchange, expiry, pricetype, product, host, ver );
                 }
                 else
@@ -506,7 +535,7 @@ else
             if( exit_symbol != "" AND Nz( StaticVarGet( static_CE_order ), 0 ) == 1 )
             {
                 _TRACE( "Exiting CE Position: " + exit_symbol );
-                response = ExitPosition( exit_symbol, exit_exchange, product, apikey, strategy, host, ver, 0, 0 );
+                response = ExitPosition( exit_symbol, exit_exchange, product, apikey, strategy, host, ver );
 
                 has_success = StrFind( response, "\"status\":\"success\"" ) >= 0;
 
@@ -551,7 +580,7 @@ else
                 if( exit_symbol != "" AND Nz( StaticVarGet( static_CE_order ), 0 ) == 1 )
                 {
                     _TRACE( "Exiting CE Position for Reversal: " + exit_symbol );
-                    response = ExitPosition( exit_symbol, exit_exchange, product, apikey, strategy, host, ver, 0, 0 );
+                    response = ExitPosition( exit_symbol, exit_exchange, product, apikey, strategy, host, ver );
 
                     has_success = StrFind( response, "\"status\":\"success\"" ) >= 0;
 
@@ -568,7 +597,6 @@ else
                 if( tradetype == "BUY" )
                 {
                     /* Option Buyer: Buy PE */
-                    _TRACEF( "Short + Sell (Reversal from Long to Short): quantity = %g\n", quantity );
                     response = PostOptionOrder( PE_offset, "PE", "BUY", quantity, apikey, strategy, underlying, exchange, expiry, pricetype, product, host, ver );
                 }
                 else
@@ -614,7 +642,6 @@ else
                 if( tradetype == "BUY" )
                 {
                     /* Option Buyer: Buy PE */
-                    _TRACEF( "Short Only (Fresh Short Entry): quantity = %g\n", quantity );
                     response = PostOptionOrder( PE_offset, "PE", "BUY", quantity, apikey, strategy, underlying, exchange, expiry, pricetype, product, host, ver );
                 }
                 else
@@ -629,7 +656,7 @@ else
 
                 if( has_success AND symbol_resolved != "" )
                 {
-                    StaticVarSet( static_PE_order, 1, True );
+                    StaticVarSet( static_PE_order, 1 , 1 );
                     StaticVarSetText( static_PE_symbol, symbol_resolved, True, True );
                     StaticVarSetText( static_PE_exchange, exchange_resolved, True, True );
 
@@ -641,8 +668,8 @@ else
                     _TRACEF( "Short Order Success: %s", symbol_resolved );
                 }
 
-                StaticVarSet( static_name_ + "ShortAlgo", 1, True );
-                StaticVarSetText( static_name_ + "ShortAlgo_barvalue", lasttime, True );
+                StaticVarSet( static_name_ + "ShortAlgo", 1 );
+                StaticVarSetText( static_name_ + "ShortAlgo_barvalue", lasttime, 1 );
             }
         }
         else
@@ -664,7 +691,7 @@ else
             if( exit_symbol != "" AND Nz( StaticVarGet( static_PE_order ), 0 ) == 1 )
             {
                 _TRACE( "Exiting PE Position: " + exit_symbol );
-                response = ExitPosition( exit_symbol, exit_exchange, product, apikey, strategy, host, ver, 0, 0 );
+                response = ExitPosition( exit_symbol, exit_exchange, product, apikey, strategy, host, ver );
 
                 has_success = StrFind( response, "\"status\":\"success\"" ) >= 0;
 
@@ -691,73 +718,6 @@ else
             {
                 StaticVarSet( static_name_ + "CoverAlgo", 0, True );
                 StaticVarSetText( static_name_ + "CoverAlgo_barvalue", "", True );
-            }
-
-        /* ========================================================================
-           SCALE OUT SIGNAL PROCESSING
-           ======================================================================== */
-
-        if( ScaleOutMode != "Disable" AND AlgoScaleOut == True AND StaticVarGet( static_scaleout_algo ) == 0 AND
-                StaticVarGetText( static_scaleout_barvalue ) != lasttime )
-        {
-            /* Determine which position to scale out from */
-            ce_active = Nz( StaticVarGet( static_CE_order ), 0 );
-            pe_active = Nz( StaticVarGet( static_PE_order ), 0 );
-
-            exit_symbol = "";
-            exit_exchange = "";
-
-            /* Priority: CE then PE */
-            if( ce_active == 1 )
-            {
-                exit_symbol = StaticVarGetText( static_CE_symbol );
-                exit_exchange = StaticVarGetText( static_CE_exchange );
-            }
-            else
-                if( pe_active == 1 )
-                {
-                    exit_symbol = StaticVarGetText( static_PE_symbol );
-                    exit_exchange = StaticVarGetText( static_PE_exchange );
-                }
-
-            if( exit_symbol != "" )
-            {
-                _TRACEF( "Scale Out Signal: %s, mode=%s\n", exit_symbol, ScaleOutMode );
-
-                if( ScaleOutMode == "Percentage" )
-                {
-                    /* Scale out by percentage */
-                    response = ExitPosition( exit_symbol, exit_exchange, product, apikey, strategy, host, ver, ScaleOutPct, 0 );
-                }
-                else
-                    if( ScaleOutMode == "Quantity" )
-                    {
-                        /* Scale out by specific lots */
-                        scale_qty_val = ScaleOutLots * RoundLotSize;
-                        response = ExitPosition( exit_symbol, exit_exchange, product, apikey, strategy, host, ver, 0, scale_qty_val );
-                    }
-
-                has_success = StrFind( response, "\"status\":\"success\"" ) >= 0;
-
-                if( has_success )
-                {
-                    if( VoiceAlert == "Enable" )
-                    {
-                        Say( "Scale Out Order Placed" );
-                    }
-
-                    _TRACE( "Scale Out Success" );
-                }
-
-                StaticVarSet( static_scaleout_algo, 1, True );
-                StaticVarSetText( static_scaleout_barvalue, lasttime, True );
-            }
-        }
-        else
-            if( AlgoScaleOut != True )
-            {
-                StaticVarSet( static_scaleout_algo, 0, True );
-                StaticVarSetText( static_scaleout_barvalue, "", True );
             }
     }
 }

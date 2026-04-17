@@ -189,6 +189,12 @@ def place_smartorder_api(data, auth):
             return res, response_data, orderid
 
         position_size = int(data.get("position_size", "0"))
+        scale_pct = data.get("scale_pct", 0)
+        scale_qty = data.get("scale_qty", 0)
+
+        logger.info(
+            f"DIAG [broker]: position_size={position_size}, scale_pct={scale_pct}, scale_qty={scale_qty}"
+        )
 
         # Get current open position for the symbol
         current_position = int(

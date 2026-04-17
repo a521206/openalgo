@@ -93,6 +93,21 @@ class TelegramBotService:
         """Return the currency symbol for the user's broker ($ for crypto brokers, ₹ for others)."""
         return "$" if telegram_user.get("broker") in CRYPTO_BROKERS else "₹"
 
+    def _get_loop(self) -> asyncio.AbstractEventLoop | None:
+        """Get event loop safely in eventlet environment"""
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        if hasattr(self, "bot_loop") and self.bot_loop:
+            return self.bot_loop
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
+        except RuntimeError:
+            return None
+
     async def _make_sdk_call(self, telegram_id: int, method: str, **kwargs) -> dict | None:
         """Make an SDK call in async context"""
         try:
@@ -100,8 +115,11 @@ class TelegramBotService:
             if not client:
                 return None
 
-            # Run the SDK method in a thread pool since it's synchronous
-            loop = asyncio.get_event_loop()
+            loop = self._get_loop()
+            if not loop:
+                logger.error("No event loop available")
+                return None
+
             sdk_method = getattr(client, method)
             result = await loop.run_in_executor(None, sdk_method, *kwargs.values())
 
@@ -913,7 +931,7 @@ class TelegramBotService:
             test_client = openalgo_api(api_key=api_key, host=host_url)
 
             # Test with a simple call
-            loop = asyncio.get_event_loop()
+            loop = self._get_loop()
             test_response = await loop.run_in_executor(None, test_client.funds)
 
             if test_response and test_response.get("status") == "success":
@@ -1024,7 +1042,7 @@ class TelegramBotService:
             client = self._get_sdk_client(user.id)
             if client:
                 try:
-                    loop = asyncio.get_event_loop()
+                    loop = self._get_loop()
                     test_response = await loop.run_in_executor(None, client.funds)
 
                     if test_response and test_response.get("status") == "success":
@@ -1080,7 +1098,7 @@ class TelegramBotService:
             await update.message.reply_text("❌ Failed to connect to OpenAlgo")
             return
 
-        loop = asyncio.get_event_loop()
+        loop = self._get_loop()
         response = await loop.run_in_executor(None, client.orderbook)
 
         if not response or response.get("status") != "success":
@@ -1210,7 +1228,7 @@ class TelegramBotService:
             await update.message.reply_text("❌ Failed to connect to OpenAlgo")
             return
 
-        loop = asyncio.get_event_loop()
+        loop = self._get_loop()
         response = await loop.run_in_executor(None, client.tradebook)
 
         if not response or response.get("status") != "success":
@@ -1298,7 +1316,7 @@ class TelegramBotService:
             await update.message.reply_text("❌ Failed to connect to OpenAlgo")
             return
 
-        loop = asyncio.get_event_loop()
+        loop = self._get_loop()
         response = await loop.run_in_executor(None, client.positionbook)
 
         if not response or response.get("status") != "success":
@@ -1394,7 +1412,7 @@ class TelegramBotService:
             await update.message.reply_text("❌ Failed to connect to OpenAlgo")
             return
 
-        loop = asyncio.get_event_loop()
+        loop = self._get_loop()
         response = await loop.run_in_executor(None, client.holdings)
 
         if not response or response.get("status") != "success":
@@ -1495,7 +1513,7 @@ class TelegramBotService:
             await update.message.reply_text("❌ Failed to connect to OpenAlgo")
             return
 
-        loop = asyncio.get_event_loop()
+        loop = self._get_loop()
         response = await loop.run_in_executor(None, client.funds)
 
         if not response or response.get("status") != "success":
@@ -1555,7 +1573,7 @@ class TelegramBotService:
             await update.message.reply_text("❌ Failed to connect to OpenAlgo")
             return
 
-        loop = asyncio.get_event_loop()
+        loop = self._get_loop()
         response = await loop.run_in_executor(None, client.funds)
 
         if not response or response.get("status") != "success":
@@ -1627,7 +1645,7 @@ class TelegramBotService:
             await update.message.reply_text("❌ Failed to connect to OpenAlgo")
             return
 
-        loop = asyncio.get_event_loop()
+        loop = self._get_loop()
         response = await loop.run_in_executor(
             None, lambda: client.quotes(symbol=symbol, exchange=exchange)
         )
@@ -2055,7 +2073,7 @@ class TelegramBotService:
 
         # Map callback data to API calls and formatters
         try:
-            loop = asyncio.get_event_loop()
+            loop = self._get_loop()
 
             if callback_data == "orderbook":
                 response = await loop.run_in_executor(None, client.orderbook)
