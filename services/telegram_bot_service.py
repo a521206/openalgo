@@ -555,28 +555,17 @@ class TelegramBotService:
         import asyncio
         import sys
 
-        if "eventlet" in sys.modules:
-            import eventlet.patcher
-
-            original_select = eventlet.patcher.original("select")
-            original_selectors = eventlet.patcher.original("selectors")
-
-            class UnpatchedSelector(original_selectors.DefaultSelector):
-                def __init__(self):
-                    self._select = original_select.select
-                    super().__init__()
-
-                def select(self, timeout=None):
-                    return self._select(self._readers, self._writers, [], timeout)
-
-            loop = asyncio.SelectorEventLoop(UnpatchedSelector())
-            asyncio.set_event_loop(loop)
-            logger.info("Created asyncio loop with unpatched select")
-        else:
+        # Create a new event loop for this thread
+        # Note: Avoid SelectorEventLoop with eventlet as it causes unpacking errors
+        try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            logger.debug("Created new asyncio event loop in bot thread")
+        except Exception as e:
+            logger.error(f"Failed to create event loop: {e}")
+            self.is_running = False
+            return
 
-        logger.debug("Created new event loop in bot thread")
         self.bot_loop = loop
 
         try:
@@ -594,7 +583,10 @@ class TelegramBotService:
                     loop.run_until_complete(self.http_client.aclose())
             except:
                 pass
-            loop.close()
+            try:
+                loop.close()
+            except:
+                pass
             self.bot_loop = None  # Clear the reference
             self.is_running = False
 
