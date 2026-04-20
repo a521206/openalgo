@@ -39,6 +39,8 @@ from database.telegram_db import (
 from utils.constants import CRYPTO_BROKERS
 from utils.logging import get_logger
 
+from openalgo import api as openalgo_api
+
 logger = get_logger(__name__)
 
 
@@ -60,8 +62,6 @@ class TelegramBotService:
 
     def _get_sdk_client(self, telegram_id: int) -> openalgo_api | None:
         """Get or create OpenAlgo SDK client for a user"""
-        from openalgo import api as openalgo_api
-
         try:
             # Check if client already exists
             if telegram_id in self.sdk_clients:
@@ -559,9 +559,9 @@ class TelegramBotService:
             import eventlet.patcher
 
             original_select = eventlet.patcher.original("select")
-            original_selectors_base = eventlet.patcher.original("selectors")
+            original_selectors = eventlet.patcher.original("selectors")
 
-            class UnpatchedSelector(original_selectors_base.BaseSelector):
+            class UnpatchedSelector(original_selectors.DefaultSelector):
                 def __init__(self):
                     self._select = original_select.select
                     super().__init__()
@@ -914,8 +914,6 @@ class TelegramBotService:
 
         # Validate API key by making a test call
         try:
-            from openalgo import api as openalgo_api
-
             # Create temporary SDK client for validation
             test_client = openalgo_api(api_key=api_key, host=host_url)
 
