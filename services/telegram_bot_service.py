@@ -551,16 +551,14 @@ class TelegramBotService:
                 loop.close()
 
     def _run_bot_in_thread(self):
-        """Run bot in separate thread with its own isolated event loop"""
+        """Run bot with its own asyncio event loop (works in both threads and greenlets)"""
         import asyncio
-        import sys
-
-        # Create a new event loop for this thread
-        # Note: Avoid SelectorEventLoop with eventlet as it causes unpacking errors
+        
+        # Create a new event loop for this execution context
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            logger.debug("Created new asyncio event loop in bot thread")
+            logger.debug("Created asyncio event loop for bot")
         except Exception as e:
             logger.error(f"Failed to create event loop: {e}")
             self.is_running = False
@@ -569,13 +567,13 @@ class TelegramBotService:
         self.bot_loop = loop
 
         try:
-            # Create HTTP client in this thread's event loop
+            # Create HTTP client in this event loop
             self.http_client = httpx.AsyncClient(timeout=30.0)
 
             # Run the bot
             loop.run_until_complete(self._start_bot_isolated())
         except Exception as e:
-            logger.exception(f"Bot thread error: {e}")
+            logger.exception(f"Bot error: {e}")
         finally:
             # Cleanup
             try:
@@ -587,7 +585,7 @@ class TelegramBotService:
                 loop.close()
             except:
                 pass
-            self.bot_loop = None  # Clear the reference
+            self.bot_loop = None
             self.is_running = False
 
     async def handle_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -742,7 +740,9 @@ class TelegramBotService:
                 logger.debug(f"Error stopping updater: {e}")
 
     def start_bot(self) -> tuple[bool, str]:
-        """Start the bot in a separate thread"""
+        """Start the bot in a separate thread or eventlet greenlet"""
+        import time
+        
         try:
             if self.is_running:
                 return False, "Bot is already running"
@@ -752,23 +752,23 @@ class TelegramBotService:
                 return False, "Bot token not configured"
 
             self.bot_token = config["bot_token"]
-
-            # Reset stop event
             self._stop_event.clear()
-
-            # Reset error counter for fresh start
             self._consecutive_network_errors = 0
 
-            # Start bot in separate thread with isolated event loop
-            self.bot_thread = original_threading.Thread(
-                target=self._run_bot_in_thread, daemon=True, name="TelegramBotThread"
-            )
-            self.bot_thread.start()
+            # Use eventlet greenlet if available, otherwise use OS thread
+            if "eventlet" in sys.modules:
+                import eventlet
+                logger.debug("Starting bot in eventlet greenlet")
+                self.bot_thread = eventlet.spawn(self._run_bot_in_thread)
+            else:
+                logger.debug("Starting bot in OS thread")
+                self.bot_thread = original_threading.Thread(
+                    target=self._run_bot_in_thread, daemon=True, name="TelegramBotThread"
+                )
+                self.bot_thread.start()
 
             # Wait for bot to start
-            import time
-
-            for _ in range(10):  # Wait up to 5 seconds
+            for _ in range(10):
                 if self.is_running:
                     return True, "Bot started successfully"
                 time.sleep(0.5)
@@ -780,30 +780,31 @@ class TelegramBotService:
             return False, str(e)
 
     def stop_bot(self) -> tuple[bool, str]:
-        """Stop the bot"""
+        """Stop the bot running in thread or greenlet"""
         try:
             if not self.is_running:
                 return False, "Bot is not running"
 
             logger.debug("Stopping Telegram bot...")
-
-            # Signal the thread to stop
             self._stop_event.set()
 
-            # Wait for thread to finish
-            if self.bot_thread and self.bot_thread.is_alive():
-                self.bot_thread.join(timeout=10.0)
-                if self.bot_thread.is_alive():
-                    logger.warning("Bot thread did not stop cleanly")
-                    self.is_running = False
+            # Stop using appropriate method for the execution context
+            if self.bot_thread:
+                if "eventlet" in sys.modules:
+                    logger.debug("Killing eventlet greenlet")
+                    self.bot_thread.kill()
+                else:
+                    if self.bot_thread.is_alive():
+                        self.bot_thread.join(timeout=10.0)
+                        if self.bot_thread.is_alive():
+                            logger.warning("Bot thread did not stop cleanly")
+                            self.is_running = False
 
             self.bot_thread = None
             self.application = None
-            self.bot_loop = None  # Clear the loop reference
+            self.bot_loop = None
 
-            # Update database
             update_bot_config({"is_active": False})
-
             logger.info("Telegram bot stopped")
             return True, "Bot stopped successfully"
 
