@@ -12,10 +12,8 @@ if "eventlet" in sys.modules:
     import eventlet
 
     original_threading = eventlet.patcher.original("threading")
-    import threading as threading_patched  # Patched version for greenlet-aware Event
 else:
     import threading as original_threading
-    threading_patched = None  # Not needed when eventlet is not active
 
 import base64
 import io
@@ -58,16 +56,7 @@ class TelegramBotService:
         self.bot_thread = None
         self.bot_loop = None  # Store the bot's event loop
         self.sdk_clients = {}  # Cache for OpenAlgo SDK clients per user
-        
-        # Use patched threading.Event when eventlet is active (greenlet-aware)
-        # Otherwise use unpatched threading.Event
-        if threading_patched:
-            self._stop_event = threading_patched.Event()  # Greenlet-aware when eventlet active
-            self._bot_ready_event = threading_patched.Event()  # Greenlet-aware when eventlet active
-        else:
-            self._stop_event = original_threading.Event()
-            self._bot_ready_event = original_threading.Event()
-        
+        self._stop_event = original_threading.Event()  # Thread-safe stop signal
         self._consecutive_network_errors = 0
         self._max_consecutive_errors = 5
 
@@ -683,7 +672,6 @@ class TelegramBotService:
                 )
 
                 self.is_running = True
-                self._bot_ready_event.set()  # Signal that bot is ready
                 update_bot_config({"is_active": True})
                 logger.debug("Telegram bot started successfully and is polling for updates")
                 self._consecutive_network_errors = 0
@@ -752,7 +740,9 @@ class TelegramBotService:
                 logger.debug(f"Error stopping updater: {e}")
 
     def start_bot(self) -> tuple[bool, str]:
-        """Start the bot in a separate OS thread"""
+        """Start the bot in a separate thread or eventlet greenlet"""
+        import time
+        
         try:
             if self.is_running:
                 return False, "Bot is already running"
@@ -763,28 +753,34 @@ class TelegramBotService:
 
             self.bot_token = config["bot_token"]
             self._stop_event.clear()
-            self._bot_ready_event.clear()
             self._consecutive_network_errors = 0
 
-            logger.debug("Starting bot in OS thread")
-            self.bot_thread = original_threading.Thread(
-                target=self._run_bot_in_thread, daemon=True, name="TelegramBotThread"
-            )
-            self.bot_thread.start()
-
-            # Wait for bot to be ready (with 5-second timeout)
-            if self._bot_ready_event.wait(timeout=5.0):
-                logger.info("Bot started successfully")
-                return True, "Bot started successfully"
+            # Use eventlet greenlet if available, otherwise use OS thread
+            if "eventlet" in sys.modules:
+                import eventlet
+                logger.debug("Starting bot in eventlet greenlet")
+                self.bot_thread = eventlet.spawn(self._run_bot_in_thread)
             else:
-                return False, "Bot failed to start within timeout"
+                logger.debug("Starting bot in OS thread")
+                self.bot_thread = original_threading.Thread(
+                    target=self._run_bot_in_thread, daemon=True, name="TelegramBotThread"
+                )
+                self.bot_thread.start()
+
+            # Wait for bot to start
+            for _ in range(10):
+                if self.is_running:
+                    return True, "Bot started successfully"
+                time.sleep(0.5)
+
+            return False, "Bot failed to start within timeout"
 
         except Exception as e:
             logger.exception(f"Failed to start bot: {e}")
             return False, str(e)
 
     def stop_bot(self) -> tuple[bool, str]:
-        """Stop the bot running in thread"""
+        """Stop the bot running in thread or greenlet"""
         try:
             if not self.is_running:
                 return False, "Bot is not running"
@@ -792,18 +788,21 @@ class TelegramBotService:
             logger.debug("Stopping Telegram bot...")
             self._stop_event.set()
 
-            # Stop the OS thread
+            # Stop using appropriate method for the execution context
             if self.bot_thread:
-                if self.bot_thread.is_alive():
-                    self.bot_thread.join(timeout=10.0)
+                if "eventlet" in sys.modules:
+                    logger.debug("Killing eventlet greenlet")
+                    self.bot_thread.kill()
+                else:
                     if self.bot_thread.is_alive():
-                        logger.warning("Bot thread did not stop cleanly")
-                        self.is_running = False
+                        self.bot_thread.join(timeout=10.0)
+                        if self.bot_thread.is_alive():
+                            logger.warning("Bot thread did not stop cleanly")
+                            self.is_running = False
 
             self.bot_thread = None
             self.application = None
             self.bot_loop = None
-            self._bot_ready_event.clear()
 
             update_bot_config({"is_active": False})
             logger.info("Telegram bot stopped")
