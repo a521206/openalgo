@@ -12,8 +12,10 @@ if "eventlet" in sys.modules:
     import eventlet
 
     original_threading = eventlet.patcher.original("threading")
+    import threading as threading_patched  # Patched version for greenlet-aware Event
 else:
     import threading as original_threading
+    threading_patched = None  # Not needed when eventlet is not active
 
 import base64
 import io
@@ -56,8 +58,16 @@ class TelegramBotService:
         self.bot_thread = None
         self.bot_loop = None  # Store the bot's event loop
         self.sdk_clients = {}  # Cache for OpenAlgo SDK clients per user
-        self._stop_event = original_threading.Event()  # Thread-safe stop signal
-        self._bot_ready_event = original_threading.Event()  # Thread-safe startup signal
+        
+        # Use patched threading.Event when eventlet is active (greenlet-aware)
+        # Otherwise use unpatched threading.Event
+        if threading_patched:
+            self._stop_event = threading_patched.Event()  # Greenlet-aware when eventlet active
+            self._bot_ready_event = threading_patched.Event()  # Greenlet-aware when eventlet active
+        else:
+            self._stop_event = original_threading.Event()
+            self._bot_ready_event = original_threading.Event()
+        
         self._consecutive_network_errors = 0
         self._max_consecutive_errors = 5
 
