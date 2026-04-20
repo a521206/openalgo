@@ -60,12 +60,16 @@ class Settings(Base):
     smart_trade_enabled = Column(Boolean, default=True)  # Master switch for smart trade rules
     prevent_duplicate_buy = Column(Boolean, default=True)  # Prevent BUY if position exists
     prevent_duplicate_sell = Column(Boolean, default=True)  # Prevent SELL if no position exists
-    max_position_size = Column(Integer, nullable=True)  # Maximum position size per symbol (lots for F&O, qty for equity)
+    max_position_size = Column(
+        Integer, nullable=True
+    )  # Maximum position size per symbol (lots for F&O, qty for equity)
     max_order_value = Column(Integer, nullable=True)  # Maximum order value in INR
     allow_intraday_only = Column(Boolean, default=False)  # Only allow MIS orders
     block_cnc_orders = Column(Boolean, default=False)  # Block CNC (delivery) orders
     block_nrml_orders = Column(Boolean, default=False)  # Block NRML (carryforward) orders
-    liquidity_fallback = Column(Boolean, default=True)  # Auto-select best liquid strike for illiquid options
+    liquidity_fallback = Column(
+        Boolean, default=True
+    )  # Auto-select best liquid strike for illiquid options
 
 
 def init_db():
@@ -86,13 +90,13 @@ def init_db():
         logger.debug(f"Settings DB: Default config may already exist (race condition): {e}")
 
 
-def get_analyze_mode():
+def get_analyze_mode() -> bool:
     """Get current analyze mode setting (cached for 1 hour)"""
     cache_key = "analyze_mode"
 
     # Check cache first
     if cache_key in _settings_cache:
-        return _settings_cache[cache_key]
+        return bool(_settings_cache[cache_key])
 
     # Cache miss - query database
     settings = Settings.query.first()
@@ -103,7 +107,7 @@ def get_analyze_mode():
 
     # Store in cache
     _settings_cache[cache_key] = settings.analyze_mode
-    return settings.analyze_mode
+    return bool(settings.analyze_mode)
 
 
 def set_analyze_mode(mode: bool):
@@ -305,7 +309,9 @@ def get_smart_trade_rules():
         "allow_intraday_only": settings.allow_intraday_only or False,
         "block_cnc_orders": settings.block_cnc_orders or False,
         "block_nrml_orders": settings.block_nrml_orders or False,
-        "liquidity_fallback": settings.liquidity_fallback if settings.liquidity_fallback is not None else True,
+        "liquidity_fallback": settings.liquidity_fallback
+        if settings.liquidity_fallback is not None
+        else True,
     }
 
     # Store in cache

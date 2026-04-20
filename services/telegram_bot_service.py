@@ -558,13 +558,20 @@ class TelegramBotService:
         if "eventlet" in sys.modules:
             import eventlet.patcher
 
-            # DefaultSelector already resolves to the best backend for the
-            # platform (EpollSelector on Linux, KqueueSelector on macOS, etc.)
-            # so no explicit probe is needed.
-            original_selectors = eventlet.patcher.original("selectors")
-            loop = asyncio.SelectorEventLoop(original_selectors.DefaultSelector())
+            original_select = eventlet.patcher.original("select")
+            original_selectors_base = eventlet.patcher.original("selectors")
+
+            class UnpatchedSelector(original_selectors_base.BaseSelector):
+                def __init__(self):
+                    self._select = original_select.select
+                    super().__init__()
+
+                def select(self, timeout=None):
+                    return self._select(self._readers, self._writers, [], timeout)
+
+            loop = asyncio.SelectorEventLoop(UnpatchedSelector())
             asyncio.set_event_loop(loop)
-            logger.info("Created asyncio loop with unpatched selector")
+            logger.info("Created asyncio loop with unpatched select")
         else:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
