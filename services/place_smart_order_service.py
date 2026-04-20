@@ -98,7 +98,7 @@ def _fetch_position_for_validation(
 
     Args:
         broker: Broker name
-        order_data: Order data containing symbol, exchange, product_type
+        order_data: Order data containing symbol, exchange, product
         auth_token: Broker authentication token
 
     Returns:
@@ -115,12 +115,13 @@ def _fetch_position_for_validation(
         )
 
     last_error = None
+    product = order_data.get("product") or order_data.get("product_type") or "MIS"
     for attempt in range(POSITION_FETCH_MAX_RETRIES + 1):
         try:
             position_qty_str = broker_module.get_open_position(
                 order_data.get("symbol"),
                 order_data.get("exchange"),
-                order_data.get("product_type"),
+                product,
                 auth_token,
             )
             quantity = int(position_qty_str) if position_qty_str else 0

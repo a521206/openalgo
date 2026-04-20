@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
 import os
 import sys
@@ -99,8 +98,6 @@ class TelegramBotService:
             return asyncio.get_running_loop()
         except RuntimeError:
             pass
-        if hasattr(self, "bot_loop") and self.bot_loop:
-            return self.bot_loop
         return None
 
     async def _make_sdk_call(self, telegram_id: int, method: str, **kwargs) -> dict | None:
@@ -548,7 +545,6 @@ class TelegramBotService:
             import asyncio
 
             loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
             try:
                 return loop.run_until_complete(self.initialize_bot(token))
             finally:
@@ -556,34 +552,25 @@ class TelegramBotService:
 
     def _run_bot_in_thread(self):
         """Run bot in separate thread with its own isolated event loop"""
+        import asyncio
         import sys
 
-        # Check if eventlet is active
         if "eventlet" in sys.modules:
-            logger.info("Eventlet detected - using special handling for asyncio")
-            # For eventlet, we need to be very careful with asyncio
-            import asyncio
+            import eventlet.patcher
 
-            # Reset the event loop policy to avoid eventlet's monkey-patching
-            try:
-                # Use the default, unpatched event loop policy
-                from asyncio import DefaultEventLoopPolicy, SelectorEventLoop
-
-                policy = DefaultEventLoopPolicy()
-                asyncio.set_event_loop_policy(policy)
-                logger.info("Reset to default event loop policy")
-            except Exception as e:
-                logger.warning(f"Could not reset event loop policy: {e}")
+            # DefaultSelector already resolves to the best backend for the
+            # platform (EpollSelector on Linux, KqueueSelector on macOS, etc.)
+            # so no explicit probe is needed.
+            original_selectors = eventlet.patcher.original("selectors")
+            loop = asyncio.SelectorEventLoop(original_selectors.DefaultSelector())
+            asyncio.set_event_loop(loop)
+            logger.info("Created asyncio loop with unpatched selector")
         else:
-            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-        # Create new event loop in this thread
-        logger.debug("Creating new event loop in bot thread")
-
-        # Create a new event loop for this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self.bot_loop = loop  # Store the loop so we can schedule tasks in it
+        logger.debug("Created new event loop in bot thread")
+        self.bot_loop = loop
 
         try:
             # Create HTTP client in this thread's event loop

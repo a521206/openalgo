@@ -2,7 +2,7 @@ import copy
 import importlib
 import time
 import traceback
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from database.analyzer_db import async_log_analyzer
 from database.apilog_db import async_log_order, executor
@@ -69,7 +69,7 @@ def _fetch_position_for_validation(
 
     Args:
         broker: Broker name
-        order_data: Order data containing symbol, exchange, product_type
+        order_data: Order data containing symbol, exchange, product
         auth_token: Broker authentication token
 
     Returns:
@@ -86,12 +86,13 @@ def _fetch_position_for_validation(
         )
 
     last_error = None
+    product = order_data.get("product") or order_data.get("product_type") or "MIS"
     for attempt in range(POSITION_FETCH_MAX_RETRIES + 1):
         try:
             position_qty_str = broker_module.get_open_position(
                 order_data.get("symbol"),
                 order_data.get("exchange"),
-                order_data.get("product_type"),
+                product,
                 auth_token,
             )
             quantity = int(position_qty_str) if position_qty_str else 0
@@ -177,11 +178,12 @@ def validate_order_data(data: dict[str, Any]) -> tuple[bool, dict[str, Any] | No
             )
 
     # Validate price type if provided
-    if "price_type" in data and data["price_type"] not in VALID_PRICE_TYPES:
+    if "pricetype" in data and data["pricetype"] not in VALID_PRICE_TYPES:
         return False, None, f"Invalid price type. Must be one of: {', '.join(VALID_PRICE_TYPES)}"
 
     # Validate product type if provided
-    if "product_type" in data and data["product_type"] not in VALID_PRODUCT_TYPES:
+    product_val = data.get("product") or data.get("product_type")
+    if product_val and product_val not in VALID_PRODUCT_TYPES:
         return (
             False,
             None,
@@ -353,8 +355,8 @@ def place_order_with_auth(
                     "action": order_data["action"],
                     "orderid": order_id,
                     "exchange": order_data.get("exchange", "Unknown"),
-                    "price_type": order_data.get("price_type", "Unknown"),
-                    "product_type": order_data.get("product_type", "Unknown"),
+                    "pricetype": order_data.get("pricetype", "Unknown"),
+                    "product": order_data.get("product", "Unknown"),
                     "mode": "live",
                 },
             )
