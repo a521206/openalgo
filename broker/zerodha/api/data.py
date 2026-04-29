@@ -33,7 +33,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None, max_retries=3):
 
     Args:
         endpoint (str): API endpoint (e.g., '/quote')
-        auth (str): Authentication token
+        auth (str): Authentication token (format: "api_key:access_token" or just "access_token")
         method (str): HTTP method (GET, POST, etc.)
         payload (dict, optional): Request payload for POST requests
         max_retries (int): Maximum number of retries for rate limit errors (default: 3)
@@ -45,7 +45,12 @@ def get_api_response(endpoint, auth, method="GET", payload=None, max_retries=3):
         ZerodhaPermissionError: For permission-related errors
         ZerodhaAPIError: For other API errors
     """
-    AUTH_TOKEN = auth
+    # Extract access token
+    if ":" in auth:
+        access_token = auth.split(":", 1)[1]
+    else:
+        access_token = auth
+
     base_url = "https://api.kite.trade"
 
     # Get the shared httpx client with connection pooling
@@ -53,7 +58,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None, max_retries=3):
 
     headers = {
         "X-Kite-Version": "3",
-        "Authorization": f"token {AUTH_TOKEN}",
+        "Authorization": f"token {access_token}",
         "Content-Type": "application/json",
     }
 

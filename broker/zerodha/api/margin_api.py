@@ -22,12 +22,18 @@ def calculate_margin_api(positions, auth):
 
     Args:
         positions: List of positions in OpenAlgo format
-        auth: Authentication token for Zerodha (format: api_key:access_token)
+        auth: Authentication token for Zerodha (format: "api_key:access_token" or just "access_token")
 
     Returns:
         Tuple of (response, response_data)
     """
-    AUTH_TOKEN = auth
+    # Extract access token
+    if ":" in auth:
+        access_token = auth.split(":", 1)[1]
+    else:
+        access_token = auth
+
+    AUTH_TOKEN = access_token
 
     # Transform positions to Zerodha format
     transformed_positions = transform_margin_positions(positions)

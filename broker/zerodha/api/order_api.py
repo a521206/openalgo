@@ -23,20 +23,25 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
 
     Args:
         endpoint (str): API endpoint (e.g., '/orders')
-        auth (str): Authentication token
+        auth (str): Authentication token (format: "api_key:access_token" or just "access_token")
         method (str): HTTP method (GET, POST, etc.)
         payload (dict/str, optional): Request payload
 
     Returns:
         dict: API response data
     """
-    AUTH_TOKEN = auth
+    # Extract access token: stored token may be prefixed with "api_key:"
+    if ":" in auth:
+        access_token = auth.split(":", 1)[1]
+    else:
+        access_token = auth
+
     base_url = "https://api.kite.trade"
 
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
 
-    headers = {"X-Kite-Version": "3", "Authorization": f"token {AUTH_TOKEN}"}
+    headers = {"X-Kite-Version": "3", "Authorization": f"token {access_token}"}
 
     url = f"{base_url}{endpoint}"
 
@@ -112,7 +117,13 @@ def get_open_position(tradingsymbol, exchange, product, auth):
 
 
 def place_order_api(data, auth):
-    AUTH_TOKEN = auth
+    # Extract access token: stored token may be prefixed with "api_key:"
+    if ":" in auth:
+        access_token = auth.split(":", 1)[1]
+    else:
+        access_token = auth
+
+    AUTH_TOKEN = access_token
 
     BROKER_API_KEY = os.getenv("BROKER_API_KEY")
     data["apikey"] = BROKER_API_KEY
@@ -171,7 +182,13 @@ def place_order_api(data, auth):
 
 
 def place_smartorder_api(data, auth):
-    AUTH_TOKEN = auth
+    # Extract access token: stored token may be prefixed with "api_key:"
+    if ":" in auth:
+        access_token = auth.split(":", 1)[1]
+    else:
+        access_token = auth
+
+    AUTH_TOKEN = access_token
 
     # Initialize default return values
     res = None
@@ -250,7 +267,13 @@ def place_smartorder_api(data, auth):
 
 
 def close_all_positions(current_api_key, auth):
-    AUTH_TOKEN = auth
+    # Extract access token: stored token may be prefixed with "api_key:"
+    if ":" in auth:
+        access_token = auth.split(":", 1)[1]
+    else:
+        access_token = auth
+
+    AUTH_TOKEN = access_token
     # Fetch the current open positions
     positions_response = get_positions(AUTH_TOKEN)
 
@@ -301,12 +324,18 @@ def cancel_order(orderid, auth):
 
     Args:
         orderid (str): The ID of the order to cancel
-        auth (str): Authentication token
+        auth (str): Authentication token (format: "api_key:access_token" or just "access_token")
 
     Returns:
         tuple: (response data, status code)
     """
-    AUTH_TOKEN = auth
+    # Extract access token
+    if ":" in auth:
+        access_token = auth.split(":", 1)[1]
+    else:
+        access_token = auth
+
+    AUTH_TOKEN = access_token
 
     try:
         # Get the shared httpx client with connection pooling
@@ -340,7 +369,13 @@ def cancel_order(orderid, auth):
 
 
 def modify_order(data, auth):
-    AUTH_TOKEN = auth
+    # Extract access token
+    if ":" in auth:
+        access_token = auth.split(":", 1)[1]
+    else:
+        access_token = auth
+
+    AUTH_TOKEN = access_token
 
     newdata = transform_modify_order_data(data)  # You need to implement this function
 
@@ -397,7 +432,13 @@ def modify_order(data, auth):
 
 
 def cancel_all_orders_api(data, auth):
-    AUTH_TOKEN = auth
+    # Extract access token: stored token may be prefixed with "api_key:"
+    if ":" in auth:
+        access_token = auth.split(":", 1)[1]
+    else:
+        access_token = auth
+
+    AUTH_TOKEN = access_token
     # Get the order book
     order_book_response = get_order_book(AUTH_TOKEN)
     if order_book_response["status"] != "success":
