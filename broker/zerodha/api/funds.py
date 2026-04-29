@@ -10,16 +10,10 @@ logger = get_logger(__name__)
 
 def get_margin_data(auth_token):
     """Fetch margin data from Zerodha's API using the provided auth token."""
-    # Extract access token: stored token may be prefixed with "api_key:"
-    if ":" in auth_token:
-        access_token = auth_token.split(":", 1)[1]
-    else:
-        access_token = auth_token
-
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
 
-    headers = {"X-Kite-Version": "3", "Authorization": f"token {access_token}"}
+    headers = {"X-Kite-Version": "3", "Authorization": f"token {auth_token}"}
 
     try:
         # Make the GET request using the shared client

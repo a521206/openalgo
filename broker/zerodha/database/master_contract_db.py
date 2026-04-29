@@ -93,13 +93,7 @@ def download_csv_zerodha_data(output_path):
     """
     try:
         login_username = os.getenv('LOGIN_USERNAME')
-        auth_token_raw = get_auth_token(login_username)
-
-        # Extract access token: stored token may be prefixed with "api_key:"
-        if ":" in auth_token_raw:
-            AUTH_TOKEN = auth_token_raw.split(":", 1)[1]
-        else:
-            AUTH_TOKEN = auth_token_raw
+        AUTH_TOKEN = get_auth_token(login_username)
 
         # Get the shared httpx client with connection pooling
         client = get_httpx_client()

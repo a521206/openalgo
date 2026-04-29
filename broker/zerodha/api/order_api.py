@@ -9,7 +9,6 @@ from broker.zerodha.mapping.transform_data import (
     transform_data,
     transform_modify_order_data,
 )
-from database.auth_db import get_auth_token
 from database.token_db import get_br_symbol, get_oa_symbol
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
@@ -23,25 +22,20 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
 
     Args:
         endpoint (str): API endpoint (e.g., '/orders')
-        auth (str): Authentication token (format: "api_key:access_token" or just "access_token")
+        auth (str): Authentication token
         method (str): HTTP method (GET, POST, etc.)
         payload (dict/str, optional): Request payload
 
     Returns:
         dict: API response data
     """
-    # Extract access token: stored token may be prefixed with "api_key:"
-    if ":" in auth:
-        access_token = auth.split(":", 1)[1]
-    else:
-        access_token = auth
-
+    AUTH_TOKEN = auth
     base_url = "https://api.kite.trade"
 
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
 
-    headers = {"X-Kite-Version": "3", "Authorization": f"token {access_token}"}
+    headers = {"X-Kite-Version": "3", "Authorization": f"token {AUTH_TOKEN}"}
 
     url = f"{base_url}{endpoint}"
 
@@ -117,13 +111,7 @@ def get_open_position(tradingsymbol, exchange, product, auth):
 
 
 def place_order_api(data, auth):
-    # Extract access token: stored token may be prefixed with "api_key:"
-    if ":" in auth:
-        access_token = auth.split(":", 1)[1]
-    else:
-        access_token = auth
-
-    AUTH_TOKEN = access_token
+    AUTH_TOKEN = auth
 
     BROKER_API_KEY = os.getenv("BROKER_API_KEY")
     data["apikey"] = BROKER_API_KEY
@@ -324,18 +312,12 @@ def cancel_order(orderid, auth):
 
     Args:
         orderid (str): The ID of the order to cancel
-        auth (str): Authentication token (format: "api_key:access_token" or just "access_token")
+        auth (str): Authentication token
 
     Returns:
         tuple: (response data, status code)
     """
-    # Extract access token
-    if ":" in auth:
-        access_token = auth.split(":", 1)[1]
-    else:
-        access_token = auth
-
-    AUTH_TOKEN = access_token
+    AUTH_TOKEN = auth
 
     try:
         # Get the shared httpx client with connection pooling
@@ -369,13 +351,7 @@ def cancel_order(orderid, auth):
 
 
 def modify_order(data, auth):
-    # Extract access token
-    if ":" in auth:
-        access_token = auth.split(":", 1)[1]
-    else:
-        access_token = auth
-
-    AUTH_TOKEN = access_token
+    AUTH_TOKEN = auth
 
     newdata = transform_modify_order_data(data)  # You need to implement this function
 

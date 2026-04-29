@@ -33,7 +33,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None, max_retries=3):
 
     Args:
         endpoint (str): API endpoint (e.g., '/quote')
-        auth (str): Authentication token (format: "api_key:access_token" or just "access_token")
+        auth (str): Authentication token
         method (str): HTTP method (GET, POST, etc.)
         payload (dict, optional): Request payload for POST requests
         max_retries (int): Maximum number of retries for rate limit errors (default: 3)
@@ -45,12 +45,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None, max_retries=3):
         ZerodhaPermissionError: For permission-related errors
         ZerodhaAPIError: For other API errors
     """
-    # Extract access token
-    if ":" in auth:
-        access_token = auth.split(":", 1)[1]
-    else:
-        access_token = auth
-
+    AUTH_TOKEN = auth
     base_url = "https://api.kite.trade"
 
     # Get the shared httpx client with connection pooling
@@ -58,7 +53,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None, max_retries=3):
 
     headers = {
         "X-Kite-Version": "3",
-        "Authorization": f"token {access_token}",
+        "Authorization": f"token {AUTH_TOKEN}",
         "Content-Type": "application/json",
     }
 
@@ -228,7 +223,7 @@ class BrokerData:
             depth = quote.get("depth", {})
             sell_depth = depth.get("sell", [])
             buy_depth = depth.get("buy", [])
-            
+
             # Log depth structure for debugging zero ask/bid prices
             if not sell_depth or not buy_depth:
                 logger.warning(
@@ -236,11 +231,11 @@ class BrokerData:
                     f"Sell depth: {len(sell_depth)} levels, Buy depth: {len(buy_depth)} levels. "
                     f"Full quote keys: {list(quote.keys())}"
                 )
-            
+
             # Log raw depth data if ask or bid is 0
             ask_price = sell_depth[0].get("price", 0) if sell_depth else 0
             bid_price = buy_depth[0].get("price", 0) if buy_depth else 0
-            
+
             if ask_price == 0 or bid_price == 0:
                 logger.info(
                     f"QUOTE_DEBUG: {exchange}:{br_symbol} - "
@@ -249,7 +244,7 @@ class BrokerData:
                     f"Buy depth: {buy_depth[:2] if buy_depth else 'empty'}. "
                     f"Quote keys: {list(quote.keys())}"
                 )
-            
+
             # Return quote data
             return {
                 "ask": ask_price,
@@ -420,10 +415,10 @@ class BrokerData:
             depth = quote.get("depth", {})
             sell_depth = depth.get("sell", [])
             buy_depth = depth.get("buy", [])
-            
+
             ask_price = sell_depth[0].get("price", 0) if sell_depth else 0
             bid_price = buy_depth[0].get("price", 0) if buy_depth else 0
-            
+
             # Log depth structure for debugging zero ask/bid prices
             if not sell_depth or not buy_depth:
                 logger.warning(
@@ -431,7 +426,7 @@ class BrokerData:
                     f"Sell depth: {len(sell_depth)} levels, Buy depth: {len(buy_depth)} levels. "
                     f"Full quote keys: {list(quote.keys())}"
                 )
-            
+
             # Log raw depth data if ask or bid is 0
             if ask_price == 0 or bid_price == 0:
                 logger.info(
@@ -441,7 +436,7 @@ class BrokerData:
                     f"Buy depth: {buy_depth[:2] if buy_depth else 'empty'}. "
                     f"Quote keys: {list(quote.keys())}"
                 )
-            
+
             # Parse and format quote data
             result_item = {
                 "symbol": original["symbol"],
