@@ -170,13 +170,7 @@ def place_order_api(data, auth):
 
 
 def place_smartorder_api(data, auth):
-    # Extract access token: stored token may be prefixed with "api_key:"
-    if ":" in auth:
-        access_token = auth.split(":", 1)[1]
-    else:
-        access_token = auth
-
-    AUTH_TOKEN = access_token
+    AUTH_TOKEN = auth
 
     # Initialize default return values
     res = None
@@ -255,13 +249,7 @@ def place_smartorder_api(data, auth):
 
 
 def close_all_positions(current_api_key, auth):
-    # Extract access token: stored token may be prefixed with "api_key:"
-    if ":" in auth:
-        access_token = auth.split(":", 1)[1]
-    else:
-        access_token = auth
-
-    AUTH_TOKEN = access_token
+    AUTH_TOKEN = auth
     # Fetch the current open positions
     positions_response = get_positions(AUTH_TOKEN)
 
@@ -408,13 +396,7 @@ def modify_order(data, auth):
 
 
 def cancel_all_orders_api(data, auth):
-    # Extract access token: stored token may be prefixed with "api_key:"
-    if ":" in auth:
-        access_token = auth.split(":", 1)[1]
-    else:
-        access_token = auth
-
-    AUTH_TOKEN = access_token
+    AUTH_TOKEN = auth
     # Get the order book
     order_book_response = get_order_book(AUTH_TOKEN)
     if order_book_response["status"] != "success":
