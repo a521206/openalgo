@@ -229,10 +229,14 @@ def place_smart_order_with_auth(
     # Get current position with fail-safe handling
     position_result = _fetch_position_for_validation(broker, order_data, auth_token)
     current_position = position_result.quantity
+    if position_result.error_message:
+        error_msg = f", error={position_result.error_message}"
+    else:
+        error_msg = ""
     logger.info(
         f"DIAG: Position fetch - symbol={order_data.get('symbol')}, exchange={order_data.get('exchange')}, "
-        f"product={order_data.get('product')}, current_position={current_position}, status={position_result.status}, "
-        f"error={position_result.error_message}"
+        f"product={order_data.get('product')}, current_position={current_position}, "
+        f"status={position_result.status}{error_msg}"
     )
 
     # Calculate target position_size for scale-out (single location)

@@ -133,6 +133,10 @@ def place_order_api(data, auth):
         "tag": newdata["tag"],
     }
 
+    # Add market_protection for MARKET orders (required by Zerodha API for algo orders)
+    if newdata["order_type"] == "MARKET":
+        payload["market_protection"] = "1"  # 1% protection
+
     logger.info(f"Payload for place_order_api: {payload}")
 
     # URL-encode the payload
