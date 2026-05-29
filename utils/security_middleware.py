@@ -1,69 +1,43 @@
 import logging
-from functools import wraps
 
-from flask import abort, jsonify, request
+from flask import jsonify
+from werkzeug.exceptions import BadHost
 
-from database.traffic_db import Error404Tracker, IPBan, logs_session
-from utils.ip_helper import get_real_ip, get_real_ip_from_environ
+from database.traffic_db import IPBan, logs_session
+from utils.ip_helper import get_real_ip_from_environ
 
 logger = logging.getLogger(__name__)
 
 
 class SecurityMiddleware:
-    """Middleware to check for banned IPs and handle security"""
+    """WSGI middleware: blocks banned IPs and handles malformed Host headers."""
 
     def __init__(self, app):
         self.app = app
 
     def __call__(self, environ, start_response):
-        # Get real client IP (handles proxies)
         client_ip = get_real_ip_from_environ(environ)
 
-        # Check if IP is banned
         if IPBan.is_ip_banned(client_ip):
-            # Clean up scoped session — this runs at WSGI level, outside Flask
-            # request context, so blueprint/app teardown handlers won't fire.
+            # Session cleanup must happen here — Flask teardown won't run at WSGI level.
             logs_session.remove()
-
-            # Return 403 Forbidden for banned IPs
-            status = "403 Forbidden"
-            headers = [("Content-Type", "text/plain")]
-            start_response(status, headers)
             logger.warning(f"Blocked banned IP: {client_ip}")
+            start_response("403 Forbidden", [("Content-Type", "text/plain")])
             return [b"Access Denied: Your IP has been banned"]
 
-        # For non-banned IPs: session cleanup is handled by Flask's
-        # teardown_app_request in traffic.py and security.py blueprints.
-        return self.app(environ, start_response)
-
-
-def check_ip_ban(f):
-    """Decorator to check if IP is banned before processing request"""
-
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        client_ip = get_real_ip()
-
-        if IPBan.is_ip_banned(client_ip):
-            logger.warning(f"Blocked banned IP in decorator: {client_ip}")
-            abort(403, description="Access Denied: Your IP has been banned")
-
-        return f(*args, **kwargs)
-
-    return decorated_function
+        try:
+            return self.app(environ, start_response)
+        except BadHost:
+            # flask-restx re-raises BadHost inside its own error router, letting it
+            # escape Flask's exception handling entirely. Catch it here and return 400.
+            logger.warning(f"BadHost from {client_ip}: invalid Host header '{environ.get('HTTP_HOST', '')}'")
+            start_response("400 Bad Request", [("Content-Type", "text/plain")])
+            return [b"400 Bad Request: Invalid Host header"]
 
 
 def init_security_middleware(app):
-    """Initialize security middleware"""
-    # Wrap the WSGI app with security middleware
     app.wsgi_app = SecurityMiddleware(app.wsgi_app)
 
-    logger.debug("Security middleware initialized")
-
-    # Note: 404 handler is now in app.py to avoid conflicts
-    # The main app's 404 handler calls Error404Tracker.track_404()
-
-    # Register 403 error handler for banned IPs
     @app.errorhandler(403)
     def handle_403(e):
         return jsonify({"error": "Access Denied"}), 403
