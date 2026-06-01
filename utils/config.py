@@ -34,10 +34,10 @@ def get_execution_buffer():
     """Return the execution buffer as a validated float.
     """
     try:
-        value = os.getenv("EXECUTION_BUFFER", "0.05")
+        value = os.getenv("EXECUTION_BUFFER", "0.0005")
         buffer = float(value)
         if buffer < 0 or buffer > 0.50:
-            return 0.05
+            return 0.0005
         return buffer
     except (ValueError, TypeError):
         return 0.05
