@@ -533,8 +533,8 @@ class TelegramBotService:
                 else:
                     return False, f"HTTP {response.status_code}: Failed to validate token"
 
-            except Exception as e:
-                logger.exception(f"Sync initialization error: {e}")
+            except requests.exceptions.RequestException as e:
+                logger.exception(f"Sync initialization network error: {e}")
                 # Store token anyway for retry later
                 self.bot_token = token
                 return True, "Token stored (will validate on start)"
@@ -641,26 +641,37 @@ class TelegramBotService:
 
         while not self._stop_event.is_set():
             try:
+                # Build application if needed - this may fail due to network issues
                 if self.application is None:
-                    self.application = Application.builder().token(self.bot_token).build()
-                    self.application.add_handler(CommandHandler("start", self.cmd_start))
-                    self.application.add_handler(CommandHandler("help", self.cmd_help))
-                    self.application.add_handler(CommandHandler("link", self.cmd_link))
-                    self.application.add_handler(CommandHandler("unlink", self.cmd_unlink))
-                    self.application.add_handler(CommandHandler("status", self.cmd_status))
-                    self.application.add_handler(CommandHandler("orderbook", self.cmd_orderbook))
-                    self.application.add_handler(CommandHandler("tradebook", self.cmd_tradebook))
-                    self.application.add_handler(CommandHandler("positions", self.cmd_positions))
-                    self.application.add_handler(CommandHandler("holdings", self.cmd_holdings))
-                    self.application.add_handler(CommandHandler("funds", self.cmd_funds))
-                    self.application.add_handler(CommandHandler("pnl", self.cmd_pnl))
-                    self.application.add_handler(CommandHandler("quote", self.cmd_quote))
-                    self.application.add_handler(CommandHandler("chart", self.cmd_chart))
-                    self.application.add_handler(CommandHandler("menu", self.cmd_menu))
-                    self.application.add_handler(CallbackQueryHandler(self.button_callback))
-                    self.application.add_error_handler(self.handle_error)
-                    await self.application.initialize()
-                    await self.application.start()
+                    try:
+                        self.application = Application.builder().token(self.bot_token).build()
+                        self.application.add_handler(CommandHandler("start", self.cmd_start))
+                        self.application.add_handler(CommandHandler("help", self.cmd_help))
+                        self.application.add_handler(CommandHandler("link", self.cmd_link))
+                        self.application.add_handler(CommandHandler("unlink", self.cmd_unlink))
+                        self.application.add_handler(CommandHandler("status", self.cmd_status))
+                        self.application.add_handler(CommandHandler("orderbook", self.cmd_orderbook))
+                        self.application.add_handler(CommandHandler("tradebook", self.cmd_tradebook))
+                        self.application.add_handler(CommandHandler("positions", self.cmd_positions))
+                        self.application.add_handler(CommandHandler("holdings", self.cmd_holdings))
+                        self.application.add_handler(CommandHandler("funds", self.cmd_funds))
+                        self.application.add_handler(CommandHandler("pnl", self.cmd_pnl))
+                        self.application.add_handler(CommandHandler("quote", self.cmd_quote))
+                        self.application.add_handler(CommandHandler("chart", self.cmd_chart))
+                        self.application.add_handler(CommandHandler("menu", self.cmd_menu))
+                        self.application.add_handler(CallbackQueryHandler(self.button_callback))
+                        self.application.add_error_handler(self.handle_error)
+                        await self.application.initialize()
+                        await self.application.start()
+                    except (
+                        httpx.ConnectError,
+                        httpx.NetworkError,
+                        httpx.TimeoutException,
+                        telegram.error.NetworkError,
+                        telegram.error.TimedOut,
+                    ) as init_error:
+                        # Treat initialization errors as recoverable network errors
+                        raise init_error
 
                 logger.debug("Starting bot in polling mode...")
 
@@ -698,11 +709,25 @@ class TelegramBotService:
 
                 logger.info(f"Retrying polling in {delay} seconds...")
 
-                if self.application and self.application.updater:
+                # Clean up any partially initialized application
+                if self.application:
                     try:
-                        await self.application.updater.stop()
+                        if self.application.updater and self.application.updater.running:
+                            await self.application.updater.stop()
                     except Exception:
                         pass
+                    try:
+                        if hasattr(self.application, "running") and self.application.running:
+                            await self.application.stop()
+                    except Exception:
+                        pass
+                    try:
+                        await self.application.shutdown()
+                    except Exception:
+                        pass
+
+                # Reset application to None so it re-initializes on retry
+                self.application = None
 
                 await asyncio.sleep(delay)
                 continue
