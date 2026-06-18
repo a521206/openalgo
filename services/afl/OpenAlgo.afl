@@ -1,9 +1,9 @@
 // Rajandran R - Creator of OpenAlgo
 // Website - openalgo.in / marketcalls.in
-// OpenAlgo - Amibroker Order Chart Trading Module v2.0
+// OpenAlgo - Amibroker SmartOrder Chart Trading Module v2.0
 // Date - 12/12/2024
 
-_SECTION_BEGIN( "OpenAlgo Order Trading Module - Modern Methods" );
+_SECTION_BEGIN( "OpenAlgo SmartOrder Trading Module - Modern Methods" );
 
 RequestTimedRefresh( 1, False );
 
@@ -11,17 +11,11 @@ RequestTimedRefresh( 1, False );
 VoiceAlert	= ParamToggle( "Voice Alert", "Disable|Enable", 1 );
 EnableAlgo	= ParamToggle( "Algo Mode", "Disable|Enable", 1 );
 
-pricetype	= "MARKET";
+pricetype	= "LIMIT";
 product		= "NRML";
-quantity	= IIf( Buy, bLots, sLots ) * RoundLotSize;
-position_size	= quantity;
-
-
-if( StrFind( Name(), "NIFTY" ) > 0 ) symbol = "NIFTY" + expiry + "FUT";
-
-if( StrFind( Name(), "NIFTY BANK" ) > 0 ) symbol = "BANKNIFTY" + expiry + "FUT";
-
-if( StrFind( Name(), "RELIANCE" ) > 0 ) symbol = "RELIANCE" + expiry + "FUT";
+symbol 		= underlying + expiry + "FUT";
+quantity	= 0;
+position_size	= IIf( Buy, bLots, IIf( Short, -1 * sLots, 0 ) ) * RoundLotSize;
 
 AlgoBuy		= lastvalue( Buy );
 AlgoSell	= lastvalue( Sell );
@@ -64,7 +58,6 @@ if( NOT EnableAlgo )
     }
 }
 
-
 //Button Trading Controls
 
 X0 = 20;
@@ -85,11 +78,7 @@ procedure DrawButton( Text, x1, y1, x2, y2, colorFrom, colorTo )
 }
 GfxSetTextColor( colorWhite );
 
-
-
-
-
-// Function to Place Smart Order (with position_size)
+// Function to Place Smart Order
 function PlaceSmartOrder( action, quantity, position_size )
 {
     postData = "{\"apikey\": \"" + apikey + "\", " +
@@ -106,48 +95,8 @@ function PlaceSmartOrder( action, quantity, position_size )
               "Accept-Encoding: gzip, deflate\r\n";
     InternetSetHeaders( headers );
 
-    _TRACE( "Smart Order Request Sent: " + postData ); // Log request
-    ih = InternetPostRequest( bridgeurl + "/placesmartorder", postData );
-
-    if( ih )
-    {
-        response = "";
-
-        while( ( line = InternetReadString( ih ) ) != "" )
-        {
-            response += line;
-        }
-
-        _TRACEF( "Smart Order Response: %s", response );
-
-        if( VoiceAlert ) Say( action + " Order Placed." );
-
-        InternetClose( ih );
-    }
-    else
-    {
-        _TRACE( "Failed to place smart order." );
-    }
-}
-
-// Function to Place Basic Order (without position_size)
-function PlaceOrder( action, quantity )
-{
-    postData = "{\"apikey\": \"" + apikey + "\", " +
-               "\"strategy\": \"" + strategy + "\", " +
-               "\"symbol\": \"" + symbol + "\", " +
-               "\"action\": \"" + action + "\", " +
-               "\"exchange\": \"" + exchange + "\", " +
-               "\"pricetype\": \"" + pricetype + "\", " +
-               "\"product\": \"" + product + "\", " +
-               "\"quantity\": \"" + quantity + "\"}";
-
-    headers = "Content-Type: application/json\r\n" +
-              "Accept-Encoding: gzip, deflate\r\n";
-    InternetSetHeaders( headers );
-
     _TRACE( "Order Request Sent: " + postData ); // Log request
-    ih = InternetPostRequest( bridgeurl + "/api/v1/placeorder", postData );
+    ih = InternetPostRequest( bridgeurl + "/placesmartorder", postData );
 
     if( ih )
     {
@@ -170,7 +119,7 @@ function PlaceOrder( action, quantity )
     }
 }
 
-// Function to Exit Order using Smart Order endpoint
+// Function to Exit Order
 function ExitOrder( action )
 {
     postData = "{\"apikey\": \"" + apikey + "\", " +
@@ -245,8 +194,6 @@ function SquareOffAll()
     }
 }
 
-
-
 // Execution Module
 if( EnableAlgo )
 {
@@ -258,85 +205,15 @@ if( EnableAlgo )
         AlgoCondition = AlgoBuy == True AND AlgoCover == True AND StaticVarGet( static_name_ + "buyCoverAlgo" ) == 0 AND StaticVarGetText( static_name_ + "buyCoverAlgo_barvalue" ) != lasttime;
         printf( " AlgoCondition = %g\n", AlgoCondition );
 
-    if( AlgoBuy == True AND AlgoCover == True AND StaticVarGet( static_name_ + "buyCoverAlgo" ) == 0 AND StaticVarGetText( static_name_ + "buyCoverAlgo_barvalue" ) != lasttime )
-    {
-        PlaceOrder( "BUY", quantity );
-
-        if( VoiceAlert ) Say( "Buy Order Triggered" );
-
-        StaticVarSetText( static_name_ + "buyCoverAlgo_barvalue", lasttime );
-        StaticVarSet( static_name_ + "buyCoverAlgo", 1 );
-    }
-    else
-        if( AlgoBuy != True OR AlgoCover != True )
+        if( AlgoBuy == True AND AlgoCover == True AND StaticVarGet( static_name_ + "buyCoverAlgo" ) == 0 AND StaticVarGetText( static_name_ + "buyCoverAlgo_barvalue" ) != lasttime )
         {
-            StaticVarSet( static_name_ + "buyCoverAlgo", 0 );
-            StaticVarSetText( static_name_ + "buyCoverAlgo_barvalue", "" );
-        }
-
-        if( AlgoBuy == True AND AlgoCover != True AND StaticVarGet( static_name_ + "buyAlgo" ) == 0 AND StaticVarGetText( static_name_ + "buyAlgo_barvalue" ) != lasttime )
-        {
-            PlaceSmartOrder( "BUY", quantity, position_size );
+            PlaceSmartOrder( "BUY", quantity, quantity );
 
             if( VoiceAlert ) Say( "Buy Order Triggered" );
 
-            StaticVarSetText( static_name_ + "buyAlgo_barvalue", lasttime );
-            StaticVarSet( static_name_ + "buyAlgo", 1 );
+            StaticVarSetText( static_name_ + "buyCoverAlgo_barvalue", lasttime );
+            StaticVarSet( static_name_ + "buyCoverAlgo", 1 );
         }
-        else
-            if( AlgoBuy != True )
-            {
-                StaticVarSet( static_name_ + "buyAlgo", 0 );
-                StaticVarSetText( static_name_ + "buyAlgo_barvalue", "" );
-            }
-
-            if( AlgoSell == true AND AlgoShort != True AND StaticVarGet( static_name_ + "sellAlgo" ) == 0 AND StaticVarGetText( static_name_ + "sellAlgo_barvalue" ) != lasttime )
-            {
-                ExitOrder( "SELL" );
-
-                if( VoiceAlert ) Say( "Sell Exit Order Triggered" );
-
-                StaticVarSetText( static_name_ + "sellAlgo_barvalue", lasttime );
-                StaticVarSet( static_name_ + "sellAlgo", 1 );
-            }
-            else
-                if( AlgoSell != True )
-                {
-                    StaticVarSet( static_name_ + "sellAlgo", 0 );
-                    StaticVarSetText( static_name_ + "sellAlgo_barvalue", "" );
-                }
-
-                if( AlgoShort == True AND AlgoSell == True AND StaticVarGet( static_name_ + "ShortSellAlgo" ) == 0 AND StaticVarGetText( static_name_ + "ShortSellAlgo_barvalue" ) != lasttime )
-                {
-                    PlaceSmartOrder( "SELL", quantity, -1 * quantity );
-
-                    if( VoiceAlert ) Say( "Short Order Triggered" );
-
-                    StaticVarSetText( static_name_ + "ShortSellAlgo_barvalue", lasttime );
-                    StaticVarSet( static_name_ + "ShortSellAlgo", 1 );
-                }
-                else
-                    if( AlgoShort != True OR AlgoSell != True )
-                    {
-                        StaticVarSet( static_name_ + "ShortSellAlgo", 0 );
-                        StaticVarSetText( static_name_ + "ShortSellAlgo_barvalue", "" );
-                    }
-
-                    if( AlgoShort == True AND AlgoSell != True AND StaticVarGet( static_name_ + "ShortAlgo" ) == 0 AND StaticVarGetText( static_name_ + "ShortAlgo_barvalue" ) != lasttime )
-                    {
-                        PlaceSmartOrder( "SELL", quantity, position_size );
-
-                        if( VoiceAlert ) Say( "Short Order Triggered" );
-
-                        StaticVarSetText( static_name_ + "ShortAlgo_barvalue", lasttime );
-                        StaticVarSet( static_name_ + "ShortAlgo", 1 );
-                    }
-                    else
-                        if( AlgoShort != True )
-                        {
-                            StaticVarSet( static_name_ + "ShortAlgo", 0 );
-                            StaticVarSetText( static_name_ + "ShortAlgo_barvalue", "" );
-                        }
         else
             if( AlgoBuy != True OR AlgoCover != True )
             {
@@ -346,7 +223,7 @@ if( EnableAlgo )
 
         if( AlgoBuy == True AND AlgoCover != True AND StaticVarGet( static_name_ + "buyAlgo" ) == 0 AND StaticVarGetText( static_name_ + "buyAlgo_barvalue" ) != lasttime )
         {
-            PlaceOrder( "BUY", quantity, position_size );
+            PlaceSmartOrder( "BUY", quantity, position_size );
 
             if( VoiceAlert ) Say( "Buy Order Triggered" );
 
@@ -378,7 +255,7 @@ if( EnableAlgo )
 
         if( AlgoShort == True AND AlgoSell == True AND StaticVarGet( static_name_ + "ShortSellAlgo" ) == 0 AND StaticVarGetText( static_name_ + "ShortSellAlgo_barvalue" ) != lasttime )
         {
-            PlaceOrder( "SELL", quantity, -1 * quantity );
+            PlaceSmartOrder( "SELL", quantity, -1 * quantity );
 
             if( VoiceAlert ) Say( "Short Order Triggered" );
 
@@ -394,7 +271,7 @@ if( EnableAlgo )
 
         if( AlgoShort == True AND AlgoSell != True AND StaticVarGet( static_name_ + "ShortAlgo" ) == 0 AND StaticVarGetText( static_name_ + "ShortAlgo_barvalue" ) != lasttime )
         {
-            PlaceOrder( "SELL", quantity, position_size );
+            PlaceSmartOrder( "SELL", quantity, position_size );
 
             if( VoiceAlert ) Say( "Short Order Triggered" );
 
@@ -427,4 +304,3 @@ if( EnableAlgo )
 }
 
 _SECTION_END();
-

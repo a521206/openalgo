@@ -163,7 +163,7 @@ function ExitPosition( sym, exch, product_type, apikey_val, strategy_val, host_v
     else
         if( scale_qty_val > 0 )
             postData = postData +
-                       ", \"scale_qty\":\"" + NumToStr( scale_qty_val, 1.0, False ) + "\"}";
+                       ", \"scale_qty\": \"" + NumToStr( scale_qty_val, 1.0, False ) + "\"}";
         else
             postData = postData + "}";
 
@@ -219,11 +219,6 @@ else
     EnableTextOutput( False );
     SetOption( "StaticVarAutoSave", 30 );
 
-    strategy	= "SpotToOptions";
-
-    /* Underlying and Exchange Settings */
-    underlying	= StrReplace( Name(), "-I.NFO", "" );
-
     if( StrFind( Name(), "NIFTY 50.NSE_IDX" ) )
     {
         underlying = "NIFTY";
@@ -234,16 +229,13 @@ else
         underlying = "BANKNIFTY";
     }
 
-    exchange	= "NFO";
-    expiry		= "28APR26";
-
     /* Strike Offset Settings - Now using string-based offsets */
     CE_offset = ParamStr( "CE Offset", "ATM" ); /* ATM, ITM1, ITM2, OTM1, OTM2, etc. */
     PE_offset = ParamStr( "PE Offset", "ATM" ); /* ATM, ITM1, ITM2, OTM1, OTM2, etc. */
 
     /* Order Settings */
     // quantity 	= IIf(StrFind( Name(), "NIFTY" ) > 0, IIf( Buy, bLots, IIf( Short, sLots, 0) ), 1) * RoundLotSize; // Only 1 lots for other stocks for now
-    quantity 	= 2 * IIf( Buy, bLots, IIf( Short, sLots, 0 ) ) * RoundLotSize;
+    quantity 	= IIf( Buy, bLots, IIf( Short, sLots, 0 ) ) * RoundLotSize;
 
     pricetype	= "LIMIT";
     product 	= "NRML";
@@ -363,7 +355,7 @@ else
     AlgoSell  = LastValue( Sell );
     AlgoShort = LastValue( Short );
     AlgoCover = LastValue( Cover );
-    AlgoScaleOut = LastValue( Buy ) == sigScaleOut;
+    AlgoScaleOut = LastValue( Buy ) == sigScaleOut OR LastValue( Short ) == sigScaleOut;
 
     printf( "quantity = %g\n", quantity );
 

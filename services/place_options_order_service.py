@@ -31,7 +31,7 @@ from services.option_symbol_service import (
 from services.place_order_service import place_order
 from services.quotes_service import get_multiquotes, get_quotes
 from services.telegram_alert_service import telegram_alert_service
-from utils.config import get_execution_buffer
+from utils.config import get_execution_buffer_options
 from utils.logging import get_logger
 from utils.price_utils import round_price_to_tick_size
 
@@ -347,7 +347,7 @@ def place_options_order(
             # Determine base price based on action with configurable execution buffer
             # BUY: Use ask + buffer% (what sellers are asking)
             # SELL: Use bid - buffer% (what buyers are bidding)
-            execution_buffer = get_execution_buffer()
+            execution_buffer = get_execution_buffer_options()
             buffer_pct = round(execution_buffer * 100, 1)
             auto_discovery_requested = price == 0  # True when price=0 triggers auto-discovery
             if action == "BUY":

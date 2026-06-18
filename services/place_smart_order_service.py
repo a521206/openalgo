@@ -13,6 +13,7 @@ from services.quotes_service import get_quotes
 from services.smart_trade_rules_service import (
     PositionFetchResult,
     PositionFetchStatus,
+    get_lot_size_with_status,
     validate_against_smart_trade_rules,
 )
 from services.symbol_service import get_symbol_info_with_auth
@@ -259,6 +260,13 @@ def place_smart_order_with_auth(
         logger.info(
             f"DIAG: Scale calculation START - current={current_position}, scale_pct={scale_pct}"
         )
+
+        # Get lot size for F&O position rounding
+        symbol = order_data.get("symbol")
+        exchange = order_data.get("exchange")
+        lot_size_result = get_lot_size_with_status(symbol, exchange)
+        lot_size = lot_size_result.lot_size if lot_size_result.lot_size > 1 else 1
+
         if scale_pct > 0:
             position_size = int(current_position * (100 - scale_pct) / 100)
         else:
@@ -266,10 +274,15 @@ def place_smart_order_with_auth(
                 position_size = max(0, current_position - scale_qty)
             else:
                 position_size = min(0, current_position + scale_qty)
+
+        # Round to lot size multiple for F&O instruments
+        if lot_size > 1:
+            position_size = int(abs(position_size) // lot_size * lot_size) * (1 if position_size >= 0 else -1)
+
         logger.info(f"DIAG: Scale calculation DONE - new target position_size={position_size}")
         order_data["position_size"] = str(position_size)
         logger.info(
-            f"Scale-out: current={current_position}, scale={scale_pct or scale_qty}, target={position_size}"
+            f"Scale-out: current={current_position}, scale={scale_pct or scale_qty}, target={position_size}, lot_size={lot_size}"
         )
 
     # Validate against smart trade rules
@@ -345,9 +358,11 @@ def place_smart_order_with_auth(
         )
 
         tick_size = 0.05
+        instrument_type = None
         if symbol_success:
             symbol_data = symbol_response.get("data", {})
             tick_size = symbol_data.get("tick_size", 0.05)
+            instrument_type = symbol_data.get("instrumenttype")
 
         api_key = original_data.get("apikey")
         success, quote_response, _ = get_quotes(
@@ -363,7 +378,7 @@ def place_smart_order_with_auth(
             quote_ask = quote_data.get("ask", 0)
 
             # BUY: Use ask + buffer%, SELL: Use bid - buffer%, fallback to LTP
-            execution_buffer = get_execution_buffer()
+            execution_buffer = get_execution_buffer(instrument_type)
             if action == "BUY" and quote_ask > 0:
                 discovered_price = quote_ask * (1 + execution_buffer)
             elif action == "SELL" and quote_bid > 0:

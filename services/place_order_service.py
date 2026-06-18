@@ -286,9 +286,11 @@ def place_order_with_auth(
         )
 
         tick_size = 0.05
+        instrument_type = None
         if symbol_success:
             symbol_data = symbol_response.get("data", {})
             tick_size = symbol_data.get("tick_size", 0.05)
+            instrument_type = symbol_data.get("instrumenttype")
 
         api_key = original_data.get("apikey")
         success, quote_response, _ = get_quotes(
@@ -304,7 +306,7 @@ def place_order_with_auth(
             quote_ask = quote_data.get("ask", 0)
 
             # BUY: Use ask + buffer%, SELL: Use bid - buffer%, fallback to LTP
-            execution_buffer = get_execution_buffer()
+            execution_buffer = get_execution_buffer(instrument_type)
             if action == "BUY" and quote_ask > 0:
                 discovered_price = quote_ask * (1 + execution_buffer)
             elif action == "SELL" and quote_bid > 0:
