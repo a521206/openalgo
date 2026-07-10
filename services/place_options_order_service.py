@@ -12,7 +12,7 @@ Supports both live trading and sandbox (analyze) mode, just like place_order_ser
 import copy
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from database.analyzer_db import async_log_analyzer
 from database.apilog_db import async_log_order
@@ -21,9 +21,9 @@ from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
 from extensions import socketio
 from services.liquidity_fallback_service import (
+    LiquidityResult,
     get_liquidity_fallback_service,
     is_liquidity_fallback_enabled,
-    LiquidityResult,
 )
 from services.option_symbol_service import (
     get_option_symbol,
@@ -299,41 +299,38 @@ def place_options_order(
                         f"(reason={reason}, bid={option_bid}, ask={option_ask})"
                     )
 
-                    liquid_strike = liquidity_service.find_liquid_strike(
+                    eval_result = liquidity_service.evaluate(
                         underlying=underlying,
                         exchange=exchange,
                         expiry_date=expiry_date,
                         option_type=option_type,
                         api_key=symbol_api_key,
+                        offset=offset,
                         underlying_ltp=underlying_ltp,
                         options_exchange=resolved_exchange,
                     )
 
-                    if liquid_strike:
+                    if eval_result.selected:
                         fallback_result.applied = True
                         fallback_result.original_symbol = resolved_symbol
-                        fallback_result.selected_symbol = liquid_strike.symbol
+                        fallback_result.selected_symbol = eval_result.selected.symbol
                         fallback_result.reason = reason
+                        if eval_result.degraded:
+                            fallback_result.reason = f"{reason};degraded:{eval_result.degradation_reason}"
+                        fallback_result.evaluated_strikes = eval_result.evaluated
 
-                        # Update symbol and exchange
-                        resolved_symbol = liquid_strike.symbol
-                        resolved_exchange = liquid_strike.exchange
-                        tick_size = liquid_strike.tick_size
+                        resolved_symbol = eval_result.selected.symbol
+                        resolved_exchange = eval_result.selected.exchange
+                        tick_size = eval_result.selected.tick_size
 
-                        # Use quotes from the liquid strike
-                        option_ltp = liquid_strike.ltp or (
-                            (liquid_strike.bid + liquid_strike.ask) / 2
-                            if liquid_strike.bid > 0 and liquid_strike.ask > 0
-                            else option_ltp
-                        )
-                        option_bid = liquid_strike.bid
-                        option_ask = liquid_strike.ask
+                        option_ltp = eval_result.selected.ltp or option_ltp
+                        option_bid = eval_result.selected.bid
+                        option_ask = eval_result.selected.ask
 
                         logger.info(
                             f"Liquidity fallback: selected {resolved_symbol} (was {fallback_result.original_symbol})"
                         )
                     else:
-                        # Fallback failed - check if we can still proceed
                         if option_bid <= 0 or option_ask <= 0:
                             return (
                                 False,
