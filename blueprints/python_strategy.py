@@ -95,41 +95,52 @@ IS_LINUX = OS_TYPE == "linux"
 
 
 def init_scheduler():
-    """Initialize the APScheduler with IST timezone"""
+    """Initialize the APScheduler with IST timezone. Non-blocking and safe to call multiple times."""
     global SCHEDULER
     if SCHEDULER is not None and SCHEDULER.running:
         logger.debug("Scheduler already running")
         return
+    # Discard stale scheduler without shutting down (thread is dead, shutdown may hang)
     if SCHEDULER is not None:
         try:
-            SCHEDULER.shutdown(wait=False)
+            SCHEDULER = None
         except Exception:
             pass
+    try:
+        SCHEDULER = BackgroundScheduler(daemon=True, timezone=IST)
+        SCHEDULER.start(paused=False)
+        logger.debug(f"Scheduler initialized with IST timezone on {OS_TYPE}")
+    except Exception as e:
+        logger.error(f"Failed to start scheduler: {e}")
         SCHEDULER = None
-    SCHEDULER = BackgroundScheduler(daemon=True, timezone=IST)
-    SCHEDULER.start()
-    logger.debug(f"Scheduler initialized with IST timezone on {OS_TYPE}")
+        return
 
     # Add daily trading day check job - runs at 00:01 IST every day
     # This stops scheduled strategies on weekends/holidays
-    SCHEDULER.add_job(
-        func=daily_trading_day_check,
-        trigger=CronTrigger(hour=0, minute=1, timezone=IST),
-        id="daily_trading_day_check",
-        replace_existing=True,
-    )
-    logger.debug("Daily trading day check scheduled at 00:01 IST")
+    try:
+        SCHEDULER.add_job(
+            func=daily_trading_day_check,
+            trigger=CronTrigger(hour=0, minute=1, timezone=IST),
+            id="daily_trading_day_check",
+            replace_existing=True,
+        )
+        logger.debug("Daily trading day check scheduled at 00:01 IST")
+    except Exception as e:
+        logger.error(f"Failed to add daily check job: {e}")
 
     # Add market hours enforcer - runs every minute during trading hours
     # This stops scheduled strategies when market closes
-    SCHEDULER.add_job(
-        func=market_hours_enforcer,
-        trigger="interval",
-        minutes=1,
-        id="market_hours_enforcer",
-        replace_existing=True,
-    )
-    logger.debug("Market hours enforcer scheduled (runs every minute)")
+    try:
+        SCHEDULER.add_job(
+            func=market_hours_enforcer,
+            trigger="interval",
+            minutes=1,
+            id="market_hours_enforcer",
+            replace_existing=True,
+        )
+        logger.debug("Market hours enforcer scheduled (runs every minute)")
+    except Exception as e:
+        logger.error(f"Failed to add market hours enforcer job: {e}")
 
 
 def load_configs():
