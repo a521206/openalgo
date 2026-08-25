@@ -1948,6 +1948,11 @@ def status():
     """Get system status"""
     cleanup_dead_processes()
 
+    # Self-heal: restart scheduler if it died (e.g., eventlet green thread starvation)
+    if SCHEDULER is not None and not SCHEDULER.running:
+        logger.warning("Scheduler died - restarting")
+        init_scheduler()
+
     # Check master contract status
     contracts_ready, contract_message = check_master_contract_ready()
 
