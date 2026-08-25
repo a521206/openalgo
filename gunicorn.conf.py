@@ -8,7 +8,10 @@ def post_fork(server, worker):
     logger = logging.getLogger("gunicorn.postfork")
     logger.info(f"Worker {worker.pid} forked - initializing strategy scheduler")
     try:
-        from blueprints.python_strategy import init_scheduler
+        from blueprints.python_strategy import init_scheduler, SCHEDULER
+        # Clear stale scheduler object from master process (dead thread after fork)
+        import blueprints.python_strategy as ps
+        ps.SCHEDULER = None
         init_scheduler()
         logger.info(f"Strategy scheduler initialized in worker {worker.pid}")
     except Exception as e:
