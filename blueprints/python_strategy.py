@@ -1956,6 +1956,8 @@ def status():
             "running": len(RUNNING_STRATEGIES),
             "total": len(STRATEGY_CONFIGS),
             "scheduler_running": SCHEDULER is not None and SCHEDULER.running,
+            "scheduler_type": str(type(SCHEDULER))),
+            "scheduler_pid": os.getpid(),
             "current_ist_time": get_ist_time().strftime("%H:%M:%S IST"),
             "platform": OS_TYPE,
             # Legacy field names (for backward compatibility)
