@@ -97,10 +97,18 @@ IS_LINUX = OS_TYPE == "linux"
 def init_scheduler():
     """Initialize the APScheduler with IST timezone"""
     global SCHEDULER
-    if SCHEDULER is None:
-        SCHEDULER = BackgroundScheduler(daemon=True, timezone=IST)
-        SCHEDULER.start()
-        logger.debug(f"Scheduler initialized with IST timezone on {OS_TYPE}")
+    if SCHEDULER is not None and SCHEDULER.running:
+        logger.debug("Scheduler already running")
+        return
+    if SCHEDULER is not None:
+        try:
+            SCHEDULER.shutdown(wait=False)
+        except Exception:
+            pass
+        SCHEDULER = None
+    SCHEDULER = BackgroundScheduler(daemon=True, timezone=IST)
+    SCHEDULER.start()
+    logger.debug(f"Scheduler initialized with IST timezone on {OS_TYPE}")
 
         # Add daily trading day check job - runs at 00:01 IST every day
         # This stops scheduled strategies on weekends/holidays
