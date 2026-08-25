@@ -848,16 +848,10 @@ def shutdown_schedulers(exception=None):
     except Exception:
         pass
 
-    # Shutdown Python Strategy Scheduler
-    try:
-        from blueprints.python_strategy import SCHEDULER
-        if SCHEDULER:
-            try:
-                SCHEDULER.shutdown(wait=False)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    # NOTE: Python Strategy Scheduler is NOT shut down here because this
+    # teardown handler runs after EVERY request. Shutting down the scheduler
+    # per-request breaks scheduled strategy execution under Gunicorn.
+    # Scheduler shutdown is handled via atexit in python_strategy.py.
 
     # Shutdown WebSocket server (can happen during app context)
     try:

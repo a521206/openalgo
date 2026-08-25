@@ -1948,10 +1948,17 @@ def status():
     """Get system status"""
     cleanup_dead_processes()
 
-    # Self-heal: restart scheduler if it died (e.g., eventlet green thread starvation)
-    if SCHEDULER is not None and not SCHEDULER.running:
-        logger.warning("Scheduler died - restarting")
+    # Self-heal: restart scheduler if it died
+    if SCHEDULER is None or not SCHEDULER.running:
+        logger.warning(f"Scheduler died (SCHEDULER={SCHEDULER}, running={getattr(SCHEDULER, 'running', 'N/A')}) - restarting")
         init_scheduler()
+        # Re-schedule all strategies after scheduler restart
+        for sid, cfg in STRATEGY_CONFIGS.items():
+            if cfg.get("is_scheduled") and cfg.get("schedule_start"):
+                try:
+                    schedule_strategy(sid, cfg["schedule_start"], cfg.get("schedule_stop"), cfg.get("schedule_days"))
+                except Exception as e:
+                    logger.warning(f"Failed to restore schedule for {sid}: {e}")
 
     # Check master contract status
     contracts_ready, contract_message = check_master_contract_ready()
@@ -2483,11 +2490,8 @@ def save_strategy(strategy_id):
 
 # Cleanup on shutdown
 def cleanup_on_exit():
-    """Clean up running processes on application exit (fallback cleanup via atexit)
-    
-    Note: Scheduler shutdown is handled by Flask teardown (app.py::shutdown_schedulers).
-    This function focuses on stopping strategy processes as a fallback.
-    """
+    """Clean up running processes and scheduler on application exit"""
+
     logger.info("Cleaning up running strategies...")
     with PROCESS_LOCK:
         for strategy_id in list(RUNNING_STRATEGIES.keys()):
@@ -2496,6 +2500,15 @@ def cleanup_on_exit():
             except Exception:
                 pass
     logger.info("Cleanup complete")
+
+    # Shutdown scheduler on process exit
+    global SCHEDULER
+    if SCHEDULER and SCHEDULER.running:
+        try:
+            logger.info("Shutting down strategy scheduler...")
+            SCHEDULER.shutdown(wait=False)
+        except Exception:
+            pass
 
 
 # Register cleanup handler
