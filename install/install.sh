@@ -1027,6 +1027,37 @@ WantedBy=multi-user.target
 EOL
 check_status "Failed to create systemd service"
 
+# Create separate scheduler systemd service
+log_message "\nCreating scheduler systemd service..." "$BLUE"
+SERVICE_SUFFIX=$(echo "$DEPLOY_NAME" | sed 's/[^a-zA-Z0-9]//g')
+sudo tee /etc/systemd/system/openalgo-scheduler-${SERVICE_SUFFIX}.service > /dev/null << EOL
+[Unit]
+Description=OpenAlgo Strategy Scheduler ($DEPLOY_NAME)
+After=network.target ${SERVICE_NAME}.service
+Wants=${SERVICE_NAME}.service
+
+[Service]
+Type=simple
+User=$WEB_USER
+Group=$WEB_GROUP
+WorkingDirectory=$OPENALGO_PATH
+Environment="PATH=$VENV_PATH/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="TMPDIR=$OPENALGO_PATH/tmp"
+Environment="NUMBA_CACHE_DIR=$OPENALGO_PATH/tmp/numba_cache"
+Environment="MPLCONFIGDIR=$OPENALGO_PATH/tmp/matplotlib"
+Environment="DATABASE_URL=sqlite:///$OPENALGO_PATH/db/openalgo.db"
+Environment="TZ=Asia/Kolkata"
+ExecStart=$VENV_PATH/bin/python $OPENALGO_PATH/scheduler.py
+Restart=always
+RestartSec=10
+StandardOutput=append:$OPENALGO_PATH/log/scheduler.log
+StandardError=append:$OPENALGO_PATH/log/scheduler.log
+
+[Install]
+WantedBy=multi-user.target
+EOL
+check_status "Failed to create scheduler systemd service"
+
 # Set correct permissions
 log_message "\nSetting permissions..." "$BLUE"
 
@@ -1065,6 +1096,8 @@ log_message "\nStarting services..." "$BLUE"
 sudo systemctl daemon-reload
 sudo systemctl enable $SERVICE_NAME
 sudo systemctl start $SERVICE_NAME
+sudo systemctl enable openalgo-scheduler-${SERVICE_SUFFIX}
+sudo systemctl start openalgo-scheduler-${SERVICE_SUFFIX}
 sudo systemctl restart nginx
 check_status "Failed to start services"
 
@@ -1127,6 +1160,9 @@ log_message "4. Monitor the application status: sudo systemctl status $SERVICE_N
 
 log_message "\nUseful Commands:" "$YELLOW"
 log_message "Restart OpenAlgo: sudo systemctl restart $SERVICE_NAME" "$BLUE"
+log_message "Restart Scheduler: sudo systemctl restart openalgo-scheduler-${SERVICE_SUFFIX}" "$BLUE"
 log_message "View Logs: sudo journalctl -u $SERVICE_NAME" "$BLUE"
+log_message "View Scheduler Logs: sudo journalctl -u openalgo-scheduler-${SERVICE_SUFFIX}" "$BLUE"
 log_message "Check Status: sudo systemctl status $SERVICE_NAME" "$BLUE"
+log_message "Check Scheduler: sudo systemctl status openalgo-scheduler-${SERVICE_SUFFIX}" "$BLUE"
 log_message "View Installation Log: cat $LOG_FILE" "$BLUE"
