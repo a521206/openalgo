@@ -157,11 +157,15 @@ def load_configs():
 
 
 def save_configs():
-    """Save strategy configurations to file"""
+    """Save strategy configurations to file atomically (safe for multi-process)"""
     try:
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(STRATEGY_CONFIGS, f, indent=2, default=str, ensure_ascii=False)
+        tmp = CONFIG_FILE.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(STRATEGY_CONFIGS, indent=2, default=str, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(CONFIG_FILE)
         logger.debug("Configurations saved")
     except Exception as e:
         logger.exception(f"Failed to save configs: {e}")
@@ -1959,18 +1963,6 @@ def status():
     """Get system status"""
     cleanup_dead_processes()
 
-    # Self-heal: restart scheduler if it died
-    if SCHEDULER is None or not SCHEDULER.running:
-        logger.warning(f"Scheduler died (SCHEDULER={SCHEDULER}, running={getattr(SCHEDULER, 'running', 'N/A')}) - restarting")
-        init_scheduler()
-        # Re-schedule all strategies after scheduler restart
-        for sid, cfg in STRATEGY_CONFIGS.items():
-            if cfg.get("is_scheduled") and cfg.get("schedule_start"):
-                try:
-                    schedule_strategy(sid, cfg["schedule_start"], cfg.get("schedule_stop"), cfg.get("schedule_days"))
-                except Exception as e:
-                    logger.warning(f"Failed to restore schedule for {sid}: {e}")
-
     # Check master contract status
     contracts_ready, contract_message = check_master_contract_ready()
 
@@ -1979,8 +1971,6 @@ def status():
             "running": len(RUNNING_STRATEGIES),
             "total": len(STRATEGY_CONFIGS),
             "scheduler_running": SCHEDULER is not None and SCHEDULER.running,
-            "scheduler_type": str(type(SCHEDULER)),
-            "scheduler_pid": os.getpid(),
             "current_ist_time": get_ist_time().strftime("%H:%M:%S IST"),
             "platform": OS_TYPE,
             # Legacy field names (for backward compatibility)
@@ -2512,15 +2502,6 @@ def cleanup_on_exit():
                 pass
     logger.info("Cleanup complete")
 
-    # Shutdown scheduler on process exit
-    global SCHEDULER
-    if SCHEDULER and SCHEDULER.running:
-        try:
-            logger.info("Shutting down strategy scheduler...")
-            SCHEDULER.shutdown(wait=False)
-        except Exception:
-            pass
-
 
 # Register cleanup handler
 import atexit
@@ -2711,7 +2692,8 @@ def restore_strategies_after_login():
 # Initialize basic components on import (no database access)
 ensure_directories()
 load_configs()
-init_scheduler()
+# NOTE: init_scheduler() is NOT called here. The standalone scheduler.py
+# process owns all scheduling. Flask should never start APScheduler.
 
 # Flag to track if full initialization has been done
 _initialized = False

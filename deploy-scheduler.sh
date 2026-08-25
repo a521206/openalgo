@@ -15,8 +15,11 @@ OPENALGO_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="${OPENALGO_DIR}/.venv"
 LOG_DIR="${OPENALGO_DIR}/log"
 
-# Detect deployment name from existing service
-EXISTING_SERVICE=$(systemctl list-units --type=service --no-legend | grep -oP 'openalgo-[a-z0-9-]+(?=\.service)' | head -1)
+# Detect deployment name from existing Flask service (exclude scheduler)
+EXISTING_SERVICE=$(systemctl list-units --type=service --no-legend 2>/dev/null \
+  | grep -oP 'openalgo-[a-z0-9-]+(?=\.service)' \
+  | grep -v '^openalgo-scheduler' \
+  | head -1)
 if [ -z "$EXISTING_SERVICE" ]; then
     echo "ERROR: No existing openalgo-*.service found. Run install.sh first."
     exit 1
@@ -141,9 +144,10 @@ else
     cp "${FLASK_SERVICE_FILE}" "${FLASK_SERVICE_FILE}.bak.$(date +%Y%m%d%H%M%S)"
 
     # Replace eventlet with gthread and add config
+    CONFIG_PATH="${OPENALGO_DIR}/gunicorn.conf.py"
     sudo sed -i \
-        -e 's/--worker-class eventlet/--worker-class gthread --threads 2/g' \
-        -e 's/app:app$/--config ${OPENALGO_DIR}\/gunicorn.conf.py app:app/g' \
+        -e "s/--worker-class eventlet/--worker-class gthread --threads 2/g" \
+        -e "s/app:app$/--config ${CONFIG_PATH} app:app/g" \
         "${FLASK_SERVICE_FILE}"
 
     echo "  ✓ Updated ${FLASK_SERVICE_FILE}"

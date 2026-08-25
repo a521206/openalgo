@@ -15,11 +15,9 @@ Managed by systemd as a separate service (openalgo-scheduler-*.service).
 """
 import json
 import logging
-import os
 import signal
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -48,14 +46,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("scheduler")
 
-# Graceful shutdown flag
-_shutdown = False
-
 
 def _handle_signal(signum, frame):
-    global _shutdown
     logger.info(f"Received signal {signum}, shutting down...")
-    _shutdown = True
 
 
 signal.signal(signal.SIGTERM, _handle_signal)
@@ -92,6 +85,37 @@ def save_running(data: dict):
 # ---------------------------------------------------------------------------
 # Strategy lifecycle
 # ---------------------------------------------------------------------------
+def get_active_broker():
+    """Get the active broker from database (last logged in user's broker)"""
+    try:
+        from sqlalchemy import desc
+
+        from database.auth_db import Auth
+
+        auth_obj = Auth.query.filter_by(is_revoked=False).order_by(desc(Auth.id)).first()
+        if auth_obj:
+            return auth_obj.broker
+        return None
+    except Exception as e:
+        logger.error(f"Error getting active broker: {e}")
+        return None
+
+
+def check_master_contracts_ready():
+    """Check if master contracts are ready for the current broker"""
+    try:
+        broker = get_active_broker()
+        if not broker:
+            logger.warning("No broker found — skipping master contract check")
+            return True  # Allow start if we can't determine broker
+
+        from database.master_contract_status_db import check_if_ready
+        return check_if_ready(broker)
+    except Exception as e:
+        logger.error(f"Error checking master contracts: {e}")
+        return True  # Fail open — don't block strategies on check error
+
+
 def start_strategy(strategy_id: str):
     """Launch a strategy subprocess and record its PID."""
     configs = load_json(CONFIG_FILE, {})
@@ -103,6 +127,11 @@ def start_strategy(strategy_id: str):
     file_path = Path(config.get("file_path", ""))
     if not file_path.exists():
         logger.error(f"Strategy file not found: {file_path}")
+        return
+
+    # Check master contracts before starting
+    if not check_master_contracts_ready():
+        logger.warning(f"Master contracts not ready — skipping start of {strategy_id}")
         return
 
     ist_now = datetime.now(IST)
