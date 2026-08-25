@@ -1,7 +1,7 @@
 # Gunicorn configuration for OpenAlgo
 # Ensures the strategy scheduler is initialized in worker processes after forking
 
-def postfork(server, worker):
+def post_fork(server, worker):
     """Initialize scheduler after Gunicorn forks a worker"""
     import logging
     logging.basicConfig(level=logging.INFO)
