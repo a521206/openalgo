@@ -110,26 +110,26 @@ def init_scheduler():
     SCHEDULER.start()
     logger.debug(f"Scheduler initialized with IST timezone on {OS_TYPE}")
 
-        # Add daily trading day check job - runs at 00:01 IST every day
-        # This stops scheduled strategies on weekends/holidays
-        SCHEDULER.add_job(
-            func=daily_trading_day_check,
-            trigger=CronTrigger(hour=0, minute=1, timezone=IST),
-            id="daily_trading_day_check",
-            replace_existing=True,
-        )
-        logger.debug("Daily trading day check scheduled at 00:01 IST")
+    # Add daily trading day check job - runs at 00:01 IST every day
+    # This stops scheduled strategies on weekends/holidays
+    SCHEDULER.add_job(
+        func=daily_trading_day_check,
+        trigger=CronTrigger(hour=0, minute=1, timezone=IST),
+        id="daily_trading_day_check",
+        replace_existing=True,
+    )
+    logger.debug("Daily trading day check scheduled at 00:01 IST")
 
-        # Add market hours enforcer - runs every minute during trading hours
-        # This stops scheduled strategies when market closes
-        SCHEDULER.add_job(
-            func=market_hours_enforcer,
-            trigger="interval",
-            minutes=1,
-            id="market_hours_enforcer",
-            replace_existing=True,
-        )
-        logger.debug("Market hours enforcer scheduled (runs every minute)")
+    # Add market hours enforcer - runs every minute during trading hours
+    # This stops scheduled strategies when market closes
+    SCHEDULER.add_job(
+        func=market_hours_enforcer,
+        trigger="interval",
+        minutes=1,
+        id="market_hours_enforcer",
+        replace_existing=True,
+    )
+    logger.debug("Market hours enforcer scheduled (runs every minute)")
 
 
 def load_configs():
