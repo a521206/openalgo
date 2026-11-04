@@ -1299,30 +1299,34 @@ def schedule_strategy(strategy_id, start_time, stop_time=None, days=None):
     start_job_id = f"start_{strategy_id}"
     stop_job_id = f"stop_{strategy_id}"
 
-    # Remove existing jobs if any
-    if SCHEDULER.get_job(start_job_id):
-        SCHEDULER.remove_job(start_job_id)
-    if SCHEDULER.get_job(stop_job_id):
-        SCHEDULER.remove_job(stop_job_id)
+    # Scheduler is owned by the standalone scheduler.py process; Flask keeps
+    # SCHEDULER as None. Skip APScheduler operations when it is not available
+    # while still persisting the schedule config for restoration by scheduler.py.
+    if SCHEDULER is not None:
+        # Remove existing jobs if any
+        if SCHEDULER.get_job(start_job_id):
+            SCHEDULER.remove_job(start_job_id)
+        if SCHEDULER.get_job(stop_job_id):
+            SCHEDULER.remove_job(stop_job_id)
 
-    # Schedule start with holiday check wrapper (time is already in IST from frontend)
-    hour, minute = map(int, start_time.split(":"))
-    SCHEDULER.add_job(
-        func=lambda: scheduled_start_strategy(strategy_id),
-        trigger=CronTrigger(hour=hour, minute=minute, day_of_week=",".join(days), timezone=IST),
-        id=start_job_id,
-        replace_existing=True,
-    )
-
-    # Schedule stop if provided (always runs for safety)
-    if stop_time:
-        hour, minute = map(int, stop_time.split(":"))
+        # Schedule start with holiday check wrapper (time is already in IST from frontend)
+        hour, minute = map(int, start_time.split(":"))
         SCHEDULER.add_job(
-            func=lambda: scheduled_stop_strategy(strategy_id),
+            func=lambda: scheduled_start_strategy(strategy_id),
             trigger=CronTrigger(hour=hour, minute=minute, day_of_week=",".join(days), timezone=IST),
-            id=stop_job_id,
+            id=start_job_id,
             replace_existing=True,
         )
+
+        # Schedule stop if provided (always runs for safety)
+        if stop_time:
+            hour, minute = map(int, stop_time.split(":"))
+            SCHEDULER.add_job(
+                func=lambda: scheduled_stop_strategy(strategy_id),
+                trigger=CronTrigger(hour=hour, minute=minute, day_of_week=",".join(days), timezone=IST),
+                id=stop_job_id,
+                replace_existing=True,
+            )
 
     # Update config
     STRATEGY_CONFIGS[strategy_id]["is_scheduled"] = True
@@ -1341,10 +1345,13 @@ def unschedule_strategy(strategy_id):
     start_job_id = f"start_{strategy_id}"
     stop_job_id = f"stop_{strategy_id}"
 
-    if SCHEDULER.get_job(start_job_id):
-        SCHEDULER.remove_job(start_job_id)
-    if SCHEDULER.get_job(stop_job_id):
-        SCHEDULER.remove_job(stop_job_id)
+    # Scheduler is owned by the standalone scheduler.py process; Flask keeps
+    # SCHEDULER as None. Skip APScheduler operations when it is not available.
+    if SCHEDULER is not None:
+        if SCHEDULER.get_job(start_job_id):
+            SCHEDULER.remove_job(start_job_id)
+        if SCHEDULER.get_job(stop_job_id):
+            SCHEDULER.remove_job(stop_job_id)
 
     if strategy_id in STRATEGY_CONFIGS:
         STRATEGY_CONFIGS[strategy_id]["is_scheduled"] = False
