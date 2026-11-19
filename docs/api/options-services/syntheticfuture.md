@@ -1,6 +1,6 @@
 # SyntheticFuture
 
-Calculate the synthetic futures price using ATM options (Put-Call Parity).
+Calculate a synthetic futures price using ATM options. The `enter` and `exit` sections below describe a proposed paired-order API contract; those actions are not implemented yet.
 
 ## Endpoint URL
 
@@ -10,22 +10,28 @@ Ngrok Domain :  POST https://<your-ngrok-domain>.ngrok-free.app/api/v1/synthetic
 Custom Domain:  POST https://<your-custom-domain>/api/v1/syntheticfuture
 ```
 
-## Sample API Request
+## Actions
+
+Send `action` as `calculate`, `enter`, or `exit`. Calculate does not place orders.
+
+## Calculate
 
 ```json
 {
   "apikey": "<your_app_apikey>",
+  "action": "calculate",
   "underlying": "NIFTY",
   "exchange": "NSE_INDEX",
   "expiry_date": "25NOV25"
 }
 ```
 
-## Sample API Response
+The response includes the underlying LTP, ATM strike, and synthetic futures price:
 
 ```json
 {
   "status": "success",
+  "action": "calculate",
   "underlying": "NIFTY",
   "underlying_ltp": 25910.05,
   "expiry": "25NOV25",
@@ -34,75 +40,80 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/syntheticfuture
 }
 ```
 
-## Request Body
+Formula: `synthetic future = strike + call premium - put premium`.
 
-| Parameter | Description | Mandatory/Optional | Default Value |
-|-----------|-------------|-------------------|---------------|
-| apikey | Your OpenAlgo API key | Mandatory | - |
-| underlying | Underlying symbol (NIFTY, BANKNIFTY, SENSEX) | Mandatory | - |
-| exchange | Exchange: NSE_INDEX, BSE_INDEX | Mandatory | - |
-| expiry_date | Expiry date in DDMMMYY format | Mandatory | - |
+## Enter
 
-## Response Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| status | string | "success" or "error" |
-| underlying | string | Underlying symbol |
-| underlying_ltp | number | Current spot price |
-| expiry | string | Expiry date |
-| atm_strike | number | ATM strike used for calculation |
-| synthetic_future_price | number | Calculated synthetic futures price |
-
-## Formula
-
-```
-Synthetic Future Price = Strike Price + Call Premium - Put Premium
+```json
+{
+  "apikey": "<your_app_apikey>",
+  "action": "enter",
+  "strategy": "Synthetic Future",
+  "underlying": "NIFTY",
+  "exchange": "NSE_INDEX",
+  "expiry_date": "25NOV25",
+  "direction": "LONG",
+  "quantity": 75,
+  "pricetype": "MARKET",
+  "product": "MIS"
+}
 ```
 
-Where:
-- Strike Price = ATM strike
-- Call Premium = LTP of ATM Call
-- Put Premium = LTP of ATM Put
+Use `direction: "LONG"` to buy the ATM call and sell the ATM put. Use `direction: "SHORT"` to sell the ATM call and buy the ATM put. Both legs use the same ATM strike and expiry.
 
-## Understanding Synthetic Futures
+The response uses the same `results` array pattern as `optionsmultiorder`:
 
-### What is Basis?
-
-```
-Basis = Synthetic Future Price - Spot Price
-```
-
-| Basis | Interpretation |
-|-------|----------------|
-| Positive | Cost of carry (normal market) |
-| Large positive | High demand for futures/options |
-| Negative | Backwardation (rare) |
-
-### Example Calculation
-
-```
-Spot Price (underlying_ltp): 25910.05
-ATM Strike: 25900
-ATM Call Premium: 500
-ATM Put Premium: 420
-
-Synthetic Future = 25900 + 500 - 420 = 25980
-Basis = 25980 - 25910.05 = 69.95 points
+```json
+{
+  "status": "success",
+  "underlying": "NIFTY",
+  "underlying_ltp": 25910.05,
+  "results": [
+    {"leg": 1, "symbol": "NIFTY25NOV2525900CE", "exchange": "NFO", "offset": "ATM", "option_type": "CE", "action": "BUY", "status": "success", "orderid": "<order-id>"},
+    {"leg": 2, "symbol": "NIFTY25NOV2525900PE", "exchange": "NFO", "offset": "ATM", "option_type": "PE", "action": "SELL", "status": "success", "orderid": "<order-id>"}
+  ]
+}
 ```
 
-## Notes
+If either leg fails, OpenAlgo attempts to square off the successful leg, returns `status: "error"` with the per-leg results, and sends an alert.
 
-- Synthetic futures provide a **fair value reference** for actual futures
-- Useful for **arbitrage detection** between futures and options
-- The **basis** indicates the cost of carry
-- Near expiry, synthetic future converges to spot price
+## Exit
 
-## Use Cases
+Send `action: "exit"` with the two symbols and quantities returned by entry. OpenAlgo places the opposite orders to close the pair.
 
-- **Arbitrage strategies**: Compare with actual futures price
-- **Fair value calculation**: Determine if futures are overpriced/underpriced
-- **Options pricing**: Use as underlying for options Greeks calculation
+```json
+{
+  "apikey": "<your_app_apikey>",
+  "strategy": "Synthetic Future",
+  "action": "exit",
+  "underlying": "NIFTY",
+  "exchange": "NSE_INDEX",
+  "legs": [
+    {"symbol": "NIFTY25NOV2525900CE", "exchange": "NFO", "action": "SELL", "quantity": 75, "pricetype": "MARKET", "product": "MIS"},
+    {"symbol": "NIFTY25NOV2525900PE", "exchange": "NFO", "action": "BUY", "quantity": 75, "pricetype": "MARKET", "product": "MIS"}
+  ]
+}
+```
+
+Exit legs use explicit symbols, like `basketorder`, because the original entry strike must be closed. The response reports both orders in `results`. If an exit leg fails, OpenAlgo returns the per-leg results and sends an alert.
+
+## Request Fields
+
+| Field | Description |
+|-------|-------------|
+| `apikey` | OpenAlgo API key |
+| `action` | `calculate`, `enter`, or `exit` |
+| `strategy` | Strategy identifier, as used by options order APIs |
+| `underlying` | Underlying symbol, for example `NIFTY`; required for calculate and entry |
+| `exchange` | Underlying exchange, for example `NSE_INDEX`; required for calculate and entry |
+| `expiry_date` | Expiry in `DDMMMYY` format |
+| `direction` | `LONG` or `SHORT`, for entry |
+| `quantity` | Quantity per leg, for entry |
+| `pricetype` | Price type, such as `MARKET` or `LIMIT`, for entry |
+| `product` | Product type, such as `MIS` or `NRML` |
+| `legs` | Explicit option symbols and order details, for exit |
+
+Order placement is not atomic. OpenAlgo attempts to close a successfully placed entry leg if its pair fails, but broker execution can prevent a square-off. Check the per-leg results and alert if the endpoint reports failure.
 
 ---
 

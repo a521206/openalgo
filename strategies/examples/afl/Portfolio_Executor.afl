@@ -1,0 +1,174 @@
+/*
+ * Portfolio_Executor.afl - Bear-call spread execution via OpenAlgo.
+ *
+ * Runs alongside Portfolio_Advisor.afl on the same chart.
+ * Detects the same entry conditions and places 2-leg orders:
+ *   SELL <shortStrike> CE  +  BUY <longStrike> CE
+ *
+ * Uses PostOptionOrder() from OpenAlgo_SpotFut_Options_v3.afl
+ * for the offset-based order API.
+ *
+ * Capital model, strike construction, and lot allocation are
+ * duplicated here (no cross-file variable sharing in AFL).
+ */
+
+#include <Common_v11.afl>
+
+/*==============================================================================
+ * USER PARAMS (must match Portfolio_Advisor.afl)
+ *============================================================================*/
+capital       = 1000000;
+niftyLotSize  = 65;
+creditSpreadMarginFrac = 0.80;
+
+cap_FC01s = 0.15;
+cap_FC03  = 0.30;
+cap_FC06  = 0.30;
+cap_PS02  = 0.30;
+
+/*==============================================================================
+ * RESAMPLED SPOT / PATTERN DETECTION
+ *============================================================================*/
+spot50 = round( MA( C, 5 ) / 50 ) * 50;
+
+fc01s_window          = TN >= 091600 AND TN <= 100000;
+fc01s_hb              = C1 <= fch AND C > fch AND fc01s_window;
+fc01s_lb              = C1 >= fcl AND C < fcl AND fc01s_window;
+fc01s_highBroken      = BarsSince( fc01s_hb ) >= 0 AND BarsSince( fc01s_hb ) < BarsSince( newDay );
+fc01s_lowBroken       = BarsSince( fc01s_lb )  >= 0 AND BarsSince( fc01s_lb )  < BarsSince( newDay );
+fc01s_confirmed       = fc01s_highBroken AND NOT fc01s_lowBroken;
+fc01s_entry           = fc01s_confirmed AND TN == 100000 AND isExpiryDay;
+
+fc06_window           = TN >= 091600 AND TN <= 100500;
+fc06_hb               = C1 <= fch AND C > fch AND fc06_window;
+fc06_lb               = C1 >= fcl AND C < fcl AND fc06_window;
+fc06_highBroken       = BarsSince( fc06_hb ) >= 0 AND BarsSince( fc06_hb ) < BarsSince( newDay );
+fc06_lowBroken        = BarsSince( fc06_lb )  >= 0 AND BarsSince( fc06_lb )  < BarsSince( newDay );
+fc06_confirmed        = fc06_highBroken AND fc06_lowBroken AND BarsSince( fc06_hb ) > BarsSince( fc06_lb );
+fc06_entry            = fc06_confirmed AND TN == 100500 AND isExpiryDay;
+
+fc03_window           = TN >= 091600 AND TN <= 103000;
+fc03_hb               = C1 <= fch AND C > fch AND fc03_window;
+fc03_lb               = C1 >= fcl AND C < fcl AND fc03_window;
+fc03_highBroken       = BarsSince( fc03_hb ) >= 0 AND BarsSince( fc03_hb ) < BarsSince( newDay );
+fc03_lowBroken        = BarsSince( fc03_lb )  >= 0 AND BarsSince( fc03_lb )  < BarsSince( newDay );
+fc03_confirmed        = fc03_highBroken AND NOT fc03_lowBroken;
+fc03_entry            = fc03_confirmed AND TN == 103000 AND isExpiryDay;
+
+z2_H       = HighestSince( TN >= 110000 AND TN <= 130000, H );
+z2_L       = LowestSince( TN >= 110000 AND TN <= 130000, L );
+z2_range   = z2_H - z2_L;
+ps02_confirmed = z2_range <= 85;
+ps02_entry     = ps02_confirmed AND TN == 131000 AND isExpiryDay;
+
+/*==============================================================================
+ * LOT ALLOCATION (must match Portfolio_Advisor.afl)
+ *============================================================================*/
+function calcLots( capPct, marginPerLot )
+{
+    return floor( capital * capPct / marginPerLot );
+}
+
+fc01s_lots = calcLots( cap_FC01s,  50 * niftyLotSize * creditSpreadMarginFrac );
+fc03_lots  = calcLots( cap_FC03,  150 * niftyLotSize * creditSpreadMarginFrac );
+fc06_lots  = calcLots( cap_FC06,  150 * niftyLotSize * creditSpreadMarginFrac );
+ps02_lots  = calcLots( cap_PS02,  150 * niftyLotSize * creditSpreadMarginFrac );
+
+/*==============================================================================
+ * OPENALGO FUNCTION — inline, extracted from v3 include
+ *============================================================================*/
+function PostOptionOrder( offset_val, opt_type, act, qty, apikey_val, strategy_val, underlying_val, exchange_val, expiry_val, pricetype_val, product_val, host_val, ver_val )
+{
+    url = host_val + "/api/" + ver_val + "/optionsorder";
+
+    body = "{\"apikey\": \"" + apikey_val + "\", " +
+           "\"strategy\": \"" + strategy_val + "\", " +
+           "\"underlying\": \"" + underlying_val + "\", " +
+           "\"exchange\": \"" + exchange_val + "\", " +
+           "\"expiry_date\": \"" + expiry_val + "\", " +
+           "\"offset\": \"" + offset_val + "\", " +
+           "\"option_type\": \"" + opt_type + "\", " +
+           "\"action\": \"" + act + "\", " +
+           "\"quantity\": \"" + NumToStr( qty, 1.0, False ) + "\", " +
+           "\"pricetype\": \"" + pricetype_val + "\", " +
+           "\"product\": \"" + product_val + "\", " +
+           "\"price\": \"0\", " +
+           "\"trigger_price\": \"0\", " +
+           "\"disclosed_quantity\": \"0\"}";
+
+    _TRACEF( "OpenAlgo OptionsOrder Request: %s", body );
+
+    headers = "Content-Type: application/json\r\n";
+    InternetSetHeaders( headers );
+    ih = InternetPostRequest( url, body );
+
+    response = "";
+    if( ih )
+    {
+        while( ( line = InternetReadString( ih ) ) != "" )
+            response = response + line;
+        _TRACEF( "OpenAlgo OptionsOrder Response: %s", response );
+        InternetClose( ih );
+    }
+    else
+    {
+        _TRACE( "OpenAlgo HTTP post failed" );
+    }
+    return response;
+}
+
+/*==============================================================================
+ * EXECUTION — place 2-leg bear call spread for first matching strategy
+ *============================================================================*/
+RequestTimedRefresh( 5, False );
+
+pricetype_exec = "LIMIT";
+product_exec   = "NRML";
+
+/* Collect entry flags in priority order (same as advisor) */
+entry_FC01s = LastValue( fc01s_entry );
+entry_FC06  = LastValue( fc06_entry );
+entry_FC03  = LastValue( fc03_entry );
+entry_PS02  = LastValue( ps02_entry );
+
+lasttime = StrFormat( "%0.f", LastValue( BarIndex() ) );
+
+/* Use a single static var to prevent repeat fires */
+static_exec_bar   = "PORTFOLIO_EXEC_bar";
+static_exec_fired = Nz( StaticVarGetText( static_exec_bar ), "" );
+
+if( static_exec_fired != lasttime AND ( entry_FC01s OR entry_FC06 OR entry_FC03 OR entry_PS02 ) )
+{
+    strategy_exec    = WriteIf( entry_FC01s, "FC01s", WriteIf( entry_FC06, "FC06", WriteIf( entry_FC03, "FC03", "PS02" ) ) );
+    shortOffset_exec = WriteIf( entry_FC01s, "200", WriteIf( entry_FC06, "ATM", WriteIf( entry_FC03, "100", "50" ) ) );
+    longOffset_exec  = WriteIf( entry_FC01s, "250", WriteIf( entry_FC06, "150", WriteIf( entry_FC03, "250", "200" ) ) );
+    qty_exec         = WriteIf( entry_FC01s, fc01s_lots, WriteIf( entry_FC06, fc06_lots, WriteIf( entry_FC03, fc03_lots, ps02_lots ) ) );
+
+    /* Leg 1: SELL short-strike CE */
+    _TRACEF( "%s Leg 1: SELL CE offset=%s qty=%g\n", strategy_exec, shortOffset_exec, qty_exec );
+    leg1_response = PostOptionOrder( shortOffset_exec, "CE", "SELL", LastValue( qty_exec ), apikey, strategy_exec, underlying, exchange, expiry, pricetype_exec, product_exec, host, ver );
+
+    /* Check Leg 1 success before placing Leg 2 */
+    leg1_success = StrFind( leg1_response, "\"status\":\"success\"" ) >= 0;
+
+    if( leg1_success )
+    {
+        /* Leg 2: BUY long-strike CE */
+        _TRACEF( "%s Leg 2: BUY CE offset=%s qty=%g\n", strategy_exec, longOffset_exec, qty_exec );
+        PostOptionOrder( longOffset_exec, "CE", "BUY", LastValue( qty_exec ), apikey, strategy_exec, underlying, exchange, expiry, pricetype_exec, product_exec, host, ver );
+    }
+    else
+    {
+        _TRACEF( "%s Leg 1 FAILED - skipping Leg 2. Response: %s", strategy_exec, leg1_response );
+    }
+
+    StaticVarSetText( static_exec_bar, lasttime, True );
+}
+else
+    if( NOT ( entry_FC01s OR entry_FC06 OR entry_FC03 OR entry_PS02 ) )
+        StaticVarSetText( static_exec_bar, "", True );
+
+/*==============================================================================
+ * CHART — minimal price display, invisible overlay
+ *============================================================================*/
+Plot( C, "Price", IIf( C > O, colorGreen, colorRed ), styleCandle );
