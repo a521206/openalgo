@@ -1,6 +1,6 @@
 # SyntheticFutureOrder
 
-Enter or exit a synthetic-futures position by submitting its paired option legs.
+Place synthetic-futures BUY or SELL trades by submitting paired option legs.
 
 ## Endpoint URL
 
@@ -8,19 +8,18 @@ Enter or exit a synthetic-futures position by submitting its paired option legs.
 POST http://127.0.0.1:5000/api/v1/syntheticfutureorder
 ```
 
-Send `action` as `enter` or `exit`. Entry places a BUY leg followed by a SELL leg. If the second entry leg fails, OpenAlgo attempts to square off the first. Exit submits the explicit option legs through `basketorder`; neither operation guarantees atomic execution.
+Send `action` as `BUY` or `SELL`. `BUY` buys the call and sells the put; `SELL` buys the put and sells the call. Entry places the BUY leg first. If the second leg fails, OpenAlgo attempts to square off the first. For exits, include the two explicit closing legs in `legs`; these are submitted through `basketorder` so the exact symbols can be closed. Neither operation guarantees atomic execution.
 
-## Enter
+## BUY or SELL
 
 ```json
 {
   "apikey": "<your_app_apikey>",
-  "action": "enter",
+  "action": "BUY",
   "strategy": "Synthetic Future",
   "underlying": "NIFTY",
   "exchange": "NSE_INDEX",
   "expiry_date": "25NOV25",
-  "direction": "LONG",
   "offset": "ATM",
   "quantity": 75,
   "pricetype": "MARKET",
@@ -28,7 +27,7 @@ Send `action` as `enter` or `exit`. Entry places a BUY leg followed by a SELL le
 }
 ```
 
-`LONG` buys the call and sells the put; `SHORT` buys the put and sells the call. `offset` defaults to `ATM` and accepts `ATM`, `ITM1`-`ITM50`, or `OTM1`-`OTM50`. The paired option legs use inverse offsets to resolve to the same strike.
+Use `action: "BUY"` for a synthetic long (buy call, sell put) or `action: "SELL"` for a synthetic short (buy put, sell call). `offset` defaults to `ATM` and accepts `ATM`, `ITM1`-`ITM50`, or `OTM1`-`OTM50`. The paired option legs use inverse offsets to resolve to the same strike.
 
 ## Exit
 
@@ -37,7 +36,7 @@ Send the two symbols and quantities from the entry response. OpenAlgo submits th
 ```json
 {
   "apikey": "<your_app_apikey>",
-  "action": "exit",
+  "action": "SELL",
   "strategy": "Synthetic Future",
   "underlying": "NIFTY",
   "exchange": "NSE_INDEX",
@@ -48,6 +47,6 @@ Send the two symbols and quantities from the entry response. OpenAlgo submits th
 }
 ```
 
-Entry can partially execute. If its second leg fails, inspect `square_off_status` and `square_off_results`; a failed square-off can leave an open position. Exit may also partially succeed. Check every result before retrying or taking corrective action.
+Use `action: "SELL"` to close a previously BUY synthetic position, or `action: "BUY"` to close a previously SELL synthetic position. Entry can partially execute. If its second leg fails, inspect `square_off_status` and `square_off_results`; a failed square-off can leave an open position. Exit may also partially succeed. Check every result before retrying or taking corrective action.
 
 See [`SyntheticFuture`](./syntheticfuture.md) for synthetic-futures price calculation.

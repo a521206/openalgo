@@ -38,7 +38,7 @@ function PostSyntheticFuture( body, host_val, ver_val )
 {
     headers = "Content-Type: application/json\r\n";
     InternetSetHeaders( headers );
-    ih = InternetPostRequest( host_val + "/api/" + ver_val + "/syntheticfuture", body );
+    ih = InternetPostRequest( host_val + "/api/" + ver_val + "/syntheticfutureorder", body );
     response = "";
 
     if( ih )
@@ -62,7 +62,7 @@ function ExitSyntheticFuture( call_symbol, call_exchange, call_action, put_symbo
                               pricetype_val, product_val, host_val, ver_val )
 {
     body = "{\"apikey\":\"" + apikey_val + "\",\"strategy\":\"" + strategy_val +
-           "\",\"action\":\"exit\",\"underlying\":\"" + underlying_val + "\",\"exchange\":\"" +
+           "\",\"action\":\"" + call_action + "\",\"underlying\":\"" + underlying_val + "\",\"exchange\":\"" +
            underlying_exchange_val + "\",\"legs\":[" +
            "{\"symbol\":\"" + call_symbol + "\",\"exchange\":\"" + call_exchange +
            "\",\"action\":\"" + call_action + "\",\"quantity\":" + NumToStr( qty, 1.0, False ) +
@@ -163,9 +163,10 @@ else
 
     if( entry_direction != "" AND StaticVarGetText( static_name_ + "_entry_bar" ) != lasttime )
     {
-        body = "{\"apikey\":\"" + apikey + "\",\"action\":\"enter\",\"strategy\":\"" + strategy +
+        order_action = WriteIf( entry_direction == "LONG", "BUY", "SELL" );
+        body = "{\"apikey\":\"" + apikey + "\",\"action\":\"" + order_action + "\",\"strategy\":\"" + strategy +
                "\",\"underlying\":\"" + underlying + "\",\"exchange\":\"" + exchange +
-               "\",\"expiry_date\":\"" + expiry + "\",\"direction\":\"" + entry_direction +
+               "\",\"expiry_date\":\"" + expiry +
                "\",\"offset\":\"" + direction_offset + "\",\"quantity\":" + NumToStr( quantity, 1.0, False ) +
                ",\"pricetype\":\"" + pricetype + "\",\"product\":\"" + product + "\"}";
         response = PostSyntheticFuture( body, host, ver );

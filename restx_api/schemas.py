@@ -286,9 +286,9 @@ class SyntheticFutureOrderSchema(Schema):
     apikey = fields.Str(required=True)
     underlying = fields.Str(required=True)
     exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
-    action = fields.Str(required=True, validate=validate.OneOf(["enter", "exit"]))
+    action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL"]))
     strategy = fields.Str()
-    direction = fields.Str(validate=validate.OneOf(["LONG", "SHORT"]))
+    expiry_date = fields.Str()
     offset = fields.Str(
         missing="ATM",
         validate=validate.Regexp(
@@ -306,11 +306,9 @@ class SyntheticFutureOrderSchema(Schema):
 
     @validates_schema
     def validate_action_fields(self, data, **kwargs):
-        action = data.get("action")
-        required = {
-            "enter": ["expiry_date", "strategy", "direction", "quantity"],
-            "exit": ["strategy", "legs"],
-        }.get(action, [])
+        required = ["strategy"]
+        if "legs" not in data:
+            required.extend(["expiry_date", "quantity"])
         missing = [field for field in required if field not in data]
         if missing:
             raise ValidationError({field: ["Missing data for required field."] for field in missing})

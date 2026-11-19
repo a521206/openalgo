@@ -1,7 +1,7 @@
 import importlib.util
 import sys
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from marshmallow import ValidationError
@@ -31,12 +31,13 @@ def test_calculate_request_without_action_remains_valid():
     assert data["underlying"] == "NIFTY"
 
 
-def test_order_schema_rejects_calculate_action():
+@pytest.mark.parametrize("action", ["enter", "exit", "calculate"])
+def test_order_schema_rejects_non_order_actions(action):
     with pytest.raises(ValidationError):
         SyntheticFutureOrderSchema().load(
             {
                 "apikey": "key",
-                "action": "calculate",
+                "action": action,
                 "underlying": "NIFTY",
                 "exchange": "NSE_INDEX",
                 "expiry_date": "25NOV25",
@@ -44,16 +45,34 @@ def test_order_schema_rejects_calculate_action():
         )
 
 
+@pytest.mark.parametrize("action", ["BUY", "SELL"])
+def test_order_schema_accepts_buy_sell_actions(action):
+    data = SyntheticFutureOrderSchema().load(
+        {
+            "apikey": "key",
+            "action": action,
+            "strategy": "Synthetic",
+            "underlying": "NIFTY",
+            "exchange": "NSE_INDEX",
+            "expiry_date": "25NOV25",
+            "quantity": 75,
+        }
+    )
+
+    assert data["action"] == action
+    assert data["offset"] == "ATM"
+
+
 @pytest.mark.parametrize(
     "payload",
     [
-        {"action": "enter", "strategy": "Synthetic", "direction": "LONG"},
-        {"action": "enter", "strategy": "Synthetic", "direction": "OTHER", "quantity": 1},
+        {"action": "BUY", "strategy": "Synthetic"},
+        {"action": "BUY", "strategy": "Synthetic", "quantity": 0},
         {
-            "action": "enter", "strategy": "Synthetic", "direction": "LONG",
+            "action": "BUY", "strategy": "Synthetic",
             "quantity": 1, "offset": "ITM51",
         },
-        {"action": "exit", "strategy": "Synthetic", "legs": []},
+        {"action": "SELL", "strategy": "Synthetic", "legs": []},
     ],
 )
 def test_action_specific_required_fields_are_validated(payload):
