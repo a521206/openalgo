@@ -1,0 +1,213 @@
+/*
+OpenAlgo - Spot/Futures Signals via SyntheticFuture API v1.0
+SyntheticFuture entries and exits manage the call/put pair as one position.
+*/
+
+_SECTION_BEGIN( "OpenAlgo Synthetic Future Options Module v1.0" );
+
+ReqVer = 6.35;
+global IDset;
+IDset = 0;
+
+function JsonValueAt( json_str, key_name, search_from )
+{
+    result = "";
+    search_key = "\"" + key_name + "\":";
+    pos = StrFind( StrMid( json_str, search_from ), search_key );
+
+    if( pos >= 0 )
+    {
+        start = search_from + pos + StrLen( search_key );
+        while( start < StrLen( json_str ) AND StrMid( json_str, start, 1 ) == " " )
+            start++;
+
+        if( StrMid( json_str, start, 1 ) == "\"" )
+        {
+            start = start + 1;
+            end = start;
+            while( end < StrLen( json_str ) AND StrMid( json_str, end, 1 ) != "\"" )
+                end++;
+            result = StrMid( json_str, start, end - start );
+        }
+    }
+
+    return result;
+}
+
+function PostSyntheticFuture( body, host_val, ver_val )
+{
+    headers = "Content-Type: application/json\r\n";
+    InternetSetHeaders( headers );
+    ih = InternetPostRequest( host_val + "/api/" + ver_val + "/syntheticfuture", body );
+    response = "";
+
+    if( ih )
+    {
+        while( ( line = InternetReadString( ih ) ) != "" )
+            response = response + line;
+        InternetClose( ih );
+        _TRACE( "SyntheticFuture response: " + response );
+    }
+    else
+    {
+        _TRACE( "OpenAlgo SyntheticFuture HTTP post failed" );
+        Say( "OpenAlgo HTTP post failed" );
+    }
+
+    return response;
+}
+
+function ExitSyntheticFuture( call_symbol, call_exchange, call_action, put_symbol, put_exchange, put_action,
+                              qty, apikey_val, strategy_val, underlying_val, underlying_exchange_val,
+                              pricetype_val, product_val, host_val, ver_val )
+{
+    body = "{\"apikey\":\"" + apikey_val + "\",\"strategy\":\"" + strategy_val +
+           "\",\"action\":\"exit\",\"underlying\":\"" + underlying_val + "\",\"exchange\":\"" +
+           underlying_exchange_val + "\",\"legs\":[" +
+           "{\"symbol\":\"" + call_symbol + "\",\"exchange\":\"" + call_exchange +
+           "\",\"action\":\"" + call_action + "\",\"quantity\":" + NumToStr( qty, 1.0, False ) +
+           ",\"pricetype\":\"" + pricetype_val + "\",\"product\":\"" + product_val + "\"}," +
+           "{\"symbol\":\"" + put_symbol + "\",\"exchange\":\"" + put_exchange +
+           "\",\"action\":\"" + put_action + "\",\"quantity\":" + NumToStr( qty, 1.0, False ) +
+           ",\"pricetype\":\"" + pricetype_val + "\",\"product\":\"" + product_val + "\"}]}";
+
+    return PostSyntheticFuture( body, host_val, ver_val );
+}
+
+y_offset = Param( "Y Offset", 20, 0, 200, 10 );
+
+if( Version() < ReqVer )
+{
+    SetChartOptions( 0, chartShowDates );
+    GfxSetBkMode( 1 );
+    GfxSetBkColor( colorBlack );
+    GfxSetTextColor( colorRed );
+    GfxSelectFont( "Arial", 16, 700 );
+    GfxTextOut( "This AFL needs AmiBroker 6.35 or later", 40, y_offset + 20 );
+}
+else
+{
+    RequestTimedRefresh( 1, False );
+    EnableTextOutput( False );
+    SetOption( "StaticVarAutoSave", 30 );
+
+    /* Supply the underlying and expiry in the same format as the API. */
+    underlying = ParamStr( "Underlying", "NIFTY" );
+    exchange = ParamStr( "Underlying Exchange", "NSE_INDEX" );
+    expiry = ParamStr( "Expiry (DDMMMYY)", "25NOV25" );
+    direction_offset = ParamStr( "Strike Offset", "ATM" );
+    quantity = IIf( Buy, bLots, IIf( Short, sLots, 0 ) ) * RoundLotSize;
+    pricetype = ParamList( "Price Type", "MARKET|LIMIT|SL|SL-M", 0 );
+    product = ParamList( "Product", "MIS|NRML", 0 );
+    VoiceAlert = ParamList( "Voice Alert", "Disable|Enable", 1 );
+    EnableAlgo = ParamList( "AlgoStatus", "Disable|Enable|LongOnly|ShortOnly", 1 );
+
+    static_name_ = Name() + GetChartID() + interval( 2 ) + strategy + "_synthetic";
+    static_call = static_name_ + "_call_symbol";
+    static_put = static_name_ + "_put_symbol";
+    static_call_exchange = static_name_ + "_call_exchange";
+    static_put_exchange = static_name_ + "_put_exchange";
+    static_position = static_name_ + "_active";
+    static_direction = static_name_ + "_direction";
+    static_quantity = static_name_ + "_quantity";
+    lasttime = StrFormat( "%0.f", LastValue( BarIndex() ) );
+
+    GfxSelectFont( "BOOK ANTIQUA", 10, 100 );
+    GfxSetBkMode( 1 );
+    if( EnableAlgo == "Disable" )
+        GfxSetTextColor( colorRed );
+    else
+        GfxSetTextColor( colorGreen );
+    GfxTextOut( "SyntheticFuture: " + WriteIf( Nz( StaticVarGet( static_position ), 0 ) == 1,
+                  "ACTIVE " + StaticVarGetText( static_direction ), "NONE" ), 20, y_offset + 40 );
+
+    AlgoBuy = LastValue( Buy );
+    AlgoSell = LastValue( Sell );
+    AlgoShort = LastValue( Short );
+    AlgoCover = LastValue( Cover );
+    trade_enabled = EnableAlgo != "Disable";
+
+    /* Exit the active two-leg pair on either closing signal. */
+    if( trade_enabled AND Nz( StaticVarGet( static_position ), 0 ) == 1 AND
+        ( ( AlgoSell AND StaticVarGetText( static_direction ) == "LONG" ) OR
+          ( AlgoCover AND StaticVarGetText( static_direction ) == "SHORT" ) ) AND
+        StaticVarGetText( static_name_ + "_exit_bar" ) != lasttime )
+    {
+        call_action = WriteIf( StaticVarGetText( static_direction ) == "LONG", "SELL", "BUY" );
+        put_action = WriteIf( StaticVarGetText( static_direction ) == "LONG", "BUY", "SELL" );
+        response = ExitSyntheticFuture( StaticVarGetText( static_call ), StaticVarGetText( static_call_exchange ),
+                     call_action, StaticVarGetText( static_put ), StaticVarGetText( static_put_exchange ),
+                     put_action, Nz( StaticVarGet( static_quantity ), quantity ), apikey, strategy, underlying, exchange, pricetype, product, host, ver );
+
+        if( StrFind( response, "\"status\":\"success\"" ) >= 0 )
+        {
+            StaticVarSet( static_position, 0, True );
+            StaticVarSetText( static_call, "", True );
+            StaticVarSetText( static_put, "", True );
+            StaticVarSetText( static_call_exchange, "", True );
+            StaticVarSetText( static_put_exchange, "", True );
+            StaticVarSet( static_quantity, 0, True );
+            StaticVarSetText( static_name_ + "_exit_bar", lasttime, True );
+            if( VoiceAlert == "Enable" ) Say( "Synthetic future exit placed" );
+        }
+    }
+
+    /* Open a pair only when flat. A LONG synthetic future buys CE/sells PE;
+       SHORT buys PE/sells CE. */
+    entry_direction = "";
+    if( trade_enabled AND Nz( StaticVarGet( static_position ), 0 ) != 1 AND quantity > 0 )
+    {
+        if( AlgoBuy AND EnableAlgo != "ShortOnly" ) entry_direction = "LONG";
+        if( AlgoShort AND EnableAlgo != "LongOnly" ) entry_direction = "SHORT";
+    }
+
+    if( entry_direction != "" AND StaticVarGetText( static_name_ + "_entry_bar" ) != lasttime )
+    {
+        body = "{\"apikey\":\"" + apikey + "\",\"action\":\"enter\",\"strategy\":\"" + strategy +
+               "\",\"underlying\":\"" + underlying + "\",\"exchange\":\"" + exchange +
+               "\",\"expiry_date\":\"" + expiry + "\",\"direction\":\"" + entry_direction +
+               "\",\"offset\":\"" + direction_offset + "\",\"quantity\":" + NumToStr( quantity, 1.0, False ) +
+               ",\"pricetype\":\"" + pricetype + "\",\"product\":\"" + product + "\"}";
+        response = PostSyntheticFuture( body, host, ver );
+
+        if( StrFind( response, "\"status\":\"success\"" ) >= 0 )
+        {
+            /* The API returns leg 1 then leg 2 in results. */
+            result_pos = StrFind( response, "\"results\":[" );
+            first_pos = result_pos + StrLen( "\"results\":[" );
+            second_pos = StrFind( StrMid( response, first_pos ), "{" ) + first_pos;
+            first_symbol = JsonValueAt( response, "symbol", second_pos );
+            first_exchange = JsonValueAt( response, "exchange", second_pos );
+            next_pos = StrFind( StrMid( response, second_pos + 1 ), "{" ) + second_pos + 1;
+            second_symbol = JsonValueAt( response, "symbol", next_pos );
+            second_exchange = JsonValueAt( response, "exchange", next_pos );
+
+            if( first_symbol != "" AND second_symbol != "" )
+            {
+                if( entry_direction == "LONG" )
+                {
+                    StaticVarSetText( static_call, first_symbol, True );
+                    StaticVarSetText( static_call_exchange, first_exchange, True );
+                    StaticVarSetText( static_put, second_symbol, True );
+                    StaticVarSetText( static_put_exchange, second_exchange, True );
+                }
+                else
+                {
+                    StaticVarSetText( static_put, first_symbol, True );
+                    StaticVarSetText( static_put_exchange, first_exchange, True );
+                    StaticVarSetText( static_call, second_symbol, True );
+                    StaticVarSetText( static_call_exchange, second_exchange, True );
+                }
+                StaticVarSetText( static_direction, entry_direction, True );
+                StaticVarSet( static_quantity, quantity, True );
+                StaticVarSet( static_position, 1, True );
+                StaticVarSetText( static_name_ + "_entry_bar", lasttime, True );
+                if( VoiceAlert == "Enable" ) Say( "Synthetic future " + entry_direction + " entered" );
+            }
+            else
+                _TRACE( "SyntheticFuture entry succeeded but both leg symbols were not found; verify position manually" );
+        }
+    }
+}
+
+_SECTION_END();

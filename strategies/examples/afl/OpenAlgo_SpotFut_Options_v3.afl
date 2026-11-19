@@ -87,54 +87,59 @@ function ExtractJsonValue( json_str, key_name )
 function PostOptionOrder( offset_val, opt_type, act, qty, apikey_val, strategy_val, underlying_val, exchange_val, expiry_val, pricetype_val, product_val, host_val, ver_val )
 {
 
-    url = host_val + "/api/" + ver_val + "/optionsorder";
-    _TRACEF( "PostOptionOrder: quantity = %g\n", qty );
-
-    if( LastValue( qty ) == 0 )
-        _TRACE( "Quantity is Zero" );
-
-    /* Construct JSON request body */
-    body = "{\"apikey\": \"" + apikey_val + "\", " +
-           "\"strategy\": \"" + strategy_val + "\", " +
-           "\"underlying\": \"" + underlying_val + "\", " +
-           "\"exchange\": \"" + exchange_val + "\", " +
-           "\"expiry_date\": \"" + expiry_val + "\", " +
-           "\"offset\": \"" + offset_val + "\", " +
-           "\"option_type\": \"" + opt_type + "\", " +
-           "\"action\": \"" + act + "\", " +
-           "\"quantity\": \"" + NumToStr( qty, 1.0, False ) + "\", " +
-           "\"pricetype\": \"" + pricetype_val + "\", " +
-           "\"product\": \"" + product_val + "\", " +
-           "\"price\": \"0\", " +
-           "\"trigger_price\": \"0\", " +
-           "\"disclosed_quantity\": \"0\"}";
-
-    _TRACEF( "OpenAlgo OptionsOrder Request: %s", body );
-
-    /* Set headers */
-    headers = "Content-Type: application/json\r\n";
-    InternetSetHeaders( headers );
-
-    ih = InternetPostRequest( url, body );
-
     response = "";
 
-    if( ih )
+    if( qty <= 0 )
     {
-        while( ( line = InternetReadString( ih ) ) != "" )
-        {
-            response = response + line;
-        }
-
-        _TRACEF( "OpenAlgo OptionsOrder Response: %s", response );
-        InternetClose( ih );
+        _TRACE( "OpenAlgo OptionsOrder skipped: quantity must be greater than zero" );
     }
+
     else
     {
-        _TRACE( "OpenAlgo HTTP post failed" );
 
-        Say( "OpenAlgo HTTP post failed" );
+        url = host_val + "/api/" + ver_val + "/optionsorder";
 
+        /* Construct JSON request body */
+        body = "{\"apikey\": \"" + apikey_val + "\", " +
+               "\"strategy\": \"" + strategy_val + "\", " +
+               "\"underlying\": \"" + underlying_val + "\", " +
+               "\"exchange\": \"" + exchange_val + "\", " +
+               "\"expiry_date\": \"" + expiry_val + "\", " +
+               "\"offset\": \"" + offset_val + "\", " +
+               "\"option_type\": \"" + opt_type + "\", " +
+               "\"action\": \"" + act + "\", " +
+               "\"quantity\": \"" + NumToStr( qty, 1.0, False ) + "\", " +
+               "\"pricetype\": \"" + pricetype_val + "\", " +
+               "\"product\": \"" + product_val + "\", " +
+               "\"price\": \"0\", " +
+               "\"trigger_price\": \"0\", " +
+               "\"disclosed_quantity\": \"0\"}";
+
+        _TRACEF( "OpenAlgo OptionsOrder Request: %s", body );
+
+        /* Set headers */
+        headers = "Content-Type: application/json\r\n";
+        InternetSetHeaders( headers );
+
+        ih = InternetPostRequest( url, body );
+
+        if( ih )
+        {
+            while( ( line = InternetReadString( ih ) ) != "" )
+            {
+                response = response + line;
+            }
+
+            _TRACEF( "OpenAlgo OptionsOrder Response: %s", response );
+            InternetClose( ih );
+        }
+        else
+        {
+            _TRACE( "OpenAlgo HTTP post failed" );
+
+            Say( "OpenAlgo HTTP post failed" );
+
+        }
     }
 
     return response;
@@ -219,23 +224,18 @@ else
     EnableTextOutput( False );
     SetOption( "StaticVarAutoSave", 30 );
 
-    if( StrFind( Name(), "NIFTY 50.NSE_IDX" ) )
-    {
-        underlying = "NIFTY";
-    }
-
-    if( StrFind( Name(), "NIFTY BANK.NSE_IDX" ) )
-    {
-        underlying = "BANKNIFTY";
-    }
-
     /* Strike Offset Settings - Now using string-based offsets */
     CE_offset = ParamStr( "CE Offset", "ATM" ); /* ATM, ITM1, ITM2, OTM1, OTM2, etc. */
     PE_offset = ParamStr( "PE Offset", "ATM" ); /* ATM, ITM1, ITM2, OTM1, OTM2, etc. */
 
     /* Order Settings */
     // quantity 	= IIf(StrFind( Name(), "NIFTY" ) > 0, IIf( Buy, bLots, IIf( Short, sLots, 0) ), 1) * RoundLotSize; // Only 1 lots for other stocks for now
-    quantity 	= 2 * IIf( Buy, bLots, IIf( Short, sLots, 0 ) ) * RoundLotSize;
+    OrigBuy 	= Buy;
+    OrigShort 	= Short;
+
+    Buy 		= IIf( blots > 0, Buy, False );
+    Short 		= IIf( slots > 0, Short, False );
+    quantity 	= IIf( Buy, bLots, IIf( Short, sLots, 0 ) ) * RoundLotSize;
 
     pricetype	= "LIMIT";
     product 	= "NRML";
@@ -351,13 +351,44 @@ else
     /* --------------------------------------------------------------------------
        Trading Signal Variables
        -------------------------------------------------------------------------- */
-    AlgoBuy	  = LastValue( Buy ) == 1;
-    AlgoSell  = LastValue( Sell );
-    AlgoShort = LastValue( Short );
-    AlgoCover = LastValue( Cover );
-    AlgoScaleOut = LastValue( Buy ) == sigScaleOut OR LastValue( Short ) == sigScaleOut;
+    AlgoBuy	  		= LastValue( Buy );
+    AlgoSell  		= LastValue( Sell );
+    AlgoShort 		= LastValue( Short );
+    AlgoCover 		= LastValue( Cover );
+    AlgoScaleOut	= LastValue( Buy ) == sigScaleOut OR LastValue( Short ) == sigScaleOut;
 
-    printf( "quantity = %g\n", quantity );
+    lasttime = StrFormat( "%0.f", LastValue( BarIndex() ) );
+
+    /* --------------------------------------------------------------------------
+       Zero-Lot Dropped Signal Warning
+       -------------------------------------------------------------------------- */
+    AlgoOrigBuy   	= LastValue( OrigBuy );
+    AlgoOrigShort	= LastValue( OrigShort );
+    BuyDropped   	= AlgoOrigBuy   == True AND AlgoBuy   != True;
+    ShortDropped  	= AlgoOrigShort == True AND AlgoShort != True;
+
+    static_zerolot_warn_barvalue = static_name_ + "zerolot_warn_barvalue";
+
+    if( BuyDropped AND VoiceAlert == "Enable" AND
+            StaticVarGetText( static_zerolot_warn_barvalue ) != lasttime )
+    {
+        Say( "Buy signal dropped: buy lots are zero" );
+        _TRACE( "Buy signal dropped due to zero lots (silently ignored)" );
+        StaticVarSetText( static_zerolot_warn_barvalue, lasttime, True );
+    }
+    else
+        if( ShortDropped AND VoiceAlert == "Enable" AND
+                StaticVarGetText( static_zerolot_warn_barvalue ) != lasttime )
+        {
+            Say( "Short signal dropped: short lots are zero" );
+            _TRACE( "Short signal dropped due to zero lots (silently ignored)" );
+            StaticVarSetText( static_zerolot_warn_barvalue, lasttime, True );
+        }
+        else
+            if( AlgoOrigBuy != True AND AlgoOrigShort != True )
+            {
+                StaticVarSetText( static_zerolot_warn_barvalue, "", True );
+            }
 
     // DumpStaticVars( static_name_ );
 
@@ -366,7 +397,6 @@ else
        -------------------------------------------------------------------------- */
     if( EnableAlgo != "Disable" )
     {
-        lasttime = StrFormat( "%0.f", LastValue( BarIndex() ) );
 
         /* ========================================================================
            BUY SIGNAL PROCESSING
