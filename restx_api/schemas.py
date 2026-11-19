@@ -272,13 +272,21 @@ class OptionsMultiOrderSchema(Schema):
 
 
 class SyntheticFutureSchema(Schema):
-    """Schema for synthetic future calculation and position orders."""
+    """Schema for synthetic future price calculation."""
 
     apikey = fields.Str(required=True)
     underlying = fields.Str(required=True)  # Underlying symbol (NIFTY, BANKNIFTY, RELIANCE)
     exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE)
-    expiry_date = fields.Str()  # Expiry date in DDMMMYY format (e.g., 28OCT25)
-    action = fields.Str(missing="calculate", validate=validate.OneOf(["calculate", "enter", "exit"]))
+    expiry_date = fields.Str(required=True)  # Expiry date in DDMMMYY format (e.g., 28OCT25)
+
+
+class SyntheticFutureOrderSchema(Schema):
+    """Schema for synthetic future entry and exit orders."""
+
+    apikey = fields.Str(required=True)
+    underlying = fields.Str(required=True)
+    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
+    action = fields.Str(required=True, validate=validate.OneOf(["enter", "exit"]))
     strategy = fields.Str()
     direction = fields.Str(validate=validate.OneOf(["LONG", "SHORT"]))
     offset = fields.Str(
@@ -298,9 +306,8 @@ class SyntheticFutureSchema(Schema):
 
     @validates_schema
     def validate_action_fields(self, data, **kwargs):
-        action = data.get("action", "calculate")
+        action = data.get("action")
         required = {
-            "calculate": ["expiry_date"],
             "enter": ["expiry_date", "strategy", "direction", "quantity"],
             "exit": ["strategy", "legs"],
         }.get(action, [])

@@ -75,6 +75,7 @@ Options-specific operations and analytics.
 | [OptionSymbol](./options-services/optionsymbol.md) | Get option symbol by offset |
 | [OptionChain](./options-services/optionchain.md) | Get full option chain data |
 | [SyntheticFuture](./options-services/syntheticfuture.md) | Calculate synthetic futures price |
+| [SyntheticFutureOrder](./options-services/syntheticfutureorder.md) | Enter or exit synthetic futures positions |
 | [OptionGreeks](./options-services/optiongreeks.md) | Calculate option Greeks and IV |
 
 ### Account Services

@@ -15,6 +15,7 @@ if schema_spec is None or schema_spec.loader is None:
 schemas = importlib.util.module_from_spec(schema_spec)
 schema_spec.loader.exec_module(schemas)
 SyntheticFutureSchema = schemas.SyntheticFutureSchema
+SyntheticFutureOrderSchema = schemas.SyntheticFutureOrderSchema
 
 
 def test_calculate_request_without_action_remains_valid():
@@ -27,8 +28,20 @@ def test_calculate_request_without_action_remains_valid():
         }
     )
 
-    assert data["action"] == "calculate"
-    assert data["offset"] == "ATM"
+    assert data["underlying"] == "NIFTY"
+
+
+def test_order_schema_rejects_calculate_action():
+    with pytest.raises(ValidationError):
+        SyntheticFutureOrderSchema().load(
+            {
+                "apikey": "key",
+                "action": "calculate",
+                "underlying": "NIFTY",
+                "exchange": "NSE_INDEX",
+                "expiry_date": "25NOV25",
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -45,7 +58,7 @@ def test_calculate_request_without_action_remains_valid():
 )
 def test_action_specific_required_fields_are_validated(payload):
     with pytest.raises(ValidationError):
-        SyntheticFutureSchema().load(
+        SyntheticFutureOrderSchema().load(
             {
                 "apikey": "key",
                 "underlying": "NIFTY",
