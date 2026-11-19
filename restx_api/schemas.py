@@ -1,4 +1,6 @@
-from marshmallow import Schema, fields, validate
+import re
+
+from marshmallow import Schema, ValidationError, fields, validate, validates_schema
 
 from utils.constants import VALID_EXCHANGES
 
@@ -305,7 +307,7 @@ class OptionsMultiOrderSchema(Schema):
 
 
 class SyntheticFutureSchema(Schema):
-    """Schema for synthetic future calculation"""
+    """Schema for synthetic future price calculation."""
 
     apikey = fields.Str(required=True)
     underlying = fields.Str(required=True)  # Underlying symbol (NIFTY, BANKNIFTY, RELIANCE)
@@ -313,6 +315,40 @@ class SyntheticFutureSchema(Schema):
         required=True, validate=validate.OneOf(VALID_EXCHANGES)
     )  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE)
     expiry_date = fields.Str(required=True)  # Expiry date in DDMMMYY format (e.g., 28OCT25)
+
+
+class SyntheticFutureOrderSchema(Schema):
+    """Schema for synthetic future entry and exit orders."""
+
+    apikey = fields.Str(required=True)
+    underlying = fields.Str(required=True)
+    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
+    action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL"]))
+    strategy = fields.Str()
+    expiry_date = fields.Str()
+    offset = fields.Str(
+        missing="ATM",
+        validate=validate.Regexp(
+            re.compile(r"^(ATM|ITM([1-9]|[1-4][0-9]|50)|OTM([1-9]|[1-4][0-9]|50))$", re.IGNORECASE),
+            error="Offset must be ATM, ITM1-ITM50, or OTM1-OTM50",
+        ),
+    )
+    quantity = fields.Int(validate=validate.Range(min=1))
+    pricetype = fields.Str(missing="MARKET", validate=validate.OneOf(["MARKET", "LIMIT", "SL", "SL-M"]))
+    product = fields.Str(missing="MIS", validate=validate.OneOf(["MIS", "NRML"]))
+    price = fields.Float(missing=0.0, validate=validate.Range(min=0))
+    trigger_price = fields.Float(missing=0.0, validate=validate.Range(min=0))
+    disclosed_quantity = fields.Int(missing=0, validate=validate.Range(min=0))
+    legs = fields.List(fields.Nested(BasketOrderItemSchema), validate=validate.Length(min=2, max=2))
+
+    @validates_schema
+    def validate_action_fields(self, data, **kwargs):
+        required = ["strategy"]
+        if "legs" not in data:
+            required.extend(["expiry_date", "quantity"])
+        missing = [field for field in required if field not in data]
+        if missing:
+            raise ValidationError({field: ["Missing data for required field."] for field in missing})
 
 
 class MarginPositionSchema(Schema):

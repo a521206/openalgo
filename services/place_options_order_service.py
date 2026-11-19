@@ -213,6 +213,7 @@ def place_options_order(
             offset=offset,
             option_type=option_type,
             api_key=symbol_api_key,
+            underlying_ltp=options_data.get("underlying_ltp"),
         )
 
         if not success:

@@ -48,6 +48,7 @@ from .search import api as search_ns
 from .split_order import api as split_order_ns
 from .symbol import api as symbol_ns
 from .synthetic_future import api as synthetic_future_ns
+from .synthetic_future_order import api as synthetic_future_order_ns
 from .telegram_bot import api as telegram_ns
 from .ticker import api as ticker_ns
 from .tradebook import api as tradebook_ns
@@ -84,6 +85,7 @@ api.add_namespace(options_multiorder_ns, path="/optionsmultiorder")
 api.add_namespace(option_greeks_ns, path="/optiongreeks")
 api.add_namespace(multi_option_greeks_ns, path="/multioptiongreeks")
 api.add_namespace(synthetic_future_ns, path="/syntheticfuture")
+api.add_namespace(synthetic_future_order_ns, path="/syntheticfutureorder")
 api.add_namespace(analyzer_ns, path="/analyzer")
 api.add_namespace(ping_ns, path="/ping")
 api.add_namespace(telegram_ns, path="/telegram")
