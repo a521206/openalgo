@@ -12,7 +12,7 @@ Supports both live trading and sandbox (analyze) mode, just like place_order_ser
 import copy
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from database.analyzer_db import async_log_analyzer
 from database.apilog_db import async_log_order
@@ -199,6 +199,7 @@ def place_options_order(
             offset=offset,
             option_type=option_type,
             api_key=symbol_api_key,
+            underlying_ltp=options_data.get("underlying_ltp"),
         )
 
         if not success:

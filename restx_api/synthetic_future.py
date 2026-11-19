@@ -4,7 +4,7 @@ Synthetic Future API Endpoint
 POST /api/v1/syntheticfuture
 
 Calculates synthetic future price using ATM Call and Put options.
-Does NOT place any orders - returns calculation only.
+Can also enter or exit the corresponding option legs.
 
 Request Body:
 {
@@ -39,6 +39,7 @@ from marshmallow import ValidationError
 
 from limiter import limiter
 from restx_api.schemas import SyntheticFutureSchema
+from services.synthetic_future_order_service import enter_synthetic_future, exit_synthetic_future
 from services.synthetic_future_service import calculate_synthetic_future
 from utils.logging import get_logger
 
@@ -57,8 +58,7 @@ class SyntheticFuture(Resource):
     @limiter.limit(API_RATE_LIMIT)
     def post(self):
         """
-        Calculate synthetic future price using ATM options.
-        Does NOT place any orders - returns calculation only.
+        Calculate a synthetic future or enter/exit its option legs.
         """
         try:
             # Validate request data
@@ -67,6 +67,16 @@ class SyntheticFuture(Resource):
 
             # Extract parameters
             api_key = data.get("apikey")
+            action = data.get("action", "calculate")
+
+            if action == "enter":
+                success, response_data, status_code = enter_synthetic_future(data, api_key)
+                return make_response(jsonify(response_data), status_code)
+
+            if action == "exit":
+                success, response_data, status_code = exit_synthetic_future(data, api_key)
+                return make_response(jsonify(response_data), status_code)
+
             underlying = data.get("underlying")
             exchange = data.get("exchange")
             expiry_date = data.get("expiry_date")
@@ -80,6 +90,9 @@ class SyntheticFuture(Resource):
             success, response_data, status_code = calculate_synthetic_future(
                 underlying=underlying, exchange=exchange, expiry_date=expiry_date, api_key=api_key
             )
+
+            if success:
+                response_data["action"] = "calculate"
 
             return make_response(jsonify(response_data), status_code)
 
