@@ -116,7 +116,6 @@ describe('useLivePrice closed-position gate', () => {
             quantity: 2,
             average_price: 100,
             ltp: 110,
-            pnl: 0,
             contract_multiplier: 0.5,
           },
         ],
@@ -127,7 +126,7 @@ describe('useLivePrice closed-position gate', () => {
     await waitFor(() => expect(result.current.data[0].pnlpercent).toBeCloseTo(10))
   })
 
-  it('adds normalized realized P&L to live unrealized P&L', async () => {
+  it('adds live unrealized P&L to the broker realized component', async () => {
     const { result } = renderHook(() =>
       useLivePrice(
         [

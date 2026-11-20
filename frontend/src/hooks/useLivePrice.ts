@@ -262,42 +262,31 @@ export function useLivePrice<T extends PriceableItem>(
         } as T & { _dataSource: string }
       }
 
-      // For open positions: recalculate P&L and P&L% using live LTP
-      // This ensures real-time updates as LTP changes
-      let calculatedPnl = item.pnl || 0
-      let calculatedPnlPercent = item.pnlpercent || 0
-
-      // Get today's realized P&L if available (from sandbox mode)
-      // This ensures cumulative P&L (realized + unrealized) is shown correctly
+      // Preserve realized P&L when the broker exposes it separately. Otherwise,
+      // adjust the broker's total by the LTP movement since the REST snapshot.
       const realizedPnl = item.realized_pnl ?? item.today_realized_pnl ?? 0
+      const hasBrokerPnl = item.pnl !== undefined && item.pnl !== null
+      let calculatedPnl = hasBrokerPnl ? Number(item.pnl) || 0 : realizedPnl
+      let calculatedPnlPercent = Number(item.pnlpercent) || 0
 
-      // Without a quote, retain broker P&L when supplied; only fall back to
-      // realized P&L when the API omitted P&L entirely.
-      if (currentLtp === undefined && item.pnl == null) {
-        calculatedPnl = realizedPnl
-      }
+      const investment = Math.abs(avgPrice * qty * (item.contract_multiplier ?? 1))
 
-      if (currentLtp && avgPrice > 0) {
-        // Contract multiplier is normalized by each broker adapter; standard
-        // positions default to 1 when quantity is already in underlying units.
+      if (currentLtp !== undefined && avgPrice > 0) {
         const contractMultiplier = item.contract_multiplier ?? 1
-
-        // Calculate unrealized P&L based on position direction
-        // Long (qty > 0): profit when ltp > avgPrice
-        // Short (qty < 0): profit when ltp < avgPrice
-        let unrealizedPnl: number
-        if (qty > 0) {
-          unrealizedPnl = (currentLtp - avgPrice) * qty * contractMultiplier
+        const unrealizedPnl = (currentLtp - avgPrice) * qty * contractMultiplier
+        if (item.realized_pnl != null || item.today_realized_pnl != null) {
+          calculatedPnl = realizedPnl + unrealizedPnl
+        } else if (hasBrokerPnl && item.ltp != null) {
+          // Broker P&L may already include realized P&L. Keep its REST total
+          // and apply only the change in unrealized P&L since that quote.
+          calculatedPnl += (currentLtp - Number(item.ltp)) * qty * contractMultiplier
         } else {
-          unrealizedPnl = (avgPrice - currentLtp) * Math.abs(qty) * contractMultiplier
+          calculatedPnl = realizedPnl + unrealizedPnl
         }
 
-        // Total P&L = today's realized (from partial closes) + current unrealized
-        calculatedPnl = realizedPnl + unrealizedPnl
-
-        // P&L% based on total P&L and investment
-        const investment = Math.abs(avgPrice * qty * contractMultiplier)
         calculatedPnlPercent = investment > 0 ? (calculatedPnl / investment) * 100 : 0
+      } else if (hasBrokerPnl && item.pnlpercent == null && investment > 0) {
+        calculatedPnlPercent = (calculatedPnl / investment) * 100
       }
 
       return {
