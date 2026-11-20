@@ -331,6 +331,67 @@ class SyntheticFutureSchema(Schema):
     expiry_date = fields.Str(required=True)  # Expiry date in DDMMMYY format (e.g., 28OCT25)
 
 
+class SyntheticFutureOrderLegSchema(Schema):
+    """Schema for a single explicit closing leg."""
+
+    symbol = fields.Str(required=True)
+    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
+    action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
+    quantity = fields.Int(
+        required=True, validate=validate.Range(min=1, error="Quantity must be a positive integer.")
+    )
+    pricetype = fields.Str(missing="MARKET", validate=validate.OneOf(["MARKET", "LIMIT", "SL", "SL-M"]))
+    product = fields.Str(missing="MIS", validate=validate.OneOf(["MIS", "NRML"]))
+    price = fields.Float(missing=0.0, validate=validate.Range(min=0))
+    trigger_price = fields.Float(missing=0.0, validate=validate.Range(min=0))
+    disclosed_quantity = fields.Int(missing=0, validate=validate.Range(min=0))
+
+
+class SyntheticFutureOrderSchema(Schema):
+    """Schema for entering or exiting a synthetic future options pair."""
+
+    apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
+    action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
+    strategy = fields.Str(required=True)
+    underlying = fields.Str(required=True)
+    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
+    expiry_date = fields.Str(required=True)
+    offset = fields.Str(missing="ATM")
+    quantity = fields.Int(
+        required=False, validate=validate.Range(min=1, error="Quantity must be a positive integer.")
+    )
+    pricetype = fields.Str(missing="MARKET", validate=validate.OneOf(["MARKET", "LIMIT", "SL", "SL-M"]))
+    product = fields.Str(missing="MIS", validate=validate.OneOf(["MIS", "NRML"]))
+    price = fields.Float(missing=0.0, validate=validate.Range(min=0))
+    trigger_price = fields.Float(missing=0.0, validate=validate.Range(min=0))
+    disclosed_quantity = fields.Int(missing=0, validate=validate.Range(min=0))
+    legs = fields.List(fields.Nested(SyntheticFutureOrderLegSchema), required=False)
+
+    @pre_load
+    def validate_order_shape(self, data, **kwargs):
+        if not isinstance(data, dict):
+            return data
+        if "legs" in data:
+            if not data["legs"]:
+                raise ValidationError({"legs": ["At least one closing leg is required."]})
+        else:
+            errors = {}
+            for field_name in ("quantity",):
+                if field_name not in data:
+                    errors[field_name] = ["Missing data for required field."]
+            offset = data.get("offset", "ATM")
+            if not isinstance(offset, str) or not (
+                offset.upper() == "ATM"
+                or offset.upper().startswith(("ITM", "OTM"))
+                and offset[3:].isdigit()
+                and 1 <= int(offset[3:]) <= 50
+            ):
+                errors["offset"] = ["Must be ATM, ITM1-ITM50, or OTM1-OTM50."]
+            if errors:
+                raise ValidationError(errors)
+        return data
+
+
 class MarginPositionSchema(Schema):
     """Schema for a single position in margin calculation"""
 
