@@ -171,4 +171,19 @@ describe('Positions close button', () => {
 
     expect(screen.getByRole('button', { name: /Close All/ })).toBeDisabled()
   })
+
+  it('uses the contract multiplier for both grouped and fallback row P&L percentages', async () => {
+    localStorage.setItem('openalgo_positions_prefs', JSON.stringify({ grouping: 'underlying' }))
+    await renderPositions([
+      {
+        ...OPEN_POSITION,
+        quantity: -2,
+        average_price: 100,
+        pnl: 10,
+        contract_multiplier: 0.5,
+      },
+    ])
+
+    expect(screen.getAllByText('+10.00%')).toHaveLength(2)
+  })
 })

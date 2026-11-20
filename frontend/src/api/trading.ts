@@ -62,6 +62,41 @@ export interface MultiQuotesApiResponse {
   message?: string
 }
 
+function positionNumber(value: unknown, fallback = 0): number {
+  const parsed =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string'
+        ? Number(value.replace(/,/g, '').trim())
+        : NaN
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function normalizePosition(value: unknown): Position | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+
+  const raw = value as Record<string, unknown>
+  const position: Position = {
+    symbol: typeof raw.symbol === 'string' ? raw.symbol : '',
+    exchange: typeof raw.exchange === 'string' ? raw.exchange : '',
+    product: typeof raw.product === 'string' ? raw.product : '',
+    quantity: positionNumber(raw.quantity),
+    average_price: positionNumber(raw.average_price),
+    ltp: positionNumber(raw.ltp),
+    pnl: positionNumber(raw.pnl),
+    pnlpercent: positionNumber(raw.pnlpercent),
+  }
+
+  const multiplier = positionNumber(raw.contract_multiplier, 1)
+  if (multiplier > 0) position.contract_multiplier = multiplier
+  if (raw.realized_pnl != null) position.realized_pnl = positionNumber(raw.realized_pnl)
+  if (raw.today_realized_pnl != null) {
+    position.today_realized_pnl = positionNumber(raw.today_realized_pnl)
+  }
+
+  return position
+}
+
 export interface BasketOrderItem {
   symbol: string
   exchange: string
@@ -149,10 +184,19 @@ export const tradingApi = {
    * Get positions
    */
   getPositions: async (apiKey: string): Promise<ApiResponse<Position[]>> => {
-    const response = await apiClient.post<ApiResponse<Position[]>>('/positionbook', {
+    const response = await apiClient.post<ApiResponse<unknown>>('/positionbook', {
       apikey: apiKey,
     })
-    return response.data
+    const payload = response.data
+    return {
+      ...payload,
+      data: Array.isArray(payload.data)
+        ? payload.data.flatMap((item) => {
+            const position = normalizePosition(item)
+            return position ? [position] : []
+          })
+        : undefined,
+    }
   },
 
   /**

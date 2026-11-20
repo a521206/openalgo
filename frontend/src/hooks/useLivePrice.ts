@@ -16,8 +16,9 @@ export interface PriceableItem {
   pnlpercent?: number
   quantity?: number
   average_price?: number
+  realized_pnl?: number // Normalized realized component included in total P&L
   today_realized_pnl?: number // Sandbox: today's realized P&L from closed partial trades
-  lot_size?: number // Contract multiplier (e.g. 0.01 for Delta Exchange ETHUSD.P)
+  contract_multiplier?: number // Normalized value multiplier; 1 when quantity is in underlying units
 }
 
 /**
@@ -214,7 +215,7 @@ export function useLivePrice<T extends PriceableItem>(
       const wsData = marketData.get(key)
       const mqData = multiQuotes.get(key)
 
-      const qty = item.quantity || 0
+      const qty = Number(item.quantity) || 0
       const avgPrice = item.average_price || 0
 
       // Check if market is open for this exchange
@@ -268,28 +269,34 @@ export function useLivePrice<T extends PriceableItem>(
 
       // Get today's realized P&L if available (from sandbox mode)
       // This ensures cumulative P&L (realized + unrealized) is shown correctly
-      const todayRealizedPnl = item.today_realized_pnl || 0
+      const realizedPnl = item.realized_pnl ?? item.today_realized_pnl ?? 0
+
+      // Without a quote, retain broker P&L when supplied; only fall back to
+      // realized P&L when the API omitted P&L entirely.
+      if (currentLtp === undefined && item.pnl == null) {
+        calculatedPnl = realizedPnl
+      }
 
       if (currentLtp && avgPrice > 0) {
-        // Contract multiplier: e.g. 0.01 for Delta Exchange ETHUSD.P (1 lot = 0.01 ETH)
-        // Defaults to 1 for all standard brokers where qty is already in underlying units
-        const lotSize = item.lot_size ?? 1
+        // Contract multiplier is normalized by each broker adapter; standard
+        // positions default to 1 when quantity is already in underlying units.
+        const contractMultiplier = item.contract_multiplier ?? 1
 
         // Calculate unrealized P&L based on position direction
         // Long (qty > 0): profit when ltp > avgPrice
         // Short (qty < 0): profit when ltp < avgPrice
         let unrealizedPnl: number
         if (qty > 0) {
-          unrealizedPnl = (currentLtp - avgPrice) * qty * lotSize
+          unrealizedPnl = (currentLtp - avgPrice) * qty * contractMultiplier
         } else {
-          unrealizedPnl = (avgPrice - currentLtp) * Math.abs(qty) * lotSize
+          unrealizedPnl = (avgPrice - currentLtp) * Math.abs(qty) * contractMultiplier
         }
 
         // Total P&L = today's realized (from partial closes) + current unrealized
-        calculatedPnl = todayRealizedPnl + unrealizedPnl
+        calculatedPnl = realizedPnl + unrealizedPnl
 
         // P&L% based on total P&L and investment
-        const investment = Math.abs(avgPrice * qty)
+        const investment = Math.abs(avgPrice * qty * contractMultiplier)
         calculatedPnlPercent = investment > 0 ? (calculatedPnl / investment) * 100 : 0
       }
 

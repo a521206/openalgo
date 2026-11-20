@@ -32,8 +32,8 @@ def format_position_data(position_data):
         "daysellqty",
     }
     # Fields that must preserve full float precision (must NOT be rounded to 2dp).
-    # lot_size can be as small as 0.001 (BTCUSD.P) — rounding to 2dp gives 0.0.
-    passthrough_fields = {"lot_size"}
+    # Contract multipliers can be less than 0.01 — preserve their precision.
+    passthrough_fields = {"contract_multiplier", "lot_size"}
 
     if isinstance(position_data, list):
         return [

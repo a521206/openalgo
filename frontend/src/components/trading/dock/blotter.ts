@@ -40,6 +40,8 @@ export interface DockPosition {
   pnl: number
   pnlpercent?: number
   lot_size?: number
+  contract_multiplier?: number
+  realized_pnl?: number
   today_realized_pnl?: number
 }
 
@@ -109,7 +111,13 @@ export function parsePosition(raw: Position): DockPosition {
   if (raw.pnlpercent !== undefined && raw.pnlpercent !== null) {
     position.pnlpercent = num(raw.pnlpercent)
   }
-  if (raw.lot_size !== undefined && raw.lot_size !== null) position.lot_size = num(raw.lot_size)
+  // Positionbook's legacy lot_size is a valuation multiplier, not an order step.
+  if (raw.contract_multiplier !== undefined && raw.contract_multiplier !== null) {
+    position.contract_multiplier = num(raw.contract_multiplier)
+  }
+  if (raw.realized_pnl !== undefined && raw.realized_pnl !== null) {
+    position.realized_pnl = num(raw.realized_pnl)
+  }
   if (raw.today_realized_pnl !== undefined && raw.today_realized_pnl !== null) {
     position.today_realized_pnl = num(raw.today_realized_pnl)
   }

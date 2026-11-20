@@ -601,6 +601,7 @@ def transform_positions_data(positions):
         elif position["exch"] in ["NFO", "MCX", "BFO", "CDS"] and position["prd"] == "M":
             position["prd"] = "NRML"
 
+        realized_pnl = float(position.get("realizedpnl") or 0)
         transformed_position = {
             "symbol": position.get("tsym", ""),
             "exchange": position.get("exch", ""),
@@ -608,7 +609,7 @@ def transform_positions_data(positions):
             "quantity": position.get("netqty", "0"),
             "average_price": position.get("netavgprc", "0.00"),
             "last_price": "0.00",  # Not available in Firstock API
-            "pnl": position.get("realizedpnl", "0.00"),
+            "pnl": realized_pnl,
             "day_buy_quantity": position.get("daybuyqty", "0"),
             "day_sell_quantity": position.get("daysellqty", "0"),
             "day_buy_amount": position.get("daybuyamt", "0.00"),
@@ -616,7 +617,7 @@ def transform_positions_data(positions):
             "day_buy_average_price": position.get("daybuyavgprc", "0.00"),
             "day_sell_average_price": position.get("daysellavgprc", "0.00"),
             "unrealized_pnl": position.get("unrealizedmtom", "0.00"),
-            "realized_pnl": position.get("realizedpnl", "0.00"),
+            "realized_pnl": realized_pnl,
         }
         transformed_positions.append(transformed_position)
 

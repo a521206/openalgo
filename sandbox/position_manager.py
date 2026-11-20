@@ -683,8 +683,10 @@ class PositionManager:
                         ),  # Fixed: use pnlpercent (no underscore) to match frontend
                         "unrealized_pnl": float(unrealized_pnl),  # Unrealized only (for reference)
                         "today_realized_pnl": float(today_realized),
+                        "realized_pnl": float(today_realized),
                         "total_pnl_today": float(position_total_pnl_today),
-                        "lot_size": pos_cv,  # contract_value multiplier (e.g. 0.01 for ETHUSD.P)
+                        "contract_multiplier": pos_cv,
+                        "lot_size": pos_cv,  # Legacy positionbook valuation field
                     }
                 )
 

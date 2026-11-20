@@ -13,6 +13,7 @@ import os
 import sys
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -131,3 +132,18 @@ def test_position_book_filters_on_the_utc_boundary(positions_around_boundary):
     assert success is True and status == 200
     shown = {row["symbol"] for row in response["data"]}
     assert shown == {"SBTEST1", "SBTEST3"}
+
+
+def test_position_book_preserves_legacy_multiplier(positions_around_boundary, monkeypatch):
+    from sandbox import position_manager
+
+    monkeypatch.setattr(
+        position_manager, "get_symbol_info", lambda *_: SimpleNamespace(contract_value=0.001)
+    )
+    success, response, status = position_manager.PositionManager(TEST_USER).get_open_positions(
+        update_mtm=False
+    )
+
+    assert success is True and status == 200
+    position = next(row for row in response["data"] if row["symbol"] == "SBTEST1")
+    assert position["contract_multiplier"] == position["lot_size"] == 0.001

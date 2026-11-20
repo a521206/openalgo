@@ -1,13 +1,14 @@
 export interface Position {
   symbol: string
   exchange: string
-  product: 'MIS' | 'NRML' | 'CNC'
+  product: string
   quantity: number
   average_price: number
   ltp: number
   pnl: number
   pnlpercent: number
-  lot_size?: number // contract_value multiplier (e.g. 0.01 for ETHUSD.P)
+  contract_multiplier?: number // Normalized value multiplier; defaults to 1
+  realized_pnl?: number // Realized component included in total P&L, when provided
   today_realized_pnl?: number // Sandbox: today's realized P&L from closed partial trades
 }
 

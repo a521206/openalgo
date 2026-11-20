@@ -75,6 +75,27 @@ describe('useLivePrice closed-position gate', () => {
     expect(result.current.data[0].ltp).toBe(1000)
   })
 
+  it('keeps realized P&L for a closed position with string-zero quantity', async () => {
+    const { result } = renderHook(() =>
+      useLivePrice(
+        [
+          {
+            symbol: 'TEST',
+            exchange: 'NSE',
+            quantity: '0' as unknown as number,
+            average_price: 1000,
+            ltp: 1100,
+            pnl: 250,
+          },
+        ],
+        { enabled: true }
+      )
+    )
+
+    await waitFor(() => expect(result.current.data[0].pnl).toBe(250))
+    expect(result.current.data[0].ltp).toBe(1100)
+  })
+
   it('takes live prices for an open position', async () => {
     const { result } = renderHook(() =>
       useLivePrice([{ symbol: 'RELIANCE', exchange: 'NSE', quantity: 5, ltp: 1000 }], {
@@ -83,5 +104,68 @@ describe('useLivePrice closed-position gate', () => {
     )
 
     await waitFor(() => expect(result.current.data[0].ltp).toBe(1350))
+  })
+
+  it('includes the contract multiplier in P&L percentage', async () => {
+    const { result } = renderHook(() =>
+      useLivePrice(
+        [
+          {
+            symbol: 'TEST',
+            exchange: 'NSE',
+            quantity: 2,
+            average_price: 100,
+            ltp: 110,
+            pnl: 0,
+            contract_multiplier: 0.5,
+          },
+        ],
+        { enabled: true }
+      )
+    )
+
+    await waitFor(() => expect(result.current.data[0].pnlpercent).toBeCloseTo(10))
+  })
+
+  it('adds normalized realized P&L to live unrealized P&L', async () => {
+    const { result } = renderHook(() =>
+      useLivePrice(
+        [
+          {
+            symbol: 'RELIANCE',
+            exchange: 'NSE',
+            quantity: 2,
+            average_price: 1000,
+            pnl: 0,
+            realized_pnl: 250,
+          },
+        ],
+        { enabled: true, useMultiQuotesFallback: false }
+      )
+    )
+
+    await waitFor(() => expect(result.current.data[0].pnl).toBe(950))
+  })
+
+  it('uses realized P&L as a fallback when P&L and quotes are unavailable', async () => {
+    marketData.clear()
+
+    const { result } = renderHook(() =>
+      useLivePrice(
+        [
+          {
+            symbol: 'RELIANCE',
+            exchange: 'NSE',
+            quantity: 5,
+            average_price: 1000,
+            today_realized_pnl: 125,
+          },
+        ],
+        { enabled: true, useMultiQuotesFallback: false }
+      )
+    )
+
+    await waitFor(() => expect(result.current.data[0].pnl).toBe(125))
+    expect(result.current.data[0].ltp).toBeUndefined()
   })
 })

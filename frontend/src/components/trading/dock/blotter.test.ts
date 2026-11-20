@@ -103,6 +103,17 @@ describe('parsing', () => {
     })
   })
 
+  it('keeps the contract multiplier separate from the order quantity step', () => {
+    const parsed = parsePosition({
+      ...position({ exchange: 'CRYPTO', symbol: 'BTCUSD.P' }),
+      pnlpercent: 10,
+      contract_multiplier: 0.001,
+      lot_size: 0.001,
+    })
+    expect(parsed.contract_multiplier).toBe(0.001)
+    expect(parsed.lot_size).toBeUndefined()
+  })
+
   it('normalises the status and fills a completed order', () => {
     const raw = {
       orderid: 'A1',
