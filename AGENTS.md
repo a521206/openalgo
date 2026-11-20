@@ -1,5 +1,11 @@
 # AGENTS.md
 
+## Python Environment
+
+- Use the repository's `.venv` for all Python commands and package management.
+- In PowerShell, activate it with `\.venv\Scripts\Activate.ps1` before running Python or pip commands.
+- Install packages with `python -m pip install <package>` after activation; do not install into the global Python environment.
+
 ## Lint Check After Commit
 
 After every commit, run the following lint check on modified Python files:

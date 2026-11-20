@@ -293,3 +293,115 @@ def test_exit_maps_explicit_symbols_to_basket_order(monkeypatch):
     order_service.exit_synthetic_future(request, "key")
 
     assert captured["orders"] == request["legs"]
+
+
+def test_exit_retries_only_failed_legs_and_reports_success(monkeypatch):
+    calls = []
+
+    def place_basket_order(data, api_key):
+        calls.append(data["orders"])
+        if len(calls) == 1:
+            return True, {
+                "status": "success",
+                "results": [
+                    {"symbol": "CALL", "status": "success"},
+                    {"symbol": "PUT", "status": "error", "message": "rejected"},
+                ],
+            }, 200
+        return True, {
+            "status": "success",
+            "results": [{"symbol": "PUT", "status": "success"}],
+        }, 200
+
+    monkeypatch.setitem(
+        sys.modules,
+        "services.basket_order_service",
+        SimpleNamespace(place_basket_order=place_basket_order),
+    )
+    request = {
+        "strategy": "Synthetic",
+        "legs": [
+            {"symbol": "CALL", "exchange": "NFO", "action": "SELL", "quantity": 75},
+            {"symbol": "PUT", "exchange": "NFO", "action": "BUY", "quantity": 75},
+        ],
+    }
+
+    success, response, status_code = order_service.exit_synthetic_future(request, "key")
+
+    assert success is True
+    assert status_code == 200
+    assert [len(batch) for batch in calls] == [2, 1]
+    assert calls[1] == [request["legs"][1]]
+    assert response["status"] == "success"
+    assert [result["status"] for result in response["results"]] == ["success", "success"]
+
+
+def test_exit_reports_error_when_retry_also_fails(monkeypatch):
+    calls = []
+
+    def place_basket_order(data, api_key):
+        calls.append(data["orders"])
+        if len(calls) == 1:
+            return True, {
+                "status": "success",
+                "results": [
+                    {"symbol": "CALL", "status": "success"},
+                    {"symbol": "PUT", "status": "error", "message": "rejected"},
+                ],
+            }, 200
+        return True, {
+            "status": "success",
+            "results": [{"symbol": "PUT", "status": "error", "message": "rejected"}],
+        }, 200
+
+    monkeypatch.setitem(
+        sys.modules,
+        "services.basket_order_service",
+        SimpleNamespace(place_basket_order=place_basket_order),
+    )
+    request = {
+        "strategy": "Synthetic",
+        "legs": [
+            {"symbol": "CALL", "exchange": "NFO", "action": "SELL", "quantity": 75},
+            {"symbol": "PUT", "exchange": "NFO", "action": "BUY", "quantity": 75},
+        ],
+    }
+
+    success, response, _ = order_service.exit_synthetic_future(request, "key")
+
+    assert success is False
+    assert len(calls) == 2
+    assert calls[1] == [request["legs"][1]]
+    assert response["status"] == "error"
+    assert [result["status"] for result in response["results"]] == ["success", "error"]
+
+
+def test_exit_does_not_retry_a_leg_missing_from_results(monkeypatch):
+    calls = []
+
+    def place_basket_order(data, api_key):
+        calls.append(data["orders"])
+        return True, {
+            "status": "success",
+            "results": [{"symbol": "CALL", "status": "success"}],
+        }, 200
+
+    monkeypatch.setitem(
+        sys.modules,
+        "services.basket_order_service",
+        SimpleNamespace(place_basket_order=place_basket_order),
+    )
+    request = {
+        "strategy": "Synthetic",
+        "legs": [
+            {"symbol": "CALL", "exchange": "NFO", "action": "SELL", "quantity": 75},
+            {"symbol": "PUT", "exchange": "NFO", "action": "BUY", "quantity": 75},
+        ],
+    }
+
+    success, response, _ = order_service.exit_synthetic_future(request, "key")
+
+    assert success is False
+    assert len(calls) == 1
+    assert response["status"] == "error"
+    assert [result["symbol"] for result in response["results"]] == ["CALL"]

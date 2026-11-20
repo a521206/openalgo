@@ -5,6 +5,37 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _place_basket_order_with_retry(basket_data: dict, api_key: str):
+    """Retry failed basket legs once and return an aggregate result."""
+    from services.basket_order_service import place_basket_order
+
+    success, response, status_code = place_basket_order(basket_data, api_key=api_key)
+    results = {result["symbol"]: result for result in response.get("results", [])}
+    retry_orders = [
+        order for order in basket_data["orders"]
+        if results.get(order["symbol"], {}).get("status") == "error"
+    ]
+
+    if retry_orders:
+        _, retry_response, status_code = place_basket_order(
+            {**basket_data, "orders": retry_orders}, api_key=api_key
+        )
+        results.update(
+            {result["symbol"]: result for result in retry_response.get("results", [])}
+        )
+
+    response["results"] = [
+        results[order["symbol"]]
+        for order in basket_data["orders"]
+        if order["symbol"] in results
+    ]
+    success = len(response["results"]) == len(basket_data["orders"]) and all(
+        result.get("status") == "success" for result in response["results"]
+    )
+    response["status"] = "success" if success else "error"
+    return success, response, status_code
+
+
 def enter_synthetic_future(data: dict, api_key: str):
     """Place the BUY then SELL leg, squaring off the first if the second fails."""
     from services.order_router_service import should_route_to_pending
@@ -135,9 +166,7 @@ def enter_synthetic_future(data: dict, api_key: str):
 
     if first_result is not None:
         try:
-            from services.basket_order_service import place_basket_order
-
-            success, square_off_response, _ = place_basket_order(
+            success, square_off_response, _ = _place_basket_order_with_retry(
                 {
                     "apikey": api_key,
                     "strategy": data["strategy"],
@@ -175,10 +204,8 @@ def enter_synthetic_future(data: dict, api_key: str):
 
 
 def exit_synthetic_future(data: dict, api_key: str):
-    """Close explicit option symbols through the existing basket-order service."""
-    from services.basket_order_service import place_basket_order
-
-    return place_basket_order(
+    """Close explicit option symbols and retry any failed legs once."""
+    return _place_basket_order_with_retry(
         {"apikey": api_key, "strategy": data["strategy"], "orders": data["legs"]},
-        api_key=api_key,
+        api_key,
     )
