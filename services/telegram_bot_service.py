@@ -4,7 +4,10 @@ import asyncio
 import logging
 import os
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
+
+from telegram import Update
+from telegram.ext import ContextTypes
 
 # Import the original threading module to run the bot in a real OS thread,
 # bypassing eventlet's monkey-patching which causes event loop conflicts.
@@ -21,8 +24,9 @@ import json
 from datetime import datetime, timedelta
 
 import httpx
+from openalgo import api as openalgo_api
 
-from database.auth_db import get_username_by_apikey, get_broker_name
+from database.auth_db import get_broker_name, get_username_by_apikey
 
 # Database imports
 from database.telegram_db import (
@@ -38,8 +42,6 @@ from database.telegram_db import (
 )
 from utils.constants import CRYPTO_BROKERS
 from utils.logging import get_logger
-
-from openalgo import api as openalgo_api
 
 logger = get_logger(__name__)
 
@@ -227,7 +229,8 @@ class TelegramBotService:
 
             # Add volume bar chart
             colors = [
-                "red" if close < open else "green" for close, open in zip(df["close"], df["open"])
+                "red" if close < open else "green"
+                for close, open in zip(df["close"], df["open"], strict=True)
             ]
 
             fig.add_trace(
@@ -401,7 +404,8 @@ class TelegramBotService:
 
             # Add volume bar chart
             colors = [
-                "red" if close < open else "green" for close, open in zip(df["close"], df["open"])
+                "red" if close < open else "green"
+                for close, open in zip(df["close"], df["open"], strict=True)
             ]
 
             fig.add_trace(
@@ -469,23 +473,22 @@ class TelegramBotService:
         """Initialize the Telegram bot with given token"""
         from telegram.ext import Application
 
+        temp_app = None
         try:
             # If bot is running, stop it first
             if self.is_running:
-                await self.stop_bot()
+                self.stop_bot()
                 # Wait a moment for cleanup
                 await asyncio.sleep(1)
 
             self.bot_token = token
 
             # Create a temporary bot just to verify the token
-            temp_app = Application.builder().token(token).build()
+            temp_app = Application.builder().token(token).read_timeout(30).build()
             await temp_app.initialize()
 
             # Test the token by getting bot info
             bot_info = await temp_app.bot.get_me()
-
-            await temp_app.shutdown()
 
             # Update bot config in database
             update_bot_config(
@@ -497,6 +500,12 @@ class TelegramBotService:
         except Exception as e:
             logger.exception(f"Failed to initialize bot: {e}")
             return False, str(e)
+        finally:
+            if temp_app is not None:
+                try:
+                    await temp_app.shutdown()
+                except Exception:
+                    logger.debug("Temporary Telegram application shutdown failed", exc_info=True)
 
     def initialize_bot_sync(self, token: str) -> tuple[bool, str]:
         """Synchronous initialization for eventlet environments"""
@@ -553,7 +562,7 @@ class TelegramBotService:
     def _run_bot_in_thread(self):
         """Run bot with its own asyncio event loop (works in both threads and greenlets)"""
         import asyncio
-        
+
         # Create a new event loop for this execution context
         try:
             loop = asyncio.new_event_loop()
@@ -579,11 +588,11 @@ class TelegramBotService:
             try:
                 if self.http_client:
                     loop.run_until_complete(self.http_client.aclose())
-            except:
+            except Exception:
                 pass
             try:
                 loop.close()
-            except:
+            except Exception:
                 pass
             self.bot_loop = None
             self.is_running = False
@@ -626,7 +635,7 @@ class TelegramBotService:
                     chat_id=update.effective_chat.id,
                     text="⚠️ An error occurred. Please try again later.",
                 )
-            except:
+            except Exception:
                 pass
 
     async def _start_bot_isolated(self):
@@ -644,7 +653,9 @@ class TelegramBotService:
                 # Build application if needed - this may fail due to network issues
                 if self.application is None:
                     try:
-                        self.application = Application.builder().token(self.bot_token).build()
+                        self.application = (
+                            Application.builder().token(self.bot_token).read_timeout(30).build()
+                        )
                         self.application.add_handler(CommandHandler("start", self.cmd_start))
                         self.application.add_handler(CommandHandler("help", self.cmd_help))
                         self.application.add_handler(CommandHandler("link", self.cmd_link))
@@ -767,7 +778,7 @@ class TelegramBotService:
     def start_bot(self) -> tuple[bool, str]:
         """Start the bot in a separate thread or eventlet greenlet"""
         import time
-        
+
         try:
             if self.is_running:
                 return False, "Bot is already running"
@@ -1054,7 +1065,7 @@ class TelegramBotService:
                         status = "🟢 Connected"
                     else:
                         status = "🔴 Connection Failed"
-                except:
+                except Exception:
                     status = "🔴 Connection Failed"
             else:
                 status = "🔴 Client Error"
@@ -1809,7 +1820,7 @@ class TelegramBotService:
             logger.exception(f"Error generating charts: {e}")
             try:
                 await loading_msg.delete()
-            except:
+            except Exception:
                 pass
             await update.message.reply_text(f"❌ Error generating charts: {str(e)}")
 
@@ -1880,11 +1891,11 @@ class TelegramBotService:
             try:
                 price = float(order.get("price", 0))
                 price_str = "Market" if price == 0 else f"{cs}{price}"
-            except:
+            except Exception:
                 price_str = f"{cs}{order.get('price', 0)}"
             try:
                 quantity = int(order.get("quantity", 0))
-            except:
+            except Exception:
                 quantity = order.get("quantity", 0)
             message += (
                 f"{status_emoji} *{order.get('symbol', 'N/A')}* ({order.get('exchange', 'N/A')})\n"
@@ -1909,12 +1920,12 @@ class TelegramBotService:
             action_emoji = "📈" if trade.get("action") == "BUY" else "📉"
             try:
                 quantity = int(trade.get("quantity", 0))
-            except:
+            except Exception:
                 quantity = trade.get("quantity", 0)
             try:
                 avg_price = float(trade.get("average_price", 0))
                 avg_price_str = f"{cs}{avg_price:,.2f}"
-            except:
+            except Exception:
                 avg_price_str = f"{cs}{trade.get('average_price', 0)}"
             message += (
                 f"{action_emoji} *{trade.get('symbol', 'N/A')}* ({trade.get('exchange', 'N/A')})\n"
@@ -1939,7 +1950,7 @@ class TelegramBotService:
         for pos in active_positions[:10]:
             try:
                 quantity = int(pos.get("quantity", 0))
-            except:
+            except Exception:
                 quantity = 0
             position_emoji = "🟢" if quantity > 0 else "🔴"
             position_type = "LONG 📈" if quantity > 0 else "SHORT 📉"
@@ -1966,7 +1977,7 @@ class TelegramBotService:
             try:
                 pnl = float(holding.get("pnl", 0))
                 pnl_percent = float(holding.get("pnlpercent", 0))
-            except:
+            except Exception:
                 pnl, pnl_percent = 0.0, 0.0
             pnl_emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
             message += f"{pnl_emoji} *{holding.get('symbol', 'N/A')}*\n"
@@ -1985,7 +1996,7 @@ class TelegramBotService:
             available = float(funds.get("availablecash", 0))
             collateral = float(funds.get("collateral", 0))
             utilized = float(funds.get("utiliseddebits", 0))
-        except:
+        except Exception:
             available, collateral, utilized = 0.0, 0.0, 0.0
 
         return (
@@ -2007,7 +2018,7 @@ class TelegramBotService:
             try:
                 pnl = float(pos.get("pnl", 0))
                 total_pnl += pnl
-            except:
+            except Exception:
                 pass
 
         pnl_emoji = "🟢" if total_pnl > 0 else "🔴" if total_pnl < 0 else "⚪"
