@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import time
 import urllib.parse
@@ -12,6 +13,7 @@ from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+logger.setLevel(logging.WARNING)
 
 
 # OpenAlgo→Kite exchange-prefix translation for /quote, /quote/ltp, /quote/ohlc.
