@@ -566,6 +566,16 @@ if [ -f "$OPENALGO_PATH/frontend/package.json" ]; then
         log_message "Error: frontend build failed; update aborted before the service is restarted." "$RED"
         exit 1
     fi
+    if [ "$SERVER_MODE" = true ]; then
+        # npm may run as root during a server update. The app generates gzip
+        # variants beside these files at startup, so its service account must
+        # own the freshly-built dist tree before the service is restarted.
+        if ! sudo chown -R "$WEB_USER:$WEB_GROUP" "$OPENALGO_PATH/frontend/dist"; then
+            log_message "Error: could not assign frontend assets to $WEB_USER:$WEB_GROUP; update aborted." "$RED"
+            exit 1
+        fi
+        log_message "Frontend assets assigned to $WEB_USER:$WEB_GROUP" "$GREEN"
+    fi
     log_message "Frontend built successfully" "$GREEN"
 fi
 
