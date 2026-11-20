@@ -520,6 +520,22 @@ if [ "$STASHED" = true ]; then
     log_message "Note: Local changes were stashed. Use 'git stash pop' to restore if needed." "$YELLOW"
 fi
 
+# Build the frontend from this checkout, not the main-branch CI artifact.
+# This keeps server deployments of feature branches in sync with their source
+# and also refreshes the bundle for local updates.
+if [ -f "$OPENALGO_PATH/frontend/package.json" ]; then
+    log_message "\nBuilding the React frontend..." "$BLUE"
+    if ! command -v npm >/dev/null 2>&1; then
+        log_message "Error: npm is required to build the frontend. Install a supported Node.js version (see frontend/package.json) and run this update again." "$RED"
+        exit 1
+    fi
+    if ! (cd "$OPENALGO_PATH/frontend" && npm ci && npm run build); then
+        log_message "Error: frontend build failed; update aborted before the service is restarted." "$RED"
+        exit 1
+    fi
+    log_message "Frontend built successfully" "$GREEN"
+fi
+
 # ============================================
 # Step 4: Check environment configuration
 # ============================================
@@ -900,24 +916,6 @@ Nginx: the main proxy block forces a WebSocket upgrade header" "$YELLOW"
     fi
 else
     log_message "\n[Step 7/7] Finalizing update..." "$BLUE"
-
-    # Build frontend if dist/ directory is missing and npm is available
-    if [ ! -d "$OPENALGO_PATH/frontend/dist" ]; then
-        if command -v npm >/dev/null 2>&1; then
-            log_message "Building React frontend (dist/ not found)..." "$BLUE"
-            cd "$OPENALGO_PATH/frontend"
-            npm ci && npm run build
-            if [ $? -eq 0 ]; then
-                log_message "Frontend built successfully" "$GREEN"
-            else
-                log_message "Frontend build failed. Run manually: cd frontend && npm ci && npm run build" "$YELLOW"
-            fi
-        else
-            log_message "Warning: frontend/dist/ not found and Node.js is not installed." "$YELLOW"
-            log_message "Install Node.js 20.20+, 22.22+, or 24.13+ and run: cd frontend && npm ci && npm run build" "$YELLOW"
-        fi
-    fi
-
     log_message "Update finalized" "$GREEN"
 fi
 

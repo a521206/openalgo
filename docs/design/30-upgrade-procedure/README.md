@@ -48,15 +48,9 @@ If no `.env` exists, the script creates one from `.sample.env` and generates fre
 
 ## Frontend Build
 
-Local mode builds the React bundle only when `frontend/dist` is absent and npm is available. Server operators should verify the bundle after frontend changes and build explicitly when needed:
+After pulling the current branch, `install/update.sh` runs `npm ci` and `npm run build` in both server and local modes when `frontend/package.json` is present. Node.js and npm must be installed on the host; the frontend's supported Node versions are declared in `frontend/package.json`. A build failure aborts the update before the service is restarted.
 
-```bash
-cd frontend
-npm ci
-npm run build
-```
-
-Then restart the application service.
+Docker deployments build the frontend in the Docker image instead.
 
 ## Migration Runner
 
