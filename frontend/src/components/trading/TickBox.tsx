@@ -12,7 +12,7 @@
  * punched in a dark panel, which is the tell the UI standard calls out.
  *
  * Why the tick is a real `<svg>` and not a CSS mask. The previous copies drew
- * it with `checked:after:[mask:url("data:image/svg+xml,...")]`, and TWO
+ * it with a checked-state CSS mask backed by an inline SVG data URL, and TWO
  * separate faults meant nothing ever appeared:
  *
  *  1. The tick was painted `bg-[hsl(var(--primary-foreground))]`. This app
@@ -24,7 +24,7 @@
  *     whichever value is live, so the plain `bg-primary-foreground` /
  *     `text-primary-foreground` utilities are correct under both systems. Do
  *     not reintroduce an `hsl(var(--x))` anywhere in this file.
- *  2. The arbitrary `[mask:url(...)]` utility was never emitted at all --
+ *  2. The arbitrary mask utility was never emitted at all --
  *     confirmed in the browser, where the pseudo-element's computed
  *     `mask-image` came back `none`. With the colour fixed but the mask still
  *     missing, the tick would have become a solid filled square covering the
