@@ -108,6 +108,8 @@ REQUIRED_MIGRATIONS = frozenset(
     {
         "migrate_strategy_module.py",
         "migrate_strategy_universe_tab.py",
+        # The ORM queries these columns as soon as authentication runs.
+        "add_totp_purpose_flags.py",
         # Without its table the /alerts page and the settings it saves fail.
         "migrate_alert_channels.py",
         # Without its table every password reset is refused.

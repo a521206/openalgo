@@ -195,13 +195,48 @@ detect_uv() {
 #                                    service "openalgo-<deploy>"
 #   3. install/install-multi.sh      /var/python/openalgo-flask/openalgoN,
 #                                    service "openalgoN" (see find_multi_instances)
-# We try the simple layout first because it's unambiguous; only fall back
-# to scanning the legacy parent dir when the simple path is absent, and to
-# install-multi.sh instances when neither is found.
+# Prefer the deployment containing this updater when it is a managed server
+# instance. This matters when several deployments share a host: the updater
+# must not silently select the separate /var/python/openalgo installation.
 SIMPLE_PATH="/var/python/openalgo"
 DEPLOY_BASE="/var/python/openalgo-flask"
+MULTI_SYSTEMD_DIR="/etc/systemd/system"
 SERVER_MODE=false
 STASHED=false
+
+SCRIPT_CHECKOUT="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd -P)"
+if [ -d "$SCRIPT_CHECKOUT/.git" ] && [ -f "$SCRIPT_CHECKOUT/.env" ]; then
+    case "$SCRIPT_CHECKOUT" in
+        "$DEPLOY_BASE"/*/openalgo)
+            SELECTED_DEPLOY="$(basename "$(dirname "$SCRIPT_CHECKOUT")")"
+            OWN_SERVICE="openalgo-$SELECTED_DEPLOY"
+            OWN_BASE_PATH="$(dirname "$SCRIPT_CHECKOUT")"
+            OWN_VENV_PATH="$OWN_BASE_PATH/venv"
+            ;;
+        "$DEPLOY_BASE"/*)
+            SELECTED_DEPLOY="$(basename "$SCRIPT_CHECKOUT")"
+            OWN_SERVICE="$SELECTED_DEPLOY"
+            OWN_BASE_PATH="$SCRIPT_CHECKOUT"
+            OWN_VENV_PATH="$SCRIPT_CHECKOUT/venv"
+            ;;
+    esac
+
+    OWN_UNIT="$MULTI_SYSTEMD_DIR/$OWN_SERVICE.service"
+    if [ -n "$OWN_SERVICE" ] && [ -f "$OWN_UNIT" ] \
+        && [ -x "$OWN_VENV_PATH/bin/python" ]; then
+        OWN_WORKDIR="$(tr -d '\r' < "$OWN_UNIT" | grep -E '^[[:space:]]*WorkingDirectory=' | tail -n 1 \
+            | sed -E 's/^[[:space:]]*WorkingDirectory=//')"
+        if [ "${OWN_WORKDIR%/}" = "$SCRIPT_CHECKOUT" ]; then
+            SERVER_MODE=true
+            BASE_PATH="$OWN_BASE_PATH"
+            OPENALGO_PATH="$SCRIPT_CHECKOUT"
+            VENV_PATH="$OWN_VENV_PATH"
+            SERVICE_NAME="$OWN_SERVICE"
+            log_message "Selected the server deployment containing this updater: $OPENALGO_PATH" "$GREEN"
+            log_message "Service: $SERVICE_NAME" "$BLUE"
+        fi
+    fi
+fi
 
 find_deployments() {
     local deployments=()
@@ -216,7 +251,7 @@ find_deployments() {
     echo "${deployments[@]}"
 }
 
-if [ -d "$SIMPLE_PATH/.git" ] && [ -f "$SIMPLE_PATH/.env" ]; then
+if [ "$SERVER_MODE" = false ] && [ -d "$SIMPLE_PATH/.git" ] && [ -f "$SIMPLE_PATH/.env" ]; then
     SERVER_MODE=true
     SELECTED_DEPLOY="openalgo"
     BASE_PATH="$SIMPLE_PATH"
@@ -276,8 +311,6 @@ fi
 # WorkingDirectory is that folder, the same test the web server switch script
 # uses to find OpenAlgo services. Only looked for when neither layout above was
 # found, so those behave exactly as before.
-MULTI_SYSTEMD_DIR="/etc/systemd/system"
-
 find_multi_instances() {
     local dir name unit workdir
     [ -d "$DEPLOY_BASE" ] || return 0

@@ -337,20 +337,19 @@ def test_a_folder_whose_service_points_elsewhere_is_not_an_instance(box):
 # ---------------------------------------------------------------- the old layouts, as before
 
 
-def test_the_install_sh_layout_is_updated_as_before_even_beside_instances(box):
+def test_run_inside_multi_instance_selects_it_over_simple_install(box):
     simple = box.simple()
     instance = box.multi(1)
-    before_instance = box.head(instance)
     new_head = box.advance()
 
-    # Run from inside the instance: the simple install is still the one updated,
-    # as it always has been when /var/python/openalgo exists.
+    # The updater belongs to this instance, so it must not pick the separate
+    # simple install merely because that path also exists.
     result = box.run(instance / "install" / "update.sh", cwd=instance)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert f"Found OpenAlgo install at {simple}" in result.stdout
-    assert box.head(simple) == new_head
-    assert box.head(instance) == before_instance
+    assert f"Selected the server deployment containing this updater: {instance}" in result.stdout
+    assert box.head(instance) == new_head
+    assert box.head(simple) != new_head
     assert _systemctl(box) == [
         "systemctl is-active --quiet openalgo",
         "systemctl stop openalgo",

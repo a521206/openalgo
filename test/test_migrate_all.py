@@ -24,6 +24,16 @@ def test_strategy_module_nonzero_exit_is_a_master_migration_failure(tmp_path, mo
     assert migrate_all.run_migration(script_name, "Strategy Module") is False
 
 
+def test_totp_flags_nonzero_exit_is_a_master_migration_failure(tmp_path, monkeypatch):
+    """A missing auth column must prevent startup with the new ORM."""
+    script_name = "add_totp_purpose_flags.py"
+    _failing_script(tmp_path, script_name)
+    monkeypatch.setattr(migrate_all, "UPGRADE_DIR", str(tmp_path))
+    monkeypatch.setattr(migrate_all, "PROJECT_ROOT", str(tmp_path))
+
+    assert migrate_all.run_migration(script_name, "TOTP Flags") is False
+
+
 def test_legacy_nonzero_exit_keeps_warning_compatibility(tmp_path, monkeypatch):
     """Existing best-effort migrations retain their historical warning result."""
     script_name = "legacy_warning.py"
@@ -39,6 +49,14 @@ def test_missing_required_strategy_script_is_a_master_migration_failure(tmp_path
     monkeypatch.setattr(migrate_all, "UPGRADE_DIR", str(tmp_path))
 
     assert migrate_all.run_migration("migrate_strategy_module.py", "Strategy Module") is False
+
+
+def test_totp_migration_is_registered_once_and_required():
+    """The auth schema migration must run and fail closed on every upgrade."""
+    names = [script_name for script_name, _description in migrate_all.MIGRATIONS]
+
+    assert names.count("add_totp_purpose_flags.py") == 1
+    assert "add_totp_purpose_flags.py" in migrate_all.REQUIRED_MIGRATIONS
 
 
 def test_strategy_module_migration_is_registered_once():
