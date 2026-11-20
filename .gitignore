@@ -130,6 +130,9 @@ workspace/**/.sample.env
 # Local Git worktrees created for isolated feature and documentation work.
 .worktrees/
 
+# Runtime state written by the Python strategy scheduler.
+strategies/running_strategies.json
+
 # A literal "~" directory in the repo root. On Windows HOME is often unset, so
 # a library that expands "~/.config/..." itself (litellm caches an auth token
 # there) creates the tilde as a real folder here instead of in the profile.
