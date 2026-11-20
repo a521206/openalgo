@@ -66,6 +66,17 @@ class Settings(Base):
     security_api_ban_duration = Column(Integer, default=0)  # 0 = permanent ban
     security_repeat_offender_limit = Column(Integer, default=2)  # Bans before permanent ban
 
+    # Smart Trade Rules
+    smart_trade_enabled = Column(Boolean, default=True)
+    prevent_duplicate_buy = Column(Boolean, default=True)
+    prevent_duplicate_sell = Column(Boolean, default=True)
+    max_position_size = Column(Integer, nullable=True)
+    max_order_value = Column(Integer, nullable=True)
+    allow_intraday_only = Column(Boolean, default=False)
+    block_cnc_orders = Column(Boolean, default=False)
+    block_nrml_orders = Column(Boolean, default=False)
+    liquidity_fallback = Column(Boolean, default=True)
+
 
 def init_db():
     """Initialize the settings database"""
@@ -305,6 +316,41 @@ def set_security_settings(
 
     # Invalidate cache after update
     _settings_cache.invalidate("security_settings")
+
+
+def get_smart_trade_rules():
+    """Get Smart Trade Rules configuration."""
+    settings = Settings.query.first()
+    if not settings:
+        settings = Settings(analyze_mode=False)
+        db_session.add(settings)
+        db_session.commit()
+
+    return {
+        "smart_trade_enabled": bool(settings.smart_trade_enabled)
+        if settings.smart_trade_enabled is not None
+        else True,
+        "prevent_duplicate_buy": bool(settings.prevent_duplicate_buy)
+        if settings.prevent_duplicate_buy is not None
+        else True,
+        "prevent_duplicate_sell": bool(settings.prevent_duplicate_sell)
+        if settings.prevent_duplicate_sell is not None
+        else True,
+        "max_position_size": settings.max_position_size,
+        "max_order_value": settings.max_order_value,
+        "allow_intraday_only": bool(settings.allow_intraday_only)
+        if settings.allow_intraday_only is not None
+        else False,
+        "block_cnc_orders": bool(settings.block_cnc_orders)
+        if settings.block_cnc_orders is not None
+        else False,
+        "block_nrml_orders": bool(settings.block_nrml_orders)
+        if settings.block_nrml_orders is not None
+        else False,
+        "liquidity_fallback": bool(settings.liquidity_fallback)
+        if settings.liquidity_fallback is not None
+        else True,
+    }
 
 
 def clear_settings_cache():
