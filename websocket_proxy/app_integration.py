@@ -12,7 +12,7 @@ Exactly one must run per installation, in one of three places, chosen by
 * ``thread``: a real OS thread inside the development server (``uv run
   app.py``), the long-standing local workflow.
 * ``external``: somebody else runs it. Docker's ``start.sh`` starts
-  ``python -m websocket_proxy.server`` itself.
+  ``python -m websocket_proxy.runner`` itself.
 
 The choice used to be inferred from whether eventlet was active, which under
 the gthread worker would have moved the whole proxy into the trading worker.
@@ -99,7 +99,7 @@ FAILURES_BEFORE_SLOW_RETRY = 5
 SLOW_RETRY_SECONDS = 60.0
 
 #: How the child is started. A list so tests can substitute a stand-in.
-SPAWN_COMMAND = [sys.executable, "-u", "-m", "websocket_proxy.server"]
+SPAWN_COMMAND = [sys.executable, "-u", "-m", "websocket_proxy.runner"]
 
 # Supervisor state. A plain lock: only in-memory bookkeeping happens under it.
 _state_lock = threading.Lock()
@@ -337,7 +337,7 @@ def _spawn_websocket_subprocess():
     Under gthread it keeps the proxy and its broker feeds out of the process
     that places orders.
 
-    The child runs `python -m websocket_proxy.server` in a fresh interpreter
+    The child runs `python -m websocket_proxy.runner` in a fresh interpreter
     with no eventlet monkey-patching, so all the offending primitives are
     real OS locks. Systemd's cgroup-based KillMode (default: control-group)
     cleans up the child when the unit stops; our atexit handler and the

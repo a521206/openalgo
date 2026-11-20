@@ -29,7 +29,7 @@ The bus is internal and unversioned. External integrations should use the authen
 
 | Mode | Default context | Ownership |
 |---|---|---|
-| `subprocess` | Gunicorn, both eventlet and gthread | Flask starts and supervises a separate `python -m websocket_proxy.server` process |
+| `subprocess` | Gunicorn, both eventlet and gthread | Flask starts and supervises a separate `python -m websocket_proxy.runner` process |
 | `external` | Docker / `APP_MODE=standalone` | `start.sh` starts a separate proxy process |
 | `thread` | Development server (`uv run app.py`) | Proxy asyncio loop runs on a real OS thread |
 

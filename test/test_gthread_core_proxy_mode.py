@@ -405,7 +405,7 @@ def test_a_real_orphaned_proxy_exits_by_itself(tmp_path):
         "import os, subprocess, sys\n"
         "env = dict(os.environ)\n"
         f"env['{proxy_server.PARENT_PID_ENV}'] = str(os.getpid())\n"
-        "child = subprocess.Popen([sys.executable, '-m', 'websocket_proxy.server'], env=env)\n"
+        "child = subprocess.Popen([sys.executable, '-m', 'websocket_proxy.runner'], env=env)\n"
         f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
         "import time; time.sleep(4)\n"
         "os._exit(0)\n"

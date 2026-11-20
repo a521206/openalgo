@@ -507,7 +507,7 @@ fi
 # WEBSOCKET PROXY SERVER
 # ============================================
 echo "[OpenAlgo] Starting WebSocket proxy server on port 8765..."
-/app/.venv/bin/python -m websocket_proxy.server &
+/app/.venv/bin/python -m websocket_proxy.runner &
 WEBSOCKET_PID=$!
 echo "[OpenAlgo] WebSocket proxy server started with PID $WEBSOCKET_PID"
 
@@ -613,7 +613,7 @@ if [ "$OPENALGO_WORKER_REQUESTED" = "gthread" ] && [ -f /app/install/openalgo-gu
             if [ "$GTHREAD_STOPPING" -ne 0 ] || ! kill -0 "$GUNICORN_PID" 2>/dev/null; then
                 break
             fi
-            /app/.venv/bin/python -m websocket_proxy.server &
+            /app/.venv/bin/python -m websocket_proxy.runner &
             WEBSOCKET_PID=$!
             PROXY_STARTED_AT=$(date +%s)
             echo "[OpenAlgo] WebSocket proxy server started again with PID $WEBSOCKET_PID"

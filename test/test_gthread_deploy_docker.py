@@ -196,7 +196,7 @@ def test_start_sh_picks_the_web_server_from_env(tmp_path, env_text, expected):
 # record what happens to them.
 
 FAKE_PYTHON = r"""#!/bin/bash
-if [ "$1" = "-m" ] && [ "$2" = "websocket_proxy.server" ]; then
+if [ "$1" = "-m" ] && [ "$2" = "websocket_proxy.runner" ]; then
   # Never two at once: every proxy started before this one must be gone.
   if [ -f "$STATE/proxy_starts" ]; then
     while read -r earlier; do

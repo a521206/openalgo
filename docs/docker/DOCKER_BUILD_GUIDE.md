@@ -210,7 +210,7 @@ docker-compose logs | grep -i error
 docker-compose exec openalgo ps aux | grep websocket_proxy
 ```
 
-Expected output showing `python -m websocket_proxy.server`
+Expected output showing `python -m websocket_proxy.runner`
 
 ## Troubleshooting
 
