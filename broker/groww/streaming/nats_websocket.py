@@ -4,7 +4,6 @@ WebSocket implementation for Groww using minimal NATS authentication
 
 import base64
 import json
-import logging
 import os
 import ssl
 import threading
@@ -16,10 +15,20 @@ import certifi
 import requests
 import websocket
 
+from utils.logging import get_logger
+
 # Import our minimal implementations
 from . import groww_nats, groww_nkeys, groww_protobuf
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+
+class GrowwSessionExpired(Exception):
+    """Groww refused the socket-token request because the login has expired"""
+
+
+# Worded so the connection pool's auth-error check ("token expired") matches it
+SESSION_EXPIRED_MESSAGE = "Groww login token expired. Please log in to Groww again."
 
 
 class GrowwNATSWebSocket:
@@ -28,7 +37,11 @@ class GrowwNATSWebSocket:
     """
 
     def __init__(
-        self, auth_token: str, on_data: Callable | None = None, on_error: Callable | None = None
+        self,
+        auth_token: str,
+        on_data: Callable | None = None,
+        on_error: Callable | None = None,
+        token_provider: Callable | None = None,
     ):
         """
         Initialize Groww WebSocket
@@ -37,8 +50,12 @@ class GrowwNATSWebSocket:
             auth_token: Authentication token for Groww API
             on_data: Callback for market data
             on_error: Callback for errors
+            token_provider: Optional zero-arg callable returning a fresh auth
+                token from the DB. Called before each reconnect so a daily-rolled
+                token (~3 AM IST) is used instead of the dead one.
         """
         self.auth_token = auth_token
+        self.token_provider = token_provider
         self.on_data = on_data or self._default_on_data
         self.on_error = on_error or self._default_on_error
 
@@ -62,6 +79,16 @@ class GrowwNATSWebSocket:
         self.connected = False
         self.authenticated = False
         self.server_nonce = None  # Server nonce for signing
+        self.connect_sent = False  # CONNECT is sent once per connection
+        self.conn_generation = 0  # Bumped on every open; helper threads exit when it changes
+        self._conn_closed = None  # Set when the current connection closes; wakes its helpers
+
+        # Reconnect loop: exponential backoff, capped, interruptible by disconnect()
+        self._stop_event = threading.Event()
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 50
+        self.base_reconnect_delay = 2
+        self.max_reconnect_delay = 60
 
         # Groww URLs
         self.ws_url = "wss://socket-api.groww.in"
@@ -105,12 +132,7 @@ class GrowwNATSWebSocket:
                 jwt=self.socket_token, nkey=nkey, sig=sig
             )
 
-            # Log CONNECT details for debugging
-            logger.info("CONNECT details:")
-            logger.info(f"  JWT Token length: {len(self.socket_token) if self.socket_token else 0}")
-            logger.info(f"  Has nkey: {bool(nkey)}")
-            logger.info(f"  Has signature: {bool(sig)}")
-            logger.debug(f"  CONNECT command: {connect_cmd[:200]}...")  # Log first 200 chars
+            logger.debug(f"CONNECT: JWT len={len(self.socket_token) if self.socket_token else 0}, nkey={bool(nkey)}, sig={bool(sig)}")
 
             self.ws.send(connect_cmd)
             logger.info(f"Sent NATS CONNECT with{'out' if not sig else ''} signature")
@@ -136,6 +158,8 @@ class GrowwNATSWebSocket:
 
             # Start WebSocket connection
             self.running = True
+            self._stop_event.clear()
+            self.reconnect_attempts = 0
             self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
             self.ws_thread.start()
 
@@ -163,7 +187,33 @@ class GrowwNATSWebSocket:
         except Exception as e:
             logger.error(f"Failed to connect to Groww: {e}")
             self.connected = False
+            # Stop the background thread too, or a failed connect leaves it
+            # reconnecting on its own with nothing left to disconnect it.
+            self.running = False
+            self._stop_event.set()
+            if self.ws:
+                try:
+                    self.ws.close()
+                except Exception:
+                    pass
             raise
+
+    def _refresh_auth_token(self):
+        """Re-read a fresh auth token from the DB via token_provider before a
+        reconnect. Keeps the existing token if the provider yields nothing."""
+        if not self.token_provider:
+            return
+        try:
+            fresh = self.token_provider()
+            if fresh:
+                self.auth_token = fresh
+                logger.info("Refreshed Groww auth token before reconnect")
+            else:
+                logger.warning(
+                    "No fresh Groww auth token available; reusing existing token"
+                )
+        except Exception as e:
+            logger.error(f"Error refreshing Groww auth token: {e}")
 
     def _generate_socket_token(self):
         """Generate socket token from Groww API using minimal nkeys"""
@@ -198,26 +248,87 @@ class GrowwNATSWebSocket:
                 logger.info(
                     f"Generated socket token successfully, subscription ID: {self.subscription_id}"
                 )
-            else:
-                # Fallback: use the main auth token directly
-                logger.warning(
-                    f"Failed to generate socket token ({response.status_code}): {response.text}"
+            elif response.status_code in (401, 403):
+                # The login token itself is dead. The feed cannot work with it,
+                # so stop instead of retrying until the next login.
+                logger.error(
+                    f"Groww refused the socket token request ({response.status_code}): {response.text}"
                 )
-                logger.warning("Using auth token directly as fallback")
-                self.socket_token = self.auth_token
-                self.subscription_id = "direct_auth"
-                self.nkey_seed = None
+                raise GrowwSessionExpired(SESSION_EXPIRED_MESSAGE)
+            else:
+                # No fallback: the NATS server only accepts a socket token, so
+                # connecting with the login token can never succeed.
+                raise ConnectionError(
+                    f"Failed to generate Groww socket token ({response.status_code}): {response.text}"
+                )
 
+        except GrowwSessionExpired:
+            raise
         except Exception as e:
-            logger.warning(f"Failed to generate socket token: {e}")
-            logger.warning("Using auth token directly as fallback")
-            # Fallback to using auth token directly
-            self.socket_token = self.auth_token
-            self.subscription_id = "direct_auth"
-            self.nkey_seed = None
+            logger.error(f"Failed to generate socket token: {e}")
+            raise
 
     def _run_websocket(self):
-        """Run WebSocket in thread"""
+        """Run the WebSocket and reconnect with backoff until stopped.
+
+        One loop on one thread: _on_close only flips flags, so reconnects never
+        nest inside the previous connection's close callback.
+        """
+        while self.running:
+            self._run_once()
+            if not self._prepare_reconnect():
+                break
+
+        logger.info("Groww WebSocket thread exiting")
+
+    def _prepare_reconnect(self) -> bool:
+        """Wait out the backoff and fetch a fresh socket token.
+
+        Returns True when the next connection can be opened, False when the
+        feed should stop (disconnect, expired login, or too many failures).
+        """
+        while self.running:
+            self.reconnect_attempts += 1
+            if self.reconnect_attempts > self.max_reconnect_attempts:
+                logger.error(
+                    f"Groww feed reconnect failed {self.max_reconnect_attempts} times; giving up"
+                )
+                self.running = False
+                self.on_error("Live data from Groww stopped after repeated reconnect failures")
+                return False
+
+            delay = min(
+                self.base_reconnect_delay * 2 ** (self.reconnect_attempts - 1),
+                self.max_reconnect_delay,
+            )
+            logger.info(
+                f"Reconnecting in {delay}s (attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})"
+            )
+            if self._stop_event.wait(delay) or not self.running:
+                return False
+
+            # Re-read a fresh auth token and regenerate the socket token so the
+            # reconnect uses live credentials instead of the dead daily-rolled
+            # token.
+            self._refresh_auth_token()
+            try:
+                self._generate_socket_token()
+            except GrowwSessionExpired as e:
+                logger.error("Groww login expired; stopping the feed until the next login")
+                self.running = False
+                self.on_error(str(e))
+                return False
+            except Exception:
+                continue  # Already logged; back off and try again
+
+            # A fresh protocol handler drops the old connection's SIDs and any
+            # half-parsed data.
+            self.nats_protocol = groww_nats.NATSProtocol()
+            return True
+        return False
+
+    def _run_once(self):
+        """Open one WebSocket connection and block until it closes"""
         try:
             # Check if we should even start
             if not self.running:
@@ -264,6 +375,13 @@ class GrowwNATSWebSocket:
         """Handle WebSocket open"""
         logger.info("WebSocket connected to Groww")
         self.connected = True
+        self.connect_sent = False
+        self.conn_generation += 1
+        generation = self.conn_generation
+        # Helper threads wait on this, so they exit as soon as this connection
+        # closes instead of finishing a sleep first.
+        closed = threading.Event()
+        self._conn_closed = closed
 
         # NATS protocol: Server sends INFO first, then we respond with CONNECT
         # Don't send CONNECT immediately, wait for INFO message
@@ -271,29 +389,27 @@ class GrowwNATSWebSocket:
 
         # For Groww, we might not get explicit +OK, so mark as authenticated after a delay
         def check_auth_status():
-            import time
-
-            time.sleep(2)
+            if closed.wait(2) or generation != self.conn_generation:
+                return
             if self.connected and not self.authenticated:
                 logger.info("No explicit +OK received, assuming authenticated")
                 self.authenticated = True
                 self._resubscribe_all()
 
-        import threading
-
         threading.Thread(target=check_auth_status, daemon=True).start()
 
         # Start periodic PING to keep connection alive and check if we're receiving data
         def periodic_ping():
-            import time
-
             ping_count = 0
-            while self.connected and self.running:  # Check both connected and running flags
-                time.sleep(10)  # Send PING every 10 seconds
+            # Exit once this connection closes or is replaced, or a quick
+            # reconnect would leave the old thread alive next to the new one.
+            while not closed.wait(10):  # Send PING every 10 seconds
+                if generation != self.conn_generation or not self.running:
+                    break
                 if self.connected and self.running and self.ws:
                     try:
                         ping_count += 1
-                        logger.info(f"\U0001f3d3 Sending PING #{ping_count} to check connection...")
+                        logger.debug(f"Sending PING #{ping_count} to check connection...")
                         if self.nats_protocol:
                             self.ws.send(self.nats_protocol.create_ping())
                         else:
@@ -301,7 +417,7 @@ class GrowwNATSWebSocket:
                     except Exception as e:
                         logger.error(f"Failed to send PING: {e}")
                         break  # Exit on error
-            logger.info("🛑 Ping thread exiting")
+            logger.debug("Ping thread exiting")
 
         threading.Thread(target=periodic_ping, daemon=True).start()
 
@@ -311,9 +427,7 @@ class GrowwNATSWebSocket:
             # Convert to string to find message boundaries
             text = data.decode("utf-8", errors="ignore")
 
-            # Log the message type for debugging
-            if len(text) > 0:
-                logger.debug(f"Binary message text preview: {text[:100]}")
+            logger.debug(f"Binary message text preview: {text[:100]}")
 
             # Ensure NATS protocol handler exists
             if not self.nats_protocol:
@@ -347,14 +461,7 @@ class GrowwNATSWebSocket:
                             sid = parts[2]
                             size = int(parts[-1])
 
-                            # Enhanced logging for BSE messages
-                            if "bse" in subject.lower():
-                                logger.info(
-                                    f"🔴 BSE MSG detected - Subject: {subject}, SID: {sid}, Size: {size}"
-                                )
-
                             # Calculate where payload starts in the original binary data
-                            # We need to find where the header ends in the original data
                             header_end_marker = b"\r\n"
                             header_start = data.find(b"MSG")
                             if header_start >= 0:
@@ -364,26 +471,24 @@ class GrowwNATSWebSocket:
                                     payload_end = payload_start + size
 
                                     if payload_end <= len(data):
-                                        # Extract binary payload
                                         payload = data[payload_start:payload_end]
 
-                                        # Create MSG dict with binary payload
                                         msg = {
                                             "type": "MSG",
                                             "subject": subject,
                                             "sid": sid,
                                             "size": size,
-                                            "payload": payload,  # Keep as bytes
+                                            "payload": payload,
                                         }
 
-                                        logger.info(
-                                            f"📊 Binary MSG parsed - Subject: {subject}, SID: {sid}, Size: {size}"
+                                        logger.debug(
+                                            f"Binary MSG parsed - Subject: {subject}, SID: {sid}, Size: {size}"
                                         )
                                         self._process_nats_message(msg)
 
-            elif text.startswith("PING") or text.startswith("PONG") or text.startswith("+OK"):
+            elif text.startswith(("PING", "PONG", "+OK", "-ERR")):
                 # Parse as text for control messages
-                logger.info(f"Control message received: {text.strip()}")
+                logger.debug(f"Control message received: {text.strip()}")
                 if self.nats_protocol:
                     messages = self.nats_protocol.parse_message(text)
                 else:
@@ -410,54 +515,19 @@ class GrowwNATSWebSocket:
                 # Decode to check content
                 msg_text = message.decode("utf-8", errors="ignore")
 
-                # Enhanced debugging for ALL messages to find BSE
+                # Log all per-message details at debug level
                 if "MSG" in msg_text:
-                    # Extract subject from MSG line
-                    if "/ld/eq/" in msg_text:
-                        logger.info(f"📥 Market data message received: {msg_size} bytes")
-                        # Check specifically for exchange and type
-                        if "/ld/eq/nse/price" in msg_text:
-                            logger.info("   ✅ NSE LTP message detected")
-                        elif "/ld/eq/nse/book" in msg_text:
-                            logger.info("   ✅ NSE DEPTH message detected")
-                        elif "/ld/eq/bse/price" in msg_text:
-                            logger.info("   🔴 BSE LTP message detected!")
-                        elif "/ld/eq/bse/book" in msg_text:
-                            logger.info("   🔴 BSE DEPTH message detected!")
-                        logger.info(f"   First 100 chars: {msg_text[:100]}")
-                    # Also check for any BSE-related content
-                    elif "bse" in msg_text.lower() or "532540" in msg_text:
-                        logger.info(f"⚠️ Possible BSE-related message: {msg_size} bytes")
-                        logger.info(f"   Content preview: {msg_text[:200]}")
-                    # Check for F&O content
-                    elif "/ld/fo/" in msg_text or "FNO" in msg_text or "53892" in msg_text:
-                        logger.info(f"📈 Possible F&O message detected: {msg_size} bytes")
-                        logger.info(f"   Content preview: {msg_text[:200]}")
-                        if "/ld/fo/nse/book" in msg_text:
-                            logger.info("   ✅ NFO DEPTH message confirmed!")
-                        elif "/ld/fo/nse/price" in msg_text:
-                            logger.info("   ✅ NFO LTP message confirmed!")
-                    # Log ANY message if we're monitoring BSE
-                    elif hasattr(self, "monitoring_bse") and self.monitoring_bse:
-                        logger.info(
-                            f"🔍 Message after BSE sub: {msg_size} bytes, starts with: {msg_text[:30]}"
-                        )
+                    logger.debug(f"Market data message received: {msg_size} bytes, preview: {msg_text[:80]}")
                 else:
-                    # Log INFO messages specially
                     if msg_text.startswith("INFO"):
-                        logger.info(
-                            f"📥 Received INFO message: {msg_size} bytes (BSE=501, NSE=499 expected)"
-                        )
+                        logger.info(f"Received INFO message: {msg_size} bytes")
                     else:
-                        logger.info(f"📥 Received BINARY message: {msg_size} bytes")
-                    logger.info(
-                        f"   First 50 bytes (hex): {message[:50].hex() if len(message) > 0 else 'empty'}"
-                    )
+                        logger.debug(f"Received BINARY message: {msg_size} bytes")
 
                 # Parse binary NATS message directly
                 self._process_binary_nats_message(message)
             else:
-                logger.info(f"📥 Received TEXT message: {len(message)} chars")
+                logger.debug(f"Received TEXT message: {len(message)} chars")
 
                 # Parse text message
                 if self.nats_protocol:
@@ -465,9 +535,7 @@ class GrowwNATSWebSocket:
                 else:
                     logger.error("NATS protocol handler not initialized")
                     messages = []
-                logger.info(f"Parsed {len(messages)} NATS messages")
                 for msg in messages:
-                    logger.info(f"Processing NATS message type: {msg.get('type')}")
                     self._process_nats_message(msg)
 
         except Exception as e:
@@ -487,8 +555,13 @@ class GrowwNATSWebSocket:
                 self.server_nonce = server_info["nonce"]
                 logger.debug(f"Server nonce: {self.server_nonce}")
 
-            # Always send CONNECT after INFO (Groww always requires auth)
-            self._send_connect_with_signature()
+            # Only the first INFO of a connection is the handshake. The server
+            # sends another INFO after CONNECT; answering it with a second
+            # CONNECT makes Groww reject the connection with
+            # "-ERR 'maximum subscriptions exceeded'" (nats.py also ignores it).
+            if not self.connect_sent:
+                self.connect_sent = True
+                self._send_connect_with_signature()
 
         elif msg_type == "OK":
             logger.info("NATS: +OK received - Authentication successful")
@@ -510,17 +583,18 @@ class GrowwNATSWebSocket:
             # Respond with PONG
             if self.nats_protocol:
                 self.ws.send(self.nats_protocol.create_pong())
-                logger.info("🏓 Received PING from server, sent PONG")
+                logger.debug("Received PING from server, sent PONG")
             else:
                 logger.error("Cannot send PONG - NATS protocol handler not initialized")
 
         elif msg_type == "PONG":
-            logger.info("✅ Received PONG from server - Connection alive")
+            logger.debug("Received PONG from server - Connection alive")
+            # A PONG means the server accepted CONNECT; reset the backoff
+            self.reconnect_attempts = 0
 
         elif msg_type == "MSG":
-            # Market data message
-            logger.info(
-                f"📊 Processing MSG - Subject: {msg.get('subject')}, SID: {msg.get('sid')}, Size: {msg.get('size')} bytes"
+            logger.debug(
+                f"Processing MSG - Subject: {msg.get('subject')}, SID: {msg.get('sid')}, Size: {msg.get('size')} bytes"
             )
             self._process_market_data_msg(msg)
 
@@ -534,16 +608,10 @@ class GrowwNATSWebSocket:
         logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
         self.connected = False
         self.authenticated = False
-
-        # Only attempt reconnection if still running (not manually disconnected)
-        if self.running:
-            logger.info("Attempting to reconnect...")
-            time.sleep(5)
-            try:
-                self._run_websocket()
-            except Exception as e:
-                logger.error(f"Reconnection failed: {e}")
-        else:
+        if self._conn_closed:
+            self._conn_closed.set()
+        # Reconnect is driven by the loop in _run_websocket, not from here
+        if not self.running:
             logger.info("WebSocket closed gracefully - not reconnecting as running=False")
 
     def _process_market_data_msg(self, msg: dict[str, Any]):
@@ -553,13 +621,7 @@ class GrowwNATSWebSocket:
             payload = msg.get("payload", b"")
             sid = msg.get("sid")
 
-            # Enhanced logging for BSE
-            is_bse = "bse" in subject.lower()
-
-            logger.info(f"📈 Market Data MSG Details{' (BSE)' if is_bse else ''}:")
-            logger.info(f"   Subject: {subject}")
-            logger.info(f"   SID: {sid}")
-            logger.info(f"   Payload size: {len(payload)} bytes")
+            logger.debug(f"Market Data MSG: Subject={subject}, SID={sid}, Payload={len(payload)} bytes")
 
             # Ensure payload is bytes
             if isinstance(payload, str):
@@ -570,18 +632,9 @@ class GrowwNATSWebSocket:
                 logger.error(f"Unexpected payload type: {type(payload)}")
                 return
 
-            # Log payload hex for debugging
-            if payload:
-                logger.info(
-                    f"   Payload (hex): {payload[:50].hex()}..."
-                    if len(payload) > 50
-                    else f"   Payload (hex): {payload.hex()}"
-                )
-
-            # Try to parse as protobuf
-            logger.info(f"Parsing protobuf data{' for BSE' if is_bse else ''}...")
+            # Parse protobuf payload
             market_data = groww_protobuf.parse_groww_market_data(payload)
-            logger.info(f"✅ Parsed market data{' (BSE)' if is_bse else ''}: {market_data}")
+            logger.debug(f"Parsed market data: {market_data}")
 
             # Find matching subscription
             found_subscription = False
@@ -592,15 +645,15 @@ class GrowwNATSWebSocket:
                     sub_sid = self.nats_sids[sub_key]
                     if str(sub_sid) == str(sid):
                         found_subscription = True
-                        logger.info(f"✅ Matched subscription by SID: {sub_key}")
+                        logger.debug(f"Matched subscription by SID: {sub_key}")
 
                         # Add subscription info to market data
                         market_data["symbol"] = sub_info["symbol"]
-                        # For index mode, exchange might be NSE_INDEX/BSE_INDEX, normalize to NSE/BSE for matching
-                        if sub_info["mode"] == "index" and "_INDEX" in sub_info["exchange"]:
-                            market_data["exchange"] = sub_info["exchange"].replace("_INDEX", "")
-                        else:
-                            market_data["exchange"] = sub_info["exchange"]
+                        # Keep the OpenAlgo exchange (NSE_INDEX/BSE_INDEX) as-is:
+                        # mode is sent numerically (1), so the adapter matches
+                        # on sub["exchange"] == exchange. Stripping _INDEX here
+                        # made index ticks match no subscription.
+                        market_data["exchange"] = sub_info["exchange"]
 
                         # CRITICAL FIX: Use numeric mode for proper adapter processing
                         if "numeric_mode" in sub_info:
@@ -614,7 +667,7 @@ class GrowwNATSWebSocket:
                         market_data["string_mode"] = sub_info["mode"]
                         market_data["original_exchange"] = sub_info["exchange"]
 
-                        logger.info(f"🚀 Sending market data to callback: {market_data}")
+                        logger.debug(f"Sending market data to callback: {market_data}")
 
                         # Call data callback
                         if self.on_data:
@@ -638,19 +691,14 @@ class GrowwNATSWebSocket:
                                 mode_type == "depth" and sub_info["mode"] == "depth"
                             ):
                                 found_subscription = True
-                                logger.info(f"✅ Matched subscription by token pattern: {sub_key}")
+                                logger.debug(f"Matched subscription by token pattern: {sub_key}")
 
                                 # Update the SID mapping for future use
                                 self.nats_sids[sub_key] = str(sid)
 
                                 # Add subscription info to market data
                                 market_data["symbol"] = sub_info["symbol"]
-                                if sub_info["mode"] == "index" and "_INDEX" in sub_info["exchange"]:
-                                    market_data["exchange"] = sub_info["exchange"].replace(
-                                        "_INDEX", ""
-                                    )
-                                else:
-                                    market_data["exchange"] = sub_info["exchange"]
+                                market_data["exchange"] = sub_info["exchange"]
 
                                 if "numeric_mode" in sub_info:
                                     market_data["mode"] = sub_info["numeric_mode"]
@@ -661,30 +709,30 @@ class GrowwNATSWebSocket:
                                 market_data["string_mode"] = sub_info["mode"]
                                 market_data["original_exchange"] = sub_info["exchange"]
 
-                                logger.info(f"🚀 Sending market data to callback: {market_data}")
+                                logger.debug(f"Sending market data to callback: {market_data}")
 
                                 if self.on_data:
                                     self.on_data(market_data)
                                 break
 
             if not found_subscription:
-                logger.warning(f"⚠️ No matching subscription found for SID: {sid}")
-                logger.info(f"   Active SIDs: {self.nats_sids}")
-                logger.info(f"   Subject: {subject}")
+                logger.debug(f"No matching subscription for SID: {sid}, subject: {subject}")
 
         except Exception as e:
             logger.error(f"Error processing market data: {e}", exc_info=True)
 
     def _resubscribe_all(self):
-        """Resubscribe to all pending subscriptions"""
+        """Resubscribe to all pending subscriptions in a single batch."""
         # Clear old SIDs as they are no longer valid after reconnection/re-auth
         logger.info(
             f"Clearing old SIDs and resubscribing to {len(self.subscriptions)} subscriptions"
         )
         self.nats_sids.clear()
 
-        for sub_key, sub_info in self.subscriptions.items():
-            self._send_nats_subscription(sub_key, sub_info)
+        sub_list = list(self.subscriptions.items())
+        if sub_list:
+            # One PING + 100ms flush instead of N × 100ms
+            self._send_nats_subscriptions_batch(sub_list)
 
     def _send_nats_subscription(self, sub_key: str, sub_info: dict):
         """Send NATS SUB command for subscription"""
@@ -695,7 +743,7 @@ class GrowwNATSWebSocket:
                 return
 
             topic = self.nats_protocol.format_topic_for_groww(
-                exchange=sub_info.get("exchange", ""),
+                exchange=sub_info.get("groww_exchange") or sub_info.get("exchange", ""),
                 segment=sub_info.get("segment", ""),
                 token=sub_info.get("exchange_token", ""),
                 mode=sub_info.get("mode", "ltp"),
@@ -709,11 +757,10 @@ class GrowwNATSWebSocket:
             self.nats_sids[sub_key] = sid
 
             logger.info(f"Sent NATS SUB for {topic} with SID {sid}")
-            logger.info(f"Current nats_sids mapping: {self.nats_sids}")
+            logger.debug(f"Current nats_sids mapping: {self.nats_sids}")
 
-            # Send a PING to flush ALL subscriptions (similar to official SDK's flush)
-            # This ensures the server processes the subscription before continuing
-            logger.info("Sending PING to flush subscription")
+            # Send a PING to flush subscription
+            logger.debug("Sending PING to flush subscription")
             self.ws.send(self.nats_protocol.create_ping())
 
             # Wait briefly for PONG to ensure subscription is processed
@@ -723,6 +770,132 @@ class GrowwNATSWebSocket:
 
         except Exception as e:
             logger.error(f"Failed to send NATS subscription: {e}")
+
+    def subscribe_batch(self, batch_specs: list[dict]) -> list[str]:
+        """
+        Subscribe to multiple symbols in a single batch.
+
+        Sends every NATS SUB command back-to-back and issues only one PING + flush
+        wait at the end, instead of paying the per-subscription PING/sleep cost.
+
+        Args:
+            batch_specs: list of dicts with keys:
+                type ('ltp'|'depth'), exchange, segment, token,
+                symbol (optional), instrumenttype (optional)
+
+        Returns:
+            list of sub_keys, in the same order as batch_specs.
+        """
+        sub_keys: list[str] = []
+        pending_to_send: list[tuple[str, dict]] = []
+
+        for spec in batch_specs:
+            sub_type = spec.get("type", "ltp")
+            exchange = spec.get("exchange", "")
+            segment = spec.get("segment", "")
+            token = spec.get("token", "")
+            symbol = spec.get("symbol")
+            instrumenttype = spec.get("instrumenttype")
+            # OpenAlgo-facing exchange (NFO/BFO/NSE_INDEX/...) for dispatch
+            # back to the adapter; falls back to the broker-side `exchange`
+            # arg (NSE/BSE) when not provided. The topic generator still
+            # needs the broker-side exchange.
+            openalgo_exchange = spec.get("openalgo_exchange") or exchange
+            # `exchange` is the broker-side NSE/BSE here, so index detection
+            # must look at the OpenAlgo exchange (NSE_INDEX/BSE_INDEX).
+            is_index = instrumenttype == "INDEX" or "INDEX" in str(openalgo_exchange).upper()
+
+            # Indices don't have depth — redirect to LTP, mirroring subscribe_depth
+            if sub_type == "depth" and is_index:
+                logger.warning(
+                    f"INDEX detected: {symbol} - Indices don't have depth data. Redirecting to LTP subscription."
+                )
+                sub_type = "ltp"
+
+            # Optional sub_key override — used by the adapter for "shadow"
+            # LTP subs paired with a depth sub on the same token. The shadow
+            # needs its own NATS SID even though the topic is identical to
+            # an existing/future real LTP sub, otherwise the SID stored in
+            # nats_sids[sub_key] gets overwritten and the older SID leaks.
+            sub_key = spec.get("sub_key")
+            if sub_type == "depth":
+                if not sub_key:
+                    sub_key = f"depth_{exchange}_{segment}_{token}"
+                self.subscriptions[sub_key] = {
+                    "symbol": symbol if symbol else f"{token}",
+                    "exchange": openalgo_exchange,
+                    "groww_exchange": exchange,
+                    "segment": segment,
+                    "exchange_token": token,
+                    "mode": "depth",
+                    "numeric_mode": 3,
+                    "instrumenttype": instrumenttype,
+                }
+            else:
+                if not sub_key:
+                    sub_key = f"ltp_{exchange}_{segment}_{token}"
+                self.subscriptions[sub_key] = {
+                    "symbol": symbol if symbol else f"{token}",
+                    "exchange": openalgo_exchange,
+                    "groww_exchange": exchange,
+                    "segment": segment,
+                    "exchange_token": token,
+                    # "index" routes to /ld/indices/{exch}/price.{token},
+                    # matching growwapi FeedConstants.get_live_index_topic.
+                    # Indices are not published on /ld/eq/... at all.
+                    "mode": "index" if is_index else "ltp",
+                    "numeric_mode": 1,
+                    "instrumenttype": instrumenttype,
+                }
+
+            sub_keys.append(sub_key)
+
+            if self.connected:
+                pending_to_send.append((sub_key, self.subscriptions[sub_key]))
+
+        if pending_to_send:
+            self._send_nats_subscriptions_batch(pending_to_send)
+
+        return sub_keys
+
+    def _send_nats_subscriptions_batch(self, sub_list: list[tuple[str, dict]]) -> None:
+        """Send multiple NATS SUB commands followed by a single PING + flush wait."""
+        if not self.nats_protocol or not self.ws:
+            logger.error("NATS protocol handler or websocket not initialized")
+            return
+
+        sent_count = 0
+        for sub_key, sub_info in sub_list:
+            try:
+                # Prefer the broker-side exchange for topic generation; fall
+                # back to `exchange` for callers that don't provide it
+                # separately (legacy paths). sub_info["exchange"] is now the
+                # OpenAlgo exchange used for dispatch, not the Groww one.
+                topic = self.nats_protocol.format_topic_for_groww(
+                    exchange=sub_info.get("groww_exchange") or sub_info.get("exchange", ""),
+                    segment=sub_info.get("segment", ""),
+                    token=sub_info.get("exchange_token", ""),
+                    mode=sub_info.get("mode", "ltp"),
+                )
+
+                sid, sub_cmd = self.nats_protocol.create_subscribe(topic)
+                self.ws.send(sub_cmd)
+                self.nats_sids[sub_key] = sid
+                sent_count += 1
+                logger.debug(f"Batch SUB queued: {topic} sid={sid}")
+            except Exception as e:
+                logger.error(f"Failed to queue batch SUB for {sub_key}: {e}")
+
+        if sent_count == 0:
+            return
+
+        try:
+            self.ws.send(self.nats_protocol.create_ping())
+            logger.info(f"Sent batch of {sent_count} SUB commands followed by PING")
+            # Single flush wait for the whole batch (matches per-sub 100ms in non-batch path)
+            time.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Failed to send batch PING: {e}")
 
     def subscribe_ltp(
         self,
@@ -744,14 +917,8 @@ class GrowwNATSWebSocket:
         """
         sub_key = f"ltp_{exchange}_{segment}_{token}"
 
-        # Enhanced logging for BSE subscriptions
         if "BSE" in exchange.upper():
-            logger.info("🔴 BSE LTP Subscription Request:")
-            logger.info(f"   Exchange: {exchange}")
-            logger.info(f"   Segment: {segment}")
-            logger.info(f"   Token: {token}")
-            logger.info(f"   Symbol: {symbol}")
-            logger.info(f"   InstrumentType: {instrumenttype}")
+            logger.debug(f"BSE LTP Subscription: exchange={exchange}, segment={segment}, token={token}, symbol={symbol}")
 
         # Determine mode based on whether it's an index
         # IMPORTANT: Only treat as index if exchange contains 'INDEX'
@@ -769,8 +936,6 @@ class GrowwNATSWebSocket:
         else:
             mode = "ltp"
 
-        # Store subscription info - CRITICAL FIX: Set correct mode for LTP
-        mode = "ltp"  # This function is for LTP subscriptions
         self.subscriptions[sub_key] = {
             "symbol": symbol if symbol else f"{token}",  # Use actual symbol if provided
             "exchange": exchange,
@@ -785,23 +950,11 @@ class GrowwNATSWebSocket:
         if self.connected:
             self._send_nats_subscription(sub_key, self.subscriptions[sub_key])
 
-            # Special logging for BSE subscriptions
             if "BSE" in exchange.upper():
-                logger.info(
-                    f"🔴 BSE subscription sent for {symbol}, waiting for market data MSG..."
-                )
-                logger.info(f"   Subscription key: {sub_key}")
-                logger.info(f"   Active SIDs: {list(self.nats_sids.keys())}")
-                logger.warning("⚠️ NOTE: Monitoring ALL messages after BSE subscription...")
-                # Set flag to monitor messages
-                self.monitoring_bse = True
+                logger.debug(f"BSE subscription sent for {symbol}, key: {sub_key}")
 
-            # Special logging for F&O subscriptions
             if segment.upper() == "FNO":
-                logger.info(f"📈 F&O LTP subscription sent for {symbol}")
-                logger.info(f"   Exchange: {exchange}, Segment: {segment}")
-                logger.info(f"   Topic subscribed: /ld/fo/{exchange.lower()}/price.{token}")
-                self.monitoring_fo = True
+                logger.debug(f"F&O LTP subscription sent for {symbol}, exchange={exchange}, segment={segment}")
 
         return sub_key
 
@@ -826,21 +979,15 @@ class GrowwNATSWebSocket:
         # Check if this is an index - indices don't have depth, only LTP
         if instrumenttype == "INDEX" or "INDEX" in exchange.upper():
             logger.warning(
-                f"⚠️ INDEX detected: {symbol} - Indices don't have depth data. Redirecting to LTP subscription."
+                f"INDEX detected: {symbol} - Indices don't have depth data. Redirecting to LTP subscription."
             )
             # Redirect to LTP subscription for indices
             return self.subscribe_ltp(exchange, segment, token, symbol, instrumenttype)
 
         sub_key = f"depth_{exchange}_{segment}_{token}"
 
-        # Enhanced logging for BSE depth subscriptions
         if "BSE" in exchange.upper():
-            logger.info("🔴 BSE DEPTH Subscription Request:")
-            logger.info(f"   Exchange: {exchange}")
-            logger.info(f"   Segment: {segment}")
-            logger.info(f"   Token: {token}")
-            logger.info(f"   Symbol: {symbol}")
-            logger.info(f"   InstrumentType: {instrumenttype}")
+            logger.debug(f"BSE DEPTH Subscription: exchange={exchange}, segment={segment}, token={token}, symbol={symbol}")
 
         # Store subscription info - CRITICAL FIX: Add numeric mode for depth
         self.subscriptions[sub_key] = {
@@ -857,21 +1004,11 @@ class GrowwNATSWebSocket:
         if self.connected:
             self._send_nats_subscription(sub_key, self.subscriptions[sub_key])
 
-            # Special logging for BSE depth subscriptions
             if "BSE" in exchange.upper():
-                logger.info(
-                    f"🔴 BSE DEPTH subscription sent for {symbol}, waiting for depth data MSG..."
-                )
-                logger.info(f"   Subscription key: {sub_key}")
-                logger.info(f"   Active SIDs: {list(self.nats_sids.keys())}")
+                logger.debug(f"BSE DEPTH subscription sent for {symbol}, key: {sub_key}")
 
-            # Special logging for F&O subscriptions
             if segment.upper() == "FNO":
-                logger.info(f"📈 F&O DEPTH subscription sent for {symbol}")
-                logger.info(f"   Exchange: {exchange}, Segment: {segment}")
-                logger.info(f"   Topic subscribed: {self.subscriptions[sub_key]}")
-                logger.info("   Monitoring for F&O depth messages...")
-                self.monitoring_fo = True
+                logger.debug(f"F&O DEPTH subscription sent for {symbol}, exchange={exchange}, segment={segment}")
 
         return sub_key
 
@@ -904,12 +1041,12 @@ class GrowwNATSWebSocket:
         """
         Unsubscribe from all subscriptions and disconnect completely from server
         """
-        logger.info("🧹 Starting complete unsubscribe and disconnect sequence...")
+        logger.info("Starting complete unsubscribe and disconnect sequence...")
 
         # Step 1: Unsubscribe from all active subscriptions
         unsubscribed_count = 0
         if self.subscriptions:
-            logger.info(f"📤 Unsubscribing from {len(self.subscriptions)} active subscriptions...")
+            logger.info(f"Unsubscribing from {len(self.subscriptions)} active subscriptions...")
 
             for sub_key in list(self.subscriptions.keys()):
                 try:
@@ -918,18 +1055,17 @@ class GrowwNATSWebSocket:
                 except Exception as e:
                     logger.error(f"Error unsubscribing {sub_key}: {e}")
 
-            logger.info(f"✅ Unsubscribed from {unsubscribed_count} subscriptions")
+            logger.info(f"Unsubscribed from {unsubscribed_count} subscriptions")
 
         # Step 2: Send additional NATS cleanup commands
         if self.connected and self.ws and self.nats_protocol:
             try:
-                # Send NATS UNSUB for any remaining SIDs
-                logger.info("🔧 Sending cleanup UNSUB commands to server...")
+                logger.debug("Sending cleanup UNSUB commands to server...")
                 for i in range(1, 50):  # Clear up to 50 possible SIDs
                     try:
                         unsub_cmd = self.nats_protocol.create_unsubscribe(str(i))
                         self.ws.send(unsub_cmd)
-                    except:
+                    except Exception:
                         break
 
                 # Give server time to process unsubscribes
@@ -937,34 +1073,37 @@ class GrowwNATSWebSocket:
 
                 time.sleep(1)
 
-                logger.info("✅ Server cleanup commands sent")
+                logger.debug("Server cleanup commands sent")
             except Exception as e:
-                logger.warning(f"⚠️ Server cleanup warning: {e}")
+                logger.warning(f"Server cleanup warning: {e}")
 
         # Step 3: Disconnect WebSocket
         self.disconnect()
 
-        logger.info("🏁 Complete unsubscribe and disconnect sequence finished")
+        logger.info("Complete unsubscribe and disconnect sequence finished")
 
     def disconnect(self):
         """Disconnect from WebSocket with enhanced cleanup"""
-        logger.info("🔌 Disconnecting from Groww WebSocket...")
+        logger.info("Disconnecting from Groww WebSocket...")
 
         # Set disconnect flags first (similar to Angel's approach)
         self.running = False
+        self._stop_event.set()  # Wake the reconnect loop if it is waiting
+        if self._conn_closed:
+            self._conn_closed.set()  # Stop this connection's helper threads
         self.connected = False  # Set this immediately to stop ping thread
         self.authenticated = False  # Reset authentication status
 
         # Send NATS cleanup commands before closing if still connected
         if self.ws and self.nats_protocol:
             try:
-                logger.info("📡 Sending final UNSUB commands to server...")
+                logger.debug("Sending final UNSUB commands to server...")
                 # Send UNSUB commands for any remaining subscriptions
                 for sid in list(self.nats_sids.values()):
                     try:
                         unsub_cmd = self.nats_protocol.create_unsubscribe(str(sid))
                         self.ws.send(unsub_cmd)
-                    except:
+                    except Exception:
                         pass
 
                 # Brief delay for server to process
@@ -976,20 +1115,19 @@ class GrowwNATSWebSocket:
 
         if self.ws:
             try:
-                logger.info("🔗 Closing WebSocket connection...")
-                # Force close the WebSocket connection
-                self.ws.keep_running = False  # Tell WebSocketApp to stop
+                logger.debug("Closing WebSocket connection...")
+                self.ws.keep_running = False
                 self.ws.close()
-                logger.info("✅ WebSocket closed")
+                logger.debug("WebSocket closed")
                 self.ws = None  # Clear the WebSocket reference
             except Exception as e:
                 logger.error(f"Error closing WebSocket: {e}")
 
         if self.ws_thread:
-            logger.info("⏳ Waiting for WebSocket thread to finish...")
+            logger.debug("Waiting for WebSocket thread to finish...")
             self.ws_thread.join(timeout=5)
             if self.ws_thread.is_alive():
-                logger.warning("⚠️ WebSocket thread did not finish gracefully")
+                logger.warning("WebSocket thread did not finish gracefully")
 
         # Clear all state for clean reconnection
         self.connected = False
@@ -1003,7 +1141,7 @@ class GrowwNATSWebSocket:
         self.ws = None
         self.ws_thread = None
 
-        logger.info("✅ Groww WebSocket disconnected and all resources cleared")
+        logger.info("Groww WebSocket disconnected and all resources cleared")
         self.subscription_id = None
 
         logger.info("Disconnected from Groww WebSocket and cleared state")

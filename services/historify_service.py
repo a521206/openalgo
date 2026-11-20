@@ -41,39 +41,85 @@ from database.historify_db import bulk_delete_market_data as db_bulk_delete_mark
 from database.token_db_enhanced import get_symbol_info
 from services.history_service import get_history
 from services.intervals_service import get_intervals
+from utils.constants import FNO_EXCHANGES as _CENTRAL_FNO_EXCHANGES
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-def validate_symbol(symbol: str, exchange: str) -> tuple[bool, str]:
+# Characters a list copied from elsewhere may carry as an underscore:
+# TradingView's symbol for NSE BAJAJ-AUTO is NSE:BAJAJ_AUTO, and its chart
+# links write M&M as M_M. A Zerodha master contract checked on 2026-11-17 held
+# no NSE or BSE symbol containing an underscore.
+_UNDERSCORE_STANDS_FOR = ("-", "&")
+
+# Each underscore doubles the lookups. Real symbols carry one or two.
+_MAX_UNDERSCORES_TO_RESOLVE = 4
+
+
+def _underscore_candidates(symbol: str) -> list[str]:
+    """Every spelling of ``symbol`` with each underscore read as - or &."""
+    candidates = [""]
+    for char in symbol:
+        if char == "_":
+            candidates = [c + sub for c in candidates for sub in _UNDERSCORE_STANDS_FOR]
+        else:
+            candidates = [c + char for c in candidates]
+    return candidates
+
+
+def resolve_symbol(symbol: str, exchange: str) -> tuple[str | None, str]:
     """
-    Validate that a symbol exists in the master contract database.
+    Find the master contract symbol a trader means.
+
+    The symbol as written wins. Only when it is not in the master contract and
+    contains an underscore is each underscore read as - or &, and the spelling
+    is accepted only if exactly one reading exists (BAJAJ_AUTO as BAJAJ-AUTO).
+    Two possible symbols are refused rather than guessed between.
 
     Args:
-        symbol: Trading symbol
+        symbol: Trading symbol as entered
         exchange: Exchange code
 
     Returns:
-        Tuple of (is_valid, error_message)
+        Tuple of (resolved_symbol, error_message). resolved_symbol is None when
+        the symbol cannot be added.
     """
+    symbol = symbol.upper()
+    exchange = exchange.upper()
+
     # Index exchanges don't need validation against master contract
-    if exchange.upper() in ("NSE_INDEX", "BSE_INDEX"):
-        return True, ""
+    if exchange in ("NSE_INDEX", "BSE_INDEX"):
+        return symbol, ""
 
     try:
-        symbol_info = get_symbol_info(symbol.upper(), exchange.upper())
-        if symbol_info is None:
-            return (
-                False,
-                f"Symbol '{symbol}' not found in {exchange} master contract. Please check the symbol name.",
-            )
-        return True, ""
+        if get_symbol_info(symbol, exchange) is not None:
+            return symbol, ""
+
+        if 0 < symbol.count("_") <= _MAX_UNDERSCORES_TO_RESOLVE:
+            matches = [
+                candidate
+                for candidate in _underscore_candidates(symbol)
+                if get_symbol_info(candidate, exchange) is not None
+            ]
+            if len(matches) == 1:
+                return matches[0], ""
+            if len(matches) > 1:
+                return (
+                    None,
+                    f"Symbol '{symbol}' could be {' or '.join(matches)} on {exchange}. "
+                    "Enter the exact symbol.",
+                )
+
+        return (
+            None,
+            f"Symbol '{symbol}' not found in {exchange} master contract. Please check the symbol name.",
+        )
     except Exception as e:
         logger.warning(f"Could not validate symbol {symbol}:{exchange}: {e}")
         # If validation fails due to cache/db issues, allow the symbol
         # (it will fail during download if truly invalid)
-        return True, ""
+        return symbol, ""
 
 
 # =============================================================================
@@ -125,11 +171,11 @@ def add_to_watchlist(
             )
 
         # Validate symbol exists in master contract database
-        is_valid, error_msg = validate_symbol(symbol, exchange)
-        if not is_valid:
+        resolved, error_msg = resolve_symbol(symbol, exchange)
+        if resolved is None:
             return False, {"status": "error", "message": error_msg}, 400
 
-        success, msg = db_add_to_watchlist(symbol, exchange, display_name)
+        success, msg = db_add_to_watchlist(resolved, exchange, display_name)
 
         if success:
             return True, {"status": "success", "message": msg}, 200
@@ -225,6 +271,7 @@ def bulk_add_to_watchlist(symbols: list[dict[str, str]]) -> tuple[bool, dict[str
         # Validate symbols before bulk insert
         validated_symbols = []
         invalid_symbols = []
+        renamed = []
 
         for item in symbols:
             symbol = item.get("symbol", "").upper()
@@ -247,15 +294,30 @@ def bulk_add_to_watchlist(symbols: list[dict[str, str]]) -> tuple[bool, dict[str
                 continue
 
             # Validate symbol exists in master contract
-            is_valid, error_msg = validate_symbol(symbol, exchange)
-            if not is_valid:
+            resolved, error_msg = resolve_symbol(symbol, exchange)
+            if resolved is None:
                 invalid_symbols.append({"symbol": symbol, "exchange": exchange, "error": error_msg})
                 continue
 
-            validated_symbols.append(item)
+            if resolved != symbol:
+                renamed.append({"from": symbol, "to": resolved, "exchange": exchange})
+
+            validated_symbols.append({**item, "symbol": resolved, "exchange": exchange})
 
         # Use bulk insert for validated symbols
         added, skipped, failed = db_bulk_add_to_watchlist(validated_symbols)
+
+        # The database layer reports a failed write as one "batch" entry:
+        # nothing was saved, so say so instead of listing a symbol named batch.
+        if any(f.get("symbol") == "batch" for f in failed):
+            return (
+                False,
+                {
+                    "status": "error",
+                    "message": "The watchlist could not be saved. Please try again.",
+                },
+                500,
+            )
 
         # Add invalid symbols to failed list
         failed.extend(invalid_symbols)
@@ -267,6 +329,7 @@ def bulk_add_to_watchlist(symbols: list[dict[str, str]]) -> tuple[bool, dict[str
                 "added": added,
                 "skipped": skipped,
                 "failed": failed,
+                "renamed": renamed,
                 "total": len(symbols),
             },
             200,
@@ -325,6 +388,7 @@ def download_data(
             start_date=start_date,
             end_date=end_date,
             api_key=api_key,
+            background=True,
         )
 
         if not success:
@@ -1035,8 +1099,9 @@ def upload_parquet_data(
 # FNO Discovery Operations
 # =============================================================================
 
-# FNO Exchanges for derivatives
-FNO_EXCHANGES = ["NFO", "BFO", "MCX", "CDS"]
+# FNO Exchanges for derivatives — sourced from utils.constants so adding a new
+# F&O exchange (e.g. NCO) is a single-place change.
+FNO_EXCHANGES = sorted(_CENTRAL_FNO_EXCHANGES)
 
 
 def get_fno_underlyings(exchange: str = None) -> tuple[bool, dict[str, Any], int]:
@@ -1305,9 +1370,30 @@ _job_executor = ThreadPoolExecutor(max_workers=int(os.getenv("HISTORIFY_MAX_WORK
 # Track running jobs for cancellation and pause state
 _running_jobs: dict[str, bool] = {}
 _paused_jobs: dict[str, threading.Event] = {}  # Event is set when NOT paused
+# A pause/resume status write happens outside _job_state_lock. The processor
+# waits for that write before claiming completion, and cancel waits before
+# writing cancelled, so an older control request cannot overwrite either.
+_job_status_writes: dict[str, threading.Event] = {}
 
-# Lock for thread-safe access to job state dictionaries
+# Lock for thread-safe access to job state dictionaries. Not reentrant: nothing
+# that holds it may call a function that takes it again (_cleanup_job does).
 _job_state_lock = threading.Lock()
+
+#: What a retry of a download that still has a processor running is told.
+RETRY_BUSY_MESSAGE = (
+    "This download is already running. Wait for it to finish, then retry the failed symbols."
+)
+
+
+def stop_all_download_jobs() -> None:
+    """Wake every worker so a graceful shutdown never waits on a paused job."""
+    with _job_state_lock:
+        running = list(_running_jobs)
+        for job_id in running:
+            _running_jobs[job_id] = False
+            event = _paused_jobs.get(job_id)
+            if event:
+                event.set()
 
 
 def cleanup_zombie_jobs():
@@ -1405,8 +1491,14 @@ def create_and_start_job(
             _paused_jobs[job_id] = threading.Event()
             _paused_jobs[job_id].set()  # Not paused initially
 
-        # Start background processing
-        _job_executor.submit(_process_download_job, job_id, api_key)
+        # A failed submit (for example while Python is shutting executors
+        # down) must not strand the in-memory claim forever.
+        try:
+            _job_executor.submit(_process_download_job, job_id, api_key)
+        except Exception:
+            _cleanup_job(job_id)
+            update_job_status(job_id, "failed", "Could not start background download")
+            raise
 
         return (
             True,
@@ -1448,11 +1540,15 @@ def _process_download_job(job_id: str, api_key: str):
         upsert_symbol_metadata,
     )
 
+    config = {}
+    completed = failed = total_items = 0
+    final_status = "failed"
     try:
         # Get job details
         job = get_download_job(job_id)
         if not job:
             logger.error(f"Job {job_id} not found")
+            _cleanup_job(job_id)
             return
 
         # Update status to running
@@ -1463,19 +1559,19 @@ def _process_download_job(job_id: str, api_key: str):
         if not items:
             logger.error(f"No items found for job {job_id}")
             update_job_status(job_id, "failed", "No items to process")
+            _cleanup_job(job_id)
             return
 
         # Filter to only pending items (for checkpoint resume)
         pending_items = [item for item in items if item["status"] in ("pending", "downloading")]
 
         # Parse config for incremental flag
-        config = {}
         if job.get("config"):
             try:
                 config = (
                     json.loads(job["config"]) if isinstance(job["config"], str) else job["config"]
                 )
-            except:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 config = {}
 
         incremental = config.get("incremental", False)
@@ -1502,6 +1598,7 @@ def _process_download_job(job_id: str, api_key: str):
             if is_cancelled:
                 logger.info(f"Job {job_id} cancelled")
                 update_job_status(job_id, "cancelled")
+                final_status = "cancelled"
                 _cleanup_job(job_id)
                 return
 
@@ -1518,6 +1615,7 @@ def _process_download_job(job_id: str, api_key: str):
                     if is_cancelled:
                         logger.info(f"Job {job_id} cancelled while paused")
                         update_job_status(job_id, "cancelled")
+                        final_status = "cancelled"
                         _cleanup_job(job_id)
                         return
 
@@ -1674,8 +1772,47 @@ def _process_download_job(job_id: str, api_key: str):
             logger.debug(f"Waiting {delay:.1f}s before next download...")
             time.sleep(delay)
 
+            # Batch cooldown: every 10 symbols processed in this run, add a
+            # 5-10s pause so broker long-window rate limiters (req/min) reset.
+            items_done_this_run = processed_count - already_completed - already_failed
+            if items_done_this_run > 0 and items_done_this_run % 10 == 0:
+                batch_delay = random.uniform(5, 10)
+                logger.info(
+                    f"Job {job_id}: batch cooldown after {items_done_this_run} symbols, "
+                    f"sleeping {batch_delay:.1f}s"
+                )
+                time.sleep(batch_delay)
+
         # Job completed
-        final_status = "completed" if failed == 0 else "completed_with_errors"
+        # A pause can land after the final item but before the terminal status
+        # is written. Honour it here as well as between items; otherwise the
+        # pause endpoint could write ``paused`` after this worker wrote
+        # ``completed`` (or vice versa).
+        while True:
+            with _job_state_lock:
+                pending_write = _job_status_writes.get(job_id)
+                final_pause_event = _paused_jobs.get(job_id)
+                cancelled_at_finish = not _running_jobs.get(job_id, False)
+                if not pending_write and (
+                    cancelled_at_finish or not final_pause_event or final_pause_event.is_set()
+                ):
+                    if not cancelled_at_finish:
+                        _running_jobs.pop(job_id, None)
+                        _paused_jobs.pop(job_id, None)
+                    break
+            if pending_write:
+                pending_write.wait(timeout=1.0)
+            elif final_pause_event:
+                _emit_job_paused(job_id, processed_count, total_items)
+                final_pause_event.wait(timeout=1.0)
+        # The pause state and terminal claim were checked under one lock. A
+        # pause that cleared the event first keeps this processor alive; a
+        # later pause finds no claim and cannot overwrite the terminal status.
+        final_status = (
+            "cancelled"
+            if cancelled_at_finish
+            else ("completed" if failed == 0 else "completed_with_errors")
+        )
         update_job_status(job_id, final_status)
 
         # Emit completion event
@@ -1690,6 +1827,46 @@ def _process_download_job(job_id: str, api_key: str):
         logger.exception(f"Error processing job {job_id}: {e}")
         update_job_status(job_id, "failed", str(e))
         _cleanup_job(job_id)
+    finally:
+        schedule_id = config.get("schedule_id")
+        if schedule_id:
+            try:
+                from services.historify_scheduler_service import (
+                    get_historify_scheduler,
+                    release_schedule_run,
+                )
+                from database.historify_db import (
+                    increment_schedule_run_counts,
+                    update_schedule,
+                    update_schedule_execution,
+                )
+
+                execution_id = config.get("schedule_execution_id")
+                if execution_id is not None:
+                    update_schedule_execution(
+                        execution_id,
+                        status=final_status,
+                        completed_at=datetime.now(),
+                        symbols_processed=total_items,
+                        symbols_success=completed,
+                        symbols_failed=failed,
+                    )
+                update_schedule(schedule_id, status="idle", last_run_status=final_status)
+                increment_schedule_run_counts(schedule_id, is_success=final_status == "completed")
+                scheduler = get_historify_scheduler()
+                if scheduler.socketio:
+                    scheduler.socketio.emit(
+                        "historify_schedule_execution_complete",
+                        {"schedule_id": schedule_id, "execution_id": execution_id, "status": final_status},
+                    )
+                release_schedule_run(schedule_id)
+            except Exception:
+                logger.exception("Could not finalize Historify schedule run")
+        # Executor workers are reused, so Flask teardown never releases the
+        # auth/token scoped sessions they touched.
+        from utils.db_sessions import remove_all_scoped_sessions
+
+        remove_all_scoped_sessions()
 
 
 def _cleanup_job(job_id: str):
@@ -1822,34 +1999,37 @@ def cancel_job(job_id: str) -> tuple[bool, dict[str, Any], int]:
     from database.historify_db import get_download_job, update_job_status
 
     try:
-        job = get_download_job(job_id)
-        if not job:
-            return False, {"status": "error", "message": "Job not found"}, 404
+        while True:
+            job = get_download_job(job_id)
+            if not job:
+                return False, {"status": "error", "message": "Job not found"}, 404
 
-        if job["status"] not in ("running", "paused"):
-            return (
-                False,
-                {
-                    "status": "error",
-                    "message": f"Job is not running or paused (status: {job['status']})",
-                },
-                400,
-            )
+            if job["status"] not in ("running", "paused"):
+                return (
+                    False,
+                    {
+                        "status": "error",
+                        "message": f"Job is not running or paused (status: {job['status']})",
+                    },
+                    400,
+                )
 
-        # Immediately update database status to 'cancelled'
+            with _job_state_lock:
+                pending_write = _job_status_writes.get(job_id)
+                if not pending_write:
+                    # Keep the False marker until the processor exits; a
+                    # retry must not start a second processor meanwhile.
+                    if job_id not in _running_jobs:
+                        return False, {"status": "error", "message": "Job has already finished"}, 409
+                    _running_jobs[job_id] = False
+                    pause_event = _paused_jobs.pop(job_id, None)
+                    if pause_event:
+                        pause_event.set()
+                    break
+            pending_write.wait(timeout=1.0)
+
         update_job_status(job_id, "cancelled")
         logger.info(f"Job {job_id} cancelled")
-
-        # Use lock for thread-safe state modification
-        with _job_state_lock:
-            # Signal cancellation to stop the processing thread
-            _running_jobs[job_id] = False
-            # Resume if paused so thread can exit cleanly
-            pause_event = _paused_jobs.get(job_id)
-            if pause_event:
-                pause_event.set()
-            # Clean up in-memory state
-            _cleanup_job(job_id)
 
         # Emit cancellation event to frontend
         _emit_job_cancelled(job_id)
@@ -1887,6 +2067,8 @@ def pause_job(job_id: str) -> tuple[bool, dict[str, Any], int]:
 
         # Use lock for thread-safe state modification
         with _job_state_lock:
+            if job_id in _job_status_writes:
+                return False, {"status": "error", "message": "Job status is changing"}, 409
             pause_event = _paused_jobs.get(job_id)
 
             # Check if already paused
@@ -1896,11 +2078,21 @@ def pause_job(job_id: str) -> tuple[bool, dict[str, Any], int]:
             # Signal pause (clear the event)
             if pause_event:
                 pause_event.clear()
-                update_job_status(job_id, "paused")
-                logger.info(f"Job {job_id} paused")
-                return True, {"status": "success", "message": "Job paused"}, 200
+                status_write = threading.Event()
+                _job_status_writes[job_id] = status_write
             else:
                 return False, {"status": "error", "message": "Job not found in running jobs"}, 400
+
+        # Do not hold a real state lock across DuckDB I/O: under eventlet a
+        # waiter would otherwise stall the hub while this connection writes.
+        try:
+            update_job_status(job_id, "paused")
+        finally:
+            with _job_state_lock:
+                _job_status_writes.pop(job_id, None)
+                status_write.set()
+        logger.info(f"Job {job_id} paused")
+        return True, {"status": "success", "message": "Job paused"}, 200
 
     except Exception as e:
         logger.exception(f"Error pausing job: {e}")
@@ -1933,14 +2125,24 @@ def resume_job(job_id: str) -> tuple[bool, dict[str, Any], int]:
 
         # Use lock for thread-safe state modification
         with _job_state_lock:
+            if job_id in _job_status_writes:
+                return False, {"status": "error", "message": "Job status is changing"}, 409
             pause_event = _paused_jobs.get(job_id)
             if pause_event:
-                pause_event.set()
-                update_job_status(job_id, "running")
-                logger.info(f"Job {job_id} resumed")
-                return True, {"status": "success", "message": "Job resumed"}, 200
+                status_write = threading.Event()
+                _job_status_writes[job_id] = status_write
             else:
                 return False, {"status": "error", "message": "Job not found in running jobs"}, 400
+
+        try:
+            update_job_status(job_id, "running")
+        finally:
+            with _job_state_lock:
+                pause_event.set()
+                _job_status_writes.pop(job_id, None)
+                status_write.set()
+        logger.info(f"Job {job_id} resumed")
+        return True, {"status": "success", "message": "Job resumed"}, 200
 
     except Exception as e:
         logger.exception(f"Error resuming job: {e}")
@@ -2009,23 +2211,42 @@ def retry_failed_items(job_id: str, api_key: str) -> tuple[bool, dict[str, Any],
         if not failed_items:
             return True, {"status": "success", "message": "No failed items to retry"}, 200
 
-        # Reset failed items to pending
-        from database.historify_db import update_job_item_status
-
-        for item in failed_items:
-            update_job_item_status(item["id"], "pending")
-
-        # Reset job counters
-        update_job_status(job_id, "pending")
-
-        # Mark job as running with thread-safe access
+        # Claim the job in the same hold that checks it. Two retries arriving
+        # together (a double click) both passed the status check above, and
+        # both then started a processor for the same job: every symbol
+        # downloaded twice against the broker's rate limit, with the two
+        # progress counters overwriting each other. A job still tracked here
+        # has a processor alive, running or paused, so a second one is refused;
+        # so does one cancelled a moment ago whose processor has not yet seen
+        # the cancel (its entry is False until it leaves).
         with _job_state_lock:
+            if job_id in _running_jobs:
+                return (
+                    False,
+                    {"status": "error", "message": RETRY_BUSY_MESSAGE},
+                    409,
+                )
             _running_jobs[job_id] = True
             _paused_jobs[job_id] = threading.Event()
             _paused_jobs[job_id].set()  # Not paused initially
 
-        # Start background processing
-        _job_executor.submit(_process_download_job, job_id, api_key)
+        try:
+            # Reset failed items to pending
+            from database.historify_db import update_job_item_status
+
+            for item in failed_items:
+                update_job_item_status(item["id"], "pending")
+
+            # Reset job counters
+            update_job_status(job_id, "pending")
+
+            # Start background processing
+            _job_executor.submit(_process_download_job, job_id, api_key)
+        except Exception:
+            # Nothing was started, so the claim must not outlive this call or
+            # the job could never be retried again.
+            _cleanup_job(job_id)
+            raise
 
         return (
             True,

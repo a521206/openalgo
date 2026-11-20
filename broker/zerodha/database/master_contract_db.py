@@ -4,15 +4,18 @@ import gzip
 import io
 import json
 import os
+import re
 import shutil
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from broker.zerodha.mapping.mcx_contract_size import get_contract_size
 from database.auth_db import get_auth_token
+from database.engine_factory import create_db_engine
 from extensions import socketio  # Import SocketIO
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
@@ -24,7 +27,7 @@ logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv('DATABASE_URL')  # Replace with your database path
 
-engine = create_engine(DATABASE_URL)
+engine = create_db_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -112,7 +115,7 @@ def download_csv_zerodha_data(output_path):
 
         # Process the response directly as CSV
         csv_string = response.text
-        df = pd.read_csv(io.StringIO(csv_string), low_memory=False)
+        df = pd.read_csv(io.StringIO(csv_string))
 
         # Save to output path if needed
         if output_path:
@@ -126,7 +129,7 @@ def download_csv_zerodha_data(output_path):
             if hasattr(e, 'response') and e.response is not None:
                 error_detail = e.response.json()
                 error_message = error_detail.get('message', str(e))
-        except:
+        except Exception:
             pass
 
         logger.error(f"Error downloading Zerodha instruments: {error_message}")
@@ -153,15 +156,56 @@ def reformat_symbol(row):
     return symbol
 
 
+# NSE series in which a company's own units trade outside EQ. Kite keeps the
+# series on the tradingsymbol of these (HFCL-BE, EMBASSY-RR, GOLDSTAR-ST),
+# while OpenAlgo's equity symbol is the bare exchange symbol, as NSE lists it
+# (Symbol HFCL, Series BE). The Sahi plugin strips every non-EQ series the
+# same way, and the Noren plugins strip -BE. brsymbol
+# keeps Kite's tradingsymbol unchanged: every order, quote, history and margin
+# call sends get_br_symbol(), and every book maps back with get_oa_symbol().
+# Not stripped: the debt and government security series (SG, GS, TB, N0 and
+# the like), and -RL, whose bare names exist as rows of their own.
+_NSE_SERIES_SUFFIXES = ('BE', 'BZ', 'RR', 'IV', 'SM', 'ST')
+_NSE_SERIES_RE = re.compile(r'^(.+)-(?:' + '|'.join(_NSE_SERIES_SUFFIXES) + r')$')
+
+
+def strip_nse_series_suffix(df):
+    """Give NSE cash rows traded outside the EQ series their bare symbol.
+
+    Only the OpenAlgo ``symbol`` changes; ``brsymbol`` stays Kite's
+    tradingsymbol. A row keeps its suffix when the bare name is already
+    another row's symbol, or when two suffixed rows would claim the same bare
+    name, so no two NSE rows ever share a symbol.
+    """
+    is_cash = (df['exchange'] == 'NSE') & (df['instrumenttype'] == 'EQ')
+    bases = df.loc[is_cash, 'symbol'].astype(str).str.extract(_NSE_SERIES_RE)[0]
+    suffixed = bases.notna()
+    if not suffixed.any():
+        return df
+
+    taken = set(df.loc[is_cash, 'symbol'])
+    claims = bases[suffixed].value_counts()
+    strip = suffixed & bases.map(lambda b: isinstance(b, str) and b not in taken and claims[b] == 1)
+
+    df.loc[strip[strip].index, 'symbol'] = bases[strip]
+    kept = int(suffixed.sum() - strip.sum())
+    logger.info(
+        f"NSE series suffix removed from {int(strip.sum())} symbols"
+        + (f", kept on {kept} whose bare name is already in use" if kept else "")
+    )
+    return df
+
 
 def process_zerodha_csv(path):
     """
     Processes the Zerodha CSV file to fit the existing database schema and performs exchange name mapping.
     """
     logger.info("Processing Zerodha CSV Data")
-    df = pd.read_csv(path, low_memory=False)
+    df = pd.read_csv(path)
 
     # Map exchange names
+    # Any Zerodha exchange code missing here would silently become NaN/NULL.
+    # Keep this list in sync with utils/constants.VALID_EXCHANGES.
     exchange_map = {
         "NSE": "NSE",
         "NFO": "NFO",
@@ -171,10 +215,17 @@ def process_zerodha_csv(path):
         "BSE": "BSE",
         "BFO": "BFO",
         "BCD": "BCD",
-        "MCX": "MCX"
-
+        "MCX": "MCX",
+        "NCO": "NCO",            # NSE Commodities (futures + options + underlyings)
+        "GLOBAL": "GLOBAL_INDEX",  # Zerodha global indices feed (US30, JAPAN225, HANGSENG, ...)
+        "NSEIX": "GLOBAL_INDEX",  # NSE IFSC (single GIFT NIFTY row) folded into GLOBAL_INDEX
     }
 
+    # Capture the raw Kite-side exchange code (NSE/BSE/NFO/.../GLOBAL/NSEIX)
+    # BEFORE we remap to OpenAlgo names, so brexchange retains the broker's
+    # exchange code. This matters for /quote calls which use NSE/BSE for
+    # indices and GLOBAL/NSEIX for the foreign-index feeds.
+    df['_kite_exchange'] = df['exchange']
     df['exchange'] = df['exchange'].map(exchange_map)
 
     # Update exchange names based on the instrument type
@@ -192,7 +243,7 @@ def process_zerodha_csv(path):
     # Select and rename columns
     df = df[['token', 'tradingsymbol', 'name', 'expiry',
              'strike', 'lot_size', 'instrument_type', 'exchange',
-             'tick_size']].rename(columns={
+             'tick_size', '_kite_exchange']].rename(columns={
         'tradingsymbol': 'symbol',
         'name': 'name',
         'expiry': 'expiry',
@@ -205,7 +256,64 @@ def process_zerodha_csv(path):
 
     df['brsymbol'] = df['symbol']
     df['symbol'] = df.apply(reformat_symbol, axis=1)
-    df['brexchange'] = df['exchange']
+    df = strip_nse_series_suffix(df)
+    df['brexchange'] = df['_kite_exchange']
+    df = df.drop(columns=['_kite_exchange'])
+
+    # Kite reports lot_size = 1 for every MCX instrument because it denominates
+    # MCX order quantity in contracts rather than units. Every other Indian
+    # broker ships the real market lot, so keeping Kite's 1 here would mean the
+    # same one-lot crude order is quantity 100 on Angel and 1 on Zerodha.
+    #
+    # OpenAlgo's API is one request body for any broker, so the real lot goes
+    # here and broker/zerodha converts back to contracts at the Kite boundary,
+    # the same way it already translates symbol, product and price type.
+    # See mapping/mcx_contract_size.py for both halves.
+    is_mcx = df['exchange'] == 'MCX'
+    if is_mcx.any():
+        # Sized per row, not per root. MCX revises contract sizes, and the old
+        # and new sizes trade side by side until the last pre-revision contract
+        # expires -- MCXBULLDEX is 30 for Sep/Oct 2026 and 15 from Nov 2026.
+        # Only the expiry on the row can tell those apart.
+        #
+        # `expiry` is already formatted to '%d-%b-%y' by this point; coerce
+        # parses it back and leaves blanks (all the non-derivative rows) as NaT,
+        # which resolves to the unrevised size.
+        expiries = pd.to_datetime(
+            df.loc[is_mcx, 'expiry'], format='%d-%b-%y', errors='coerce'
+        )
+        sizes = pd.Series(
+            [
+                # A blank name is 'unknown underlying', not an input worth a
+                # lookup -- Kite ships thousands of them on other segments.
+                None if pd.isna(name) else get_contract_size(
+                    name, None if pd.isna(exp) else exp.date()
+                )
+                for name, exp in zip(df.loc[is_mcx, 'name'], expiries, strict=True)
+            ],
+            index=df.index[is_mcx],
+            dtype='float64',
+        )
+        # An unmapped underlying keeps Kite's 1, which is what shipped before
+        # this table existed: orders still size correctly in contracts, they
+        # just do not read like the other brokers. A wrong lot is far worse
+        # than an inconsistent one, so it is never guessed -- it is logged.
+        df.loc[is_mcx, 'lotsize'] = sizes.fillna(df.loc[is_mcx, 'lotsize']).astype('int64')
+        unmapped = sorted(df.loc[is_mcx, 'name'][sizes.isna()].dropna().unique())
+        logger.info(
+            f"MCX lot sizes applied to {int(sizes.notna().sum())} of {int(is_mcx.sum())} rows"
+        )
+        if unmapped:
+            logger.warning(f"No MCX contract size for: {', '.join(unmapped)}")
+
+    # Kite leaves `name` blank on ~8k EQ-type rows: BSE/NSE debt (NCDs, bonds,
+    # CPs, the -N0/-SF series) and the NCO spot underlyings GOLD, SILVER,
+    # XAUGOLD, COPPER. Every derivative carries its underlying, so only these
+    # are affected. Fall back to the tradingsymbol, which for the NCO rows is
+    # the underlying itself. Done after the MCX sizing above, which reads a
+    # blank name as 'unknown underlying'.
+    blank_name = df['name'].isna() | (df['name'].astype(str).str.strip() == '')
+    df.loc[blank_name, 'name'] = df.loc[blank_name, 'brsymbol']
 
     # Fill NaN values in the 'expiry' column with an empty string
     df['expiry'] = df['expiry'].fillna('')
@@ -216,8 +324,10 @@ def process_zerodha_csv(path):
     # Options Symbol Update
 
     def format_strike(strike):
-        # Convert the string to a float, then to an integer, and finally back to a string.
-        return str(int(float(strike)))
+        # Convert to float, then to int only if it's a whole number (e.g., 190 -> "190")
+        # Preserve decimal strikes (e.g., 187.5 -> "187.5")
+        val = float(strike)
+        return str(int(val)) if val == int(val) else str(val)
 
 
     df.loc[(df['instrumenttype'] == 'CE'), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + df['strike'].apply(format_strike) + df['instrumenttype']
@@ -329,6 +439,14 @@ def process_zerodha_csv(path):
         'SMEIPO': 'BSESMEIPO',
         'TECK': 'BSETECK',
         'TELCOM': 'BSETELECOM',
+    })
+
+    # GLOBAL_INDEX symbol normalisation (currently the lone NSE-IFSC GIFT NIFTY
+    # row, which Zerodha ships with a literal space in the tradingsymbol).
+    # Strip the space so users can call it as a single-token symbol.
+    global_idx_mask = df['exchange'] == 'GLOBAL_INDEX'
+    df.loc[global_idx_mask, 'symbol'] = df.loc[global_idx_mask, 'symbol'].replace({
+        'GIFT NIFTY': 'GIFTNIFTY',
     })
 
     return df

@@ -1,14 +1,17 @@
-import json
-import logging
 import os
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from broker.definedge.streaming.definedge_websocket import DefinedGeWebSocket
-from database.auth_db import get_auth_token, get_feed_token
-from database.token_db import get_token
+from database.auth_db import (
+    decrypt_token,
+    get_auth_token,
+    get_feed_token,
+    get_feed_token_dbquery,
+)
+from utils.logging import get_logger
 
 # Add parent directory to path to allow imports
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../"))
@@ -20,55 +23,60 @@ from .definedge_mapping import DefinedgeCapabilityRegistry, DefinedgeExchangeMap
 
 
 class MarketDataCache:
-    """Manages market data caching with thread safety for DefinEdge"""
+    """Manages market data caching with thread safety for DefinEdge.
+
+    Keyed by scrip (``"NFO|65872"``), never by the bare token. Noren tokens are
+    unique only within an exchange, so a token-keyed cache merges two different
+    instruments into one slot - see issue #1732.
+    """
 
     def __init__(self):
         self._cache = {}
-        self._initialized_tokens = set()
+        self._initialized_scrips = set()
         self._lock = threading.Lock()
-        self.logger = logging.getLogger("market_cache")
+        self.logger = get_logger("market_cache")
 
-    def get(self, token: str) -> dict[str, Any]:
-        """Get cached data for a token"""
+    def get(self, scrip: str) -> dict[str, Any]:
+        """Get cached data for a scrip"""
         with self._lock:
-            return self._cache.get(token, {}).copy()
+            return self._cache.get(scrip, {}).copy()
 
-    def update(self, token: str, data: dict[str, Any]) -> dict[str, Any]:
+    def update(self, scrip: str, data: dict[str, Any]) -> dict[str, Any]:
         """Update cache with new data and return merged result"""
         with self._lock:
-            cached_data = self._cache.get(token, {})
-            merged_data = self._merge_data(cached_data, data, token)
-            self._cache[token] = merged_data
+            cached_data = self._cache.get(scrip, {})
+            merged_data = self._merge_data(cached_data, data, scrip)
+            self._cache[scrip] = merged_data
 
-            if token not in self._initialized_tokens:
-                self._initialized_tokens.add(token)
-                self._log_cache_initialization(token, data)
+            if scrip not in self._initialized_scrips:
+                self._initialized_scrips.add(scrip)
+                self._log_cache_initialization(scrip, data)
 
             return merged_data.copy()
 
-    def clear(self, token: str = None) -> None:
-        """Clear cache for specific token or all tokens"""
+    def clear(self, scrip: str = None) -> None:
+        """Clear cache for specific scrip or all scrips"""
         with self._lock:
-            if token:
-                self._cache.pop(token, None)
-                self._initialized_tokens.discard(token)
-                self.logger.info(f"Cleared cache for token {token}")
+            if scrip:
+                self._cache.pop(scrip, None)
+                self._initialized_scrips.discard(scrip)
+                self.logger.info(f"Cleared cache for scrip {scrip}")
             else:
                 cache_size = len(self._cache)
                 self._cache.clear()
-                self._initialized_tokens.clear()
-                self.logger.info(f"Cleared all cached market data ({cache_size} tokens)")
+                self._initialized_scrips.clear()
+                self.logger.info(f"Cleared all cached market data ({cache_size} scrips)")
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics"""
         with self._lock:
             return {
-                "total_tokens": len(self._cache),
-                "initialized_tokens": len(self._initialized_tokens),
-                "tokens": list(self._cache.keys()),
+                "total_scrips": len(self._cache),
+                "initialized_scrips": len(self._initialized_scrips),
+                "scrips": list(self._cache.keys()),
             }
 
-    def _merge_data(self, cached: dict, new: dict, token: str) -> dict:
+    def _merge_data(self, cached: dict, new: dict, scrip: str) -> dict:
         """Smart merge logic for market data - similar to Shoonya"""
         merged = cached.copy()
 
@@ -98,7 +106,7 @@ class MarketDataCache:
         """Check if value represents zero - same as Shoonya line 130-132"""
         return value in [None, "", "0", 0, "0.0", 0.0]
 
-    def _log_cache_initialization(self, token: str, data: dict) -> None:
+    def _log_cache_initialization(self, scrip: str, data: dict) -> None:
         """Log cache initialization details - same as Shoonya"""
         # Use raw field names like Shoonya
         basic_fields = ["lp", "o", "h", "l", "c", "v", "ap", "pc", "ltq", "ltt", "tbq", "tsq"]
@@ -110,12 +118,12 @@ class MarketDataCache:
             data.get(f) and not self._is_zero_value(data.get(f)) for f in ["o", "h", "l", "c"]
         )
         if has_ohlc:
-            self.logger.info(
-                f"📸 OHLC snapshot cached for {token}: o={data.get('o')}, h={data.get('h')}, l={data.get('l')}, c={data.get('c')}"
+            self.logger.debug(
+                f"OHLC snapshot cached for {scrip}: o={data.get('o')}, h={data.get('h')}, l={data.get('l')}, c={data.get('c')}"
             )
 
-        self.logger.info(
-            f"Initializing cache for token {token} - "
+        self.logger.debug(
+            f"Initializing cache for scrip {scrip} - "
             f"{present_fields}/{len(basic_fields)} fields present ({completeness:.1%})"
         )
 
@@ -125,7 +133,7 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def __init__(self):
         super().__init__()
-        self.logger = logging.getLogger("definedge_websocket")
+        self.logger = get_logger("definedge_websocket")
         self.ws_client = None
         self.user_id = None
         self.broker_name = "definedge"
@@ -136,8 +144,19 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.running = False
         self.lock = threading.Lock()
         self.market_cache = MarketDataCache()  # Initialize market data cache
-        self.token_to_symbol = {}  # Map tokens to symbols for cache management
+        # Keyed by scrip ("NFO|65872"), not by the bare token: Noren tokens are
+        # unique only within an exchange and the live master carries thousands of
+        # cross-exchange duplicates (NSE/CDS, BSE_INDEX/NSE, BSE/MCX) - see #1732
+        self.scrip_to_symbol = {}  # Map scrips to symbols for cache management
         self.ws_subscription_refs = {}  # Reference counting for WebSocket subscriptions
+        self._reconnecting = False  # Single-flight guard for _connect_with_retry
+
+        # Batch subscription management - coalesce rapid subscribe calls into a
+        # single touchline/depth message instead of one send per symbol
+        # (flattrade/zerodha pattern, issue #1359)
+        self.subscription_queue = []
+        self.batch_timer = None
+        self.batch_delay = 0.5  # seconds to collect subscriptions before flushing
 
     def initialize(
         self, broker_name: str, user_id: str, auth_data: dict[str, str] | None = None
@@ -159,7 +178,7 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Get tokens from database if not provided (following Angel pattern)
         if not auth_data:
             # Fetch authentication tokens from database
-            auth_token = get_auth_token(user_id)
+            auth_token = get_auth_token(user_id, bypass_cache=True)
             feed_token = get_feed_token(user_id)  # This contains susertoken for DefinEdge
 
             if not auth_token:
@@ -189,8 +208,16 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 "actid": definedge_uid,  # Same as uid for DefinEdge
             }
 
-        # Create DefinedGeWebSocket instance with auth data
-        self.ws_client = DefinedGeWebSocket(auth_data)
+        # Remember uid/actid so we can rebuild fresh auth_data on reconnect.
+        # uid/actid do not roll over; only the auth_token/feed_token do.
+        self._uid = auth_data.get("uid", "")
+        self._actid = auth_data.get("actid", "")
+
+        # Create DefinedGeWebSocket instance with auth data.
+        # Pass a token_provider so the client can re-read a fresh token from
+        # the DB before each reconnect (DefinEdge tokens roll over daily at
+        # ~3 AM IST; reusing the construction-time token reconnects dead).
+        self.ws_client = DefinedGeWebSocket(auth_data, token_provider=self._fetch_fresh_auth_data)
 
         # Set callbacks
         self.ws_client.on_connect = self._on_open
@@ -201,6 +228,39 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         self.running = True
 
+    def _fetch_fresh_auth_data(self) -> dict[str, Any] | None:
+        """Re-read fresh auth tokens from the database for reconnection.
+
+        Returns a fresh auth_data dict (same shape used in initialize) so the
+        WebSocket client can authenticate with the current day's token after
+        the ~3 AM IST rollover. Returns None if no user_id or token available.
+        """
+        if not self.user_id:
+            return None
+        try:
+            auth_token = get_auth_token(self.user_id, bypass_cache=True)
+            # Direct DB read (get_feed_token has no bypass_cache param) so the
+            # susertoken is fresh after the ~3 AM IST rollover regardless of
+            # cross-process cache-invalidation timing.
+            feed_obj = get_feed_token_dbquery(self.user_id)
+            feed_token = (
+                decrypt_token(feed_obj.feed_token) if feed_obj and feed_obj.feed_token else None
+            )
+            if not auth_token:
+                self.logger.warning(
+                    "Could not fetch fresh auth token on reconnect; using existing token"
+                )
+                return None
+            return {
+                "auth_token": auth_token,
+                "feed_token": feed_token,
+                "uid": self._uid,
+                "actid": self._actid,
+            }
+        except Exception as e:
+            self.logger.error(f"Error fetching fresh auth data on reconnect: {e}")
+            return None
+
     def connect(self) -> None:
         """Establish connection to DefinEdge WebSocket"""
         if not self.ws_client:
@@ -210,41 +270,61 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         threading.Thread(target=self._connect_with_retry, daemon=True).start()
 
     def _connect_with_retry(self) -> None:
-        """Connect to DefinEdge WebSocket with retry logic"""
-        while self.running and self.reconnect_attempts < self.max_reconnect_attempts:
-            try:
-                # Check if we should still be running
-                if not self.running:
-                    self.logger.info("Adapter stopped - aborting connection attempt")
-                    return
+        """Connect to DefinEdge WebSocket with retry logic.
 
-                self.logger.info(
-                    f"Connecting to DefinEdge WebSocket (attempt {self.reconnect_attempts + 1})"
-                )
-                if self.ws_client and self.ws_client.connect():
-                    self.reconnect_attempts = 0  # Reset attempts on successful connection
-                    self.connected = True
-                    break
-                else:
-                    raise Exception("Connection failed")
+        Single-flight: the adapter is the sole owner of reconnection (the WS
+        layer never reconnects itself), and only one retry loop may run at a
+        time even if multiple close events fire.
+        """
+        with self.lock:
+            if self._reconnecting:
+                self.logger.debug("Reconnect already in progress - skipping duplicate")
+                return
+            self._reconnecting = True
 
-            except Exception as e:
-                self.reconnect_attempts += 1
+        try:
+            while self.running and self.reconnect_attempts < self.max_reconnect_attempts:
+                try:
+                    # Check if we should still be running
+                    if not self.running:
+                        self.logger.info("Adapter stopped - aborting connection attempt")
+                        return
 
-                # Check again if we should still be running before sleeping
-                if not self.running:
-                    self.logger.info("Adapter stopped during retry - aborting")
-                    return
+                    self.logger.info(
+                        f"Connecting to DefinEdge WebSocket (attempt {self.reconnect_attempts + 1})"
+                    )
+                    # Re-read a fresh token from the DB before connecting so a
+                    # daily ~3 AM IST token rollover does not leave us dead.
+                    if self.ws_client:
+                        self.ws_client._refresh_tokens()
+                    if self.ws_client and self.ws_client.connect():
+                        self.reconnect_attempts = 0  # Reset attempts on successful connection
+                        self.connected = True
+                        break
+                    else:
+                        raise Exception("Connection failed")
 
-                delay = min(
-                    self.reconnect_delay * (2**self.reconnect_attempts), self.max_reconnect_delay
-                )
-                self.logger.error(f"Connection failed: {e}. Retrying in {delay} seconds...")
-                time.sleep(delay)
+                except Exception as e:
+                    self.reconnect_attempts += 1
 
-        if self.reconnect_attempts >= self.max_reconnect_attempts:
-            self.logger.error("Max reconnection attempts reached. Giving up.")
-            self.running = False  # Stop the adapter
+                    # Check again if we should still be running before sleeping
+                    if not self.running:
+                        self.logger.info("Adapter stopped during retry - aborting")
+                        return
+
+                    delay = min(
+                        self.reconnect_delay * (2**self.reconnect_attempts),
+                        self.max_reconnect_delay,
+                    )
+                    self.logger.error(f"Connection failed: {e}. Retrying in {delay} seconds...")
+                    time.sleep(delay)
+
+            if self.reconnect_attempts >= self.max_reconnect_attempts:
+                self.logger.error("Max reconnection attempts reached. Giving up.")
+                self.running = False  # Stop the adapter
+        finally:
+            with self.lock:
+                self._reconnecting = False
 
     def disconnect(self) -> None:
         """Disconnect from DefinEdge WebSocket with proper cleanup"""
@@ -259,6 +339,12 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.subscriptions.clear()
             self.logger.info(f"Cleared {subscription_count} active subscriptions")
 
+            # Cancel any pending batch subscription timer and drop queued items
+            if self.batch_timer:
+                self.batch_timer.cancel()
+                self.batch_timer = None
+            self.subscription_queue.clear()
+
         # Disconnect WebSocket client
         if hasattr(self, "ws_client") and self.ws_client:
             self.logger.info("Disconnecting WebSocket client...")
@@ -270,10 +356,10 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.market_cache.clear()
             self.logger.info("Cleared market data cache")
 
-        # Clean up token mappings
-        if hasattr(self, "token_to_symbol"):
-            self.token_to_symbol.clear()
-            self.logger.info("Cleared token mappings")
+        # Clean up scrip mappings
+        if hasattr(self, "scrip_to_symbol"):
+            self.scrip_to_symbol.clear()
+            self.logger.info("Cleared scrip mappings")
 
         # Reset connection state
         self.connected = False
@@ -376,6 +462,7 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.logger.info(f"[SUBSCRIBE] New WebSocket subscription needed for {correlation_id}")
 
         # Store subscription for reconnection
+        subscription_scrip = f"{definedge_exchange}|{token}"
         with self.lock:
             self.subscriptions[correlation_id] = {
                 "symbol": symbol,
@@ -383,49 +470,43 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 "brexchange": brexchange,
                 "definedge_exchange": definedge_exchange,
                 "token": token,
+                "scrip": subscription_scrip,
                 "mode": mode,
                 "depth_level": depth_level,
                 "actual_depth": actual_depth,
                 "tokens": tokens,
                 "is_fallback": is_fallback,
             }
-            # Track token to symbol mapping for cache management
-            self.token_to_symbol[token] = (symbol, exchange)
+            # Track scrip to symbol mapping for cache management
+            self.scrip_to_symbol[subscription_scrip] = (symbol, exchange)
 
         # Subscribe via WebSocket (reference counting will handle duplicates)
         if self.connected and self.ws_client:
             try:
-                # Map mode to DefinEdge subscription type
-                if mode == 1:  # LTP only - use touchline
-                    subscription_type = "tick"
-                elif mode == 2:  # Quote - use touchline for OHLC
-                    subscription_type = "tick"
-                    self.logger.info(
-                        f"Using touchline subscription for {symbol} Quote mode to get OHLC data"
-                    )
-                else:  # mode == 3, Depth
-                    subscription_type = "depth"
-
-                # Use reference counting to avoid duplicate WebSocket subscriptions
+                # First reference queues the scrip for a batched subscribe;
+                # later references only bump the counter, so bursts of
+                # subscriptions go out as one message instead of one per symbol
                 scrip = f"{definedge_exchange}|{token}"
-                if self._should_ws_subscribe(scrip, subscription_type):
-                    success = self.ws_client.subscribe(subscription_type, tokens)
-                    if not success:
-                        return self._create_error_response(
-                            "SUBSCRIPTION_ERROR", "Failed to subscribe"
-                        )
-                    self.logger.info(f"[SUBSCRIBE] WebSocket subscription sent for {scrip}")
-                else:
-                    self.logger.info(
-                        f"[SUBSCRIBE] WebSocket already has active subscription for {scrip}"
-                    )
+                with self.lock:
+                    for subscription_type in self._feed_types(mode):
+                        if self._should_ws_subscribe(scrip, subscription_type):
+                            self._queue_ws_subscription(
+                                definedge_exchange, token, subscription_type
+                            )
+                            self.logger.info(
+                                f"[SUBSCRIBE] Queued {subscription_type} subscription for {scrip}"
+                            )
+                        else:
+                            self.logger.info(
+                                f"[SUBSCRIBE] {subscription_type} already active for {scrip}"
+                            )
 
             except Exception as e:
                 self.logger.error(f"Error subscribing to {symbol}.{exchange}: {e}")
                 return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
         else:
             self.logger.warning(
-                f"[SUBSCRIBE] Not connected, cannot subscribe to {symbol}.{exchange}"
+                f"[SUBSCRIBE] Not connected - {symbol}.{exchange} will be picked up by resubscribe on connect"
             )
 
         # Log current subscription state
@@ -491,46 +572,109 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # Remove the first matching subscription
             correlation_id, subscription = matching_subscriptions[0]
 
-            # Check if this is the last subscription for this symbol/exchange/mode
-            is_last = len(matching_subscriptions) == 1
-
             # Remove the subscription
             del self.subscriptions[correlation_id]
 
-            # Clean up token mapping and cache if no other subscriptions use this token
-            if not any(sub["token"] == token for sub in self.subscriptions.values()):
-                self.token_to_symbol.pop(token, None)
-                self.market_cache.clear(token)
+            # Clean up scrip mapping and cache if no other subscriptions use this
+            # scrip. Keyed on scrip, not token: a token still subscribed on another
+            # exchange must keep its own cache slot and mapping intact (#1732)
+            scrip = f"{definedge_exchange}|{token}"
+            if not any(sub["scrip"] == scrip for sub in self.subscriptions.values()):
+                self.scrip_to_symbol.pop(scrip, None)
+                self.market_cache.clear(scrip)
 
-            # Only unsubscribe from WebSocket if this was the last subscription
-            if is_last:
-                scrip = f"{definedge_exchange}|{token}"
-                if self._should_ws_unsubscribe(scrip, subscription["mode"]):
-                    # Unsubscribe if connected
-                    if self.connected and self.ws_client:
-                        try:
-                            # Map mode to DefinEdge subscription type
-                            if subscription["mode"] == 1:  # LTP only - use touchline
-                                subscription_type = "tick"
-                            elif (
-                                subscription["mode"] == 2
-                            ):  # Quote - we subscribed to touchline for OHLC
-                                subscription_type = "tick"
-                            else:  # mode == 3, Depth
-                                subscription_type = "depth"
-
-                            success = self.ws_client.unsubscribe(subscription_type, tokens)
-                            if not success:
-                                self.logger.warning(
-                                    f"Failed to unsubscribe WebSocket for {symbol}.{exchange}"
-                                )
-
-                        except Exception as e:
-                            self.logger.error(f"Error unsubscribing from {symbol}.{exchange}: {e}")
+            # Every client subscription took one reference per feed when it
+            # subscribed, so each one gives its references back here. The feed
+            # itself is unsubscribed only when its count reaches zero. Releasing
+            # only for the last subscription of a symbol and mode left one
+            # reference behind per extra client, and the feed then stayed
+            # subscribed for good.
+            for subscription_type in self._feed_types(subscription["mode"]):
+                if not self._release_ws_ref(scrip, subscription_type):
+                    continue
+                if not (self.connected and self.ws_client):
+                    continue
+                try:
+                    success = self.ws_client.unsubscribe(subscription_type, tokens)
+                    if not success:
+                        self.logger.warning(
+                            f"Failed to unsubscribe {subscription_type} for {symbol}.{exchange}"
+                        )
+                except Exception as e:
+                    self.logger.error(f"Error unsubscribing from {symbol}.{exchange}: {e}")
 
         return self._create_success_response(
             f"Unsubscribed from {symbol}.{exchange}", symbol=symbol, exchange=exchange, mode=mode
         )
+
+    def _queue_ws_subscription(self, definedge_exchange: str, token: str, sub_type: str) -> None:
+        """Queue a scrip for batched subscription. Caller must hold self.lock."""
+        self.subscription_queue.append(
+            {"exchange": definedge_exchange, "token": token, "type": sub_type}
+        )
+        if len(self.subscription_queue) == 1:
+            self._start_batch_timer()
+
+    def _start_batch_timer(self) -> None:
+        """(Re)start the timer that flushes queued subscriptions. Caller must hold self.lock."""
+        if self.batch_timer:
+            self.batch_timer.cancel()
+
+        self.batch_timer = threading.Timer(self.batch_delay, self._process_batch_subscriptions)
+        self.batch_timer.daemon = True
+        self.batch_timer.start()
+
+    def _process_batch_subscriptions(self) -> None:
+        """Flush the queue: one tick and one depth subscribe with all scrips batched."""
+        with self.lock:
+            self.batch_timer = None
+
+            if not self.subscription_queue:
+                return
+
+            # De-duplicate while preserving order
+            tick_tokens = []
+            depth_tokens = []
+            seen_tick = set()
+            seen_depth = set()
+
+            for sub in self.subscription_queue:
+                pair = (sub["exchange"], sub["token"])
+                if sub["type"] == "tick":
+                    if pair not in seen_tick:
+                        seen_tick.add(pair)
+                        tick_tokens.append(pair)
+                else:
+                    if pair not in seen_depth:
+                        seen_depth.add(pair)
+                        depth_tokens.append(pair)
+
+            self.subscription_queue.clear()
+
+            # Snapshot client; release the lock before network I/O
+            ws_client = self.ws_client
+            connected = self.connected
+
+        if not ws_client or not connected:
+            self.logger.warning(
+                "Skipping batch flush - WebSocket not connected; "
+                "_resubscribe_all() will handle these on reconnect"
+            )
+            return
+
+        if tick_tokens:
+            try:
+                self.logger.info(f"Batch subscribing {len(tick_tokens)} tick scrips")
+                ws_client.subscribe("tick", tick_tokens)
+            except Exception as e:
+                self.logger.error(f"Batch tick subscription failed: {e}")
+
+        if depth_tokens:
+            try:
+                self.logger.info(f"Batch subscribing {len(depth_tokens)} depth scrips")
+                ws_client.subscribe("depth", depth_tokens)
+            except Exception as e:
+                self.logger.error(f"Batch depth subscription failed: {e}")
 
     def _on_open(self, wsapp) -> None:
         """Callback when connection is established"""
@@ -563,14 +707,13 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 if scrip not in self.ws_subscription_refs:
                     self.ws_subscription_refs[scrip] = {"tick_count": 0, "depth_count": 0}
 
-                if mode in [1, 2]:  # LTP or Quote
-                    if scrip not in tick_scrips:
+                for subscription_type in self._feed_types(mode):
+                    if subscription_type == "tick":
                         tick_scrips.add((definedge_exchange, token))
-                    self.ws_subscription_refs[scrip]["tick_count"] += 1
-                elif mode == 3:  # Depth
-                    if scrip not in depth_scrips:
+                        self.ws_subscription_refs[scrip]["tick_count"] += 1
+                    else:
                         depth_scrips.add((definedge_exchange, token))
-                    self.ws_subscription_refs[scrip]["depth_count"] += 1
+                        self.ws_subscription_refs[scrip]["depth_count"] += 1
 
             # Resubscribe in batches
             try:
@@ -600,7 +743,17 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.logger.info(f"DefinEdge WebSocket connection closed: {code} - {reason}")
         self.connected = False
 
-        # Only attempt to reconnect if adapter is still running (not manually disconnected)
+        # Drop pending batch items - _resubscribe_all() rebuilds subscriptions
+        # from self.subscriptions on reconnect, so anything still queued is stale
+        with self.lock:
+            if self.batch_timer:
+                self.batch_timer.cancel()
+                self.batch_timer = None
+            self.subscription_queue.clear()
+
+        # Only attempt to reconnect if adapter is still running (not manually
+        # disconnected). _connect_with_retry is single-flight, so overlapping
+        # close events cannot spawn competing retry loops.
         if self.running:
             self.logger.info("Connection lost - will attempt to reconnect")
             threading.Thread(target=self._connect_with_retry, daemon=True).start()
@@ -617,7 +770,7 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 # This is subscription acknowledgement with initial OHLC snapshot
                 token = message.get("tk")
                 exchange = message.get("e")
-                self.logger.info(f"📸 Touchline ACK for {exchange}|{token} - Initial snapshot")
+                self.logger.debug(f"Touchline ACK for {exchange}|{token} - Initial snapshot")
 
                 # Check and log OHLC values in acknowledgment
                 ohlc_values = {
@@ -631,119 +784,21 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 has_nonzero_ohlc = any(v not in [None, "", "0", 0] for v in ohlc_values.values())
 
                 if has_nonzero_ohlc:
-                    self.logger.info(
-                        f"✅ OHLC snapshot received: Open={ohlc_values['open']}, High={ohlc_values['high']}, Low={ohlc_values['low']}, Close={ohlc_values['close']}"
+                    self.logger.debug(
+                        f"OHLC snapshot received: Open={ohlc_values['open']}, High={ohlc_values['high']}, Low={ohlc_values['low']}, Close={ohlc_values['close']}"
                     )
                     # Mark this as initial snapshot for cache
                     message["_is_snapshot"] = True
                 else:
-                    self.logger.warning("⚠️ No OHLC in touchline ACK (market may be closed)")
+                    self.logger.warning("No OHLC in touchline ACK (market may be closed)")
 
                 # Always process acknowledgment as it contains initial snapshot
                 # Continue processing - don't return
 
-            # Extract symbol and exchange from our subscriptions using token
-            token = message.get("tk")
-            exchange = message.get("e")
-
-            # Find the subscription that matches this token
-            subscription = None
-            with self.lock:
-                for sub in self.subscriptions.values():
-                    if sub["token"] == token and sub["definedge_exchange"] == exchange:
-                        subscription = sub
-                        break
-
-            if not subscription:
-                self.logger.warning(f"Received data for unsubscribed token: {exchange}|{token}")
-                return
-
-            # Create topic for ZeroMQ
-            symbol = subscription["symbol"]
-            orig_exchange = subscription["exchange"]
-            mode = subscription["mode"]
-
-            mode_str = {1: "LTP", 2: "QUOTE", 3: "DEPTH"}[mode]
-            topic = f"{orig_exchange}_{symbol}_{mode_str}"
-
-            # Use cache BEFORE normalization (like Shoonya does)
-            # This preserves raw field names for cache logic
-            cached_data = self.market_cache.update(token, message)
-
-            # Now normalize the cached data for output
-            market_data = self._normalize_raw_data(cached_data, mode)
-
-            # Add metadata
-            market_data.update(
-                {
-                    "symbol": symbol,
-                    "exchange": orig_exchange,
-                    "mode": mode,
-                    "timestamp": int(time.time() * 1000),  # Current timestamp in ms
-                }
-            )
-
-            # Log the market data we're sending
-            self.logger.debug(f"Publishing market data on topic {topic}: {market_data}")
-
-            # Publish to ZeroMQ
-            self.publish_market_data(topic, market_data)
+            self._publish_to_subscribers(message, is_depth=False)
 
         except Exception as e:
             self.logger.error(f"Error processing market data: {e}", exc_info=True)
-
-    def _publish_for_other_modes(
-        self, token: str, symbol: str, exchange: str, market_data: dict
-    ) -> None:
-        """
-        Publish market data for other subscription modes (Quote/LTP) when depth data is available.
-        This allows Quote mode to get OHLC values from Depth subscriptions.
-        """
-        try:
-            # Check if there are Quote or LTP subscriptions for this token
-            with self.lock:
-                for correlation_id, sub in self.subscriptions.items():
-                    if sub["token"] == token and sub["mode"] in [1, 2]:  # LTP or Quote mode
-                        mode = sub["mode"]
-                        mode_str = {1: "LTP", 2: "QUOTE"}[mode]
-                        topic = f"{exchange}_{symbol}_{mode_str}"
-
-                        # Create mode-specific data
-                        if mode == 1:  # LTP mode - only send LTP
-                            ltp_data = {
-                                "symbol": symbol,
-                                "exchange": exchange,
-                                "mode": 1,
-                                "ltp": market_data.get("ltp", 0),
-                                "timestamp": int(time.time() * 1000),
-                            }
-                            self.publish_market_data(topic, ltp_data)
-                            self.logger.debug(f"Published LTP data from depth for {symbol}")
-
-                        elif mode == 2:  # Quote mode - send OHLC + quote data
-                            quote_data = {
-                                "symbol": symbol,
-                                "exchange": exchange,
-                                "mode": 2,
-                                "ltp": market_data.get("ltp", 0),
-                                "open": market_data.get("open", 0),
-                                "high": market_data.get("high", 0),
-                                "low": market_data.get("low", 0),
-                                "close": market_data.get("close", 0),
-                                "volume": market_data.get("volume", 0),
-                                "timestamp": int(time.time() * 1000),
-                            }
-
-                            # Log if we're providing OHLC from depth
-                            if any(market_data.get(f) for f in ["open", "high", "low", "close"]):
-                                self.logger.info(
-                                    f"✓ Providing OHLC to Quote mode from Depth data for {symbol}"
-                                )
-
-                            self.publish_market_data(topic, quote_data)
-
-        except Exception as e:
-            self.logger.error(f"Error publishing for other modes: {e}")
 
     def _on_depth_data(self, wsapp, message) -> None:
         """Callback for depth data from the WebSocket"""
@@ -758,8 +813,8 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 )
                 # Check if acknowledgment contains initial OHLC data
                 if any(message.get(f) for f in ["o", "h", "l", "c"]):
-                    self.logger.info(
-                        f"✓ Depth ACK has OHLC: o={message.get('o')}, h={message.get('h')}, l={message.get('l')}, c={message.get('c')}"
+                    self.logger.debug(
+                        f"Depth ACK has OHLC: o={message.get('o')}, h={message.get('h')}, l={message.get('l')}, c={message.get('c')}"
                     )
                     # Process the acknowledgment as initial data
                 else:
@@ -785,58 +840,107 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                         self._depth_ohlc_logged = {}
                     self._depth_ohlc_logged[f"{exchange}|{token}"] = True
                     if has_ohlc:
-                        self.logger.info(
-                            f"✓ Depth feed has OHLC for {exchange}|{token}: {ohlc_check}"
+                        self.logger.debug(
+                            f"Depth feed has OHLC for {exchange}|{token}: {ohlc_check}"
                         )
                     else:
-                        self.logger.warning(f"✗ Depth feed has NO OHLC for {exchange}|{token}")
+                        # Normal for Noren depth feeds - only changed fields are sent;
+                        # cached OHLC from the ack/touchline fills the gap
+                        self.logger.debug(f"Depth feed has NO OHLC for {exchange}|{token}")
 
-            # Find the subscription
-            subscription = None
-            with self.lock:
-                for sub in self.subscriptions.values():
-                    if sub["token"] == token and sub["definedge_exchange"] == exchange:
-                        subscription = sub
-                        break
-
-            if not subscription:
-                self.logger.warning(
-                    f"Received depth data for unsubscribed token: {exchange}|{token}"
-                )
-                return
-
-            # Create topic for ZeroMQ
-            symbol = subscription["symbol"]
-            orig_exchange = subscription["exchange"]
-
-            topic = f"{orig_exchange}_{symbol}_DEPTH"
-
-            # Use cache BEFORE normalization (like Shoonya)
-            cached_data = self.market_cache.update(token, message)
-
-            # Now normalize the cached data for output
-            market_data = self._normalize_raw_depth_data(cached_data)
-
-            # Add metadata for depth subscription
-            depth_data = market_data.copy()
-            depth_data.update(
-                {
-                    "symbol": symbol,
-                    "exchange": orig_exchange,
-                    "mode": 3,  # Depth mode
-                    "timestamp": int(time.time() * 1000),
-                }
-            )
-
-            # Publish to ZeroMQ for depth subscribers
-            self.publish_market_data(topic, depth_data)
-
-            # IMPORTANT: Also publish OHLC data for any Quote mode subscriptions
-            # This allows Quote mode to get OHLC from Depth data
-            self._publish_for_other_modes(token, symbol, orig_exchange, market_data)
+            self._publish_to_subscribers(message, is_depth=True)
 
         except Exception as e:
             self.logger.error(f"Error processing depth data: {e}", exc_info=True)
+
+    # Raw keys that only the depth feed carries. A DEPTH payload is built only
+    # once one of them is cached, so a touchline tick never publishes an empty
+    # or zero-filled order book.
+    _DEPTH_ONLY_KEYS = ("tbq", "tsq", "bp2", "sp2", "bq2", "sq2", "ltq", "ltt")
+
+    def _publish_to_subscribers(self, message: dict, is_depth: bool) -> None:
+        """Merge a touchline or depth message into the per-scrip snapshot and
+        publish it to every subscribed mode for that (exchange, token).
+
+        Each mode's payload is built from the merged snapshot, so a QUOTE client
+        keeps OHLC, average price and percent change whichever feed ticked, and
+        a DEPTH client keeps every quote field. A payload with no data is never
+        published.
+        """
+        token = message.get("tk")
+        exchange = message.get("e")
+        scrip = f"{exchange}|{token}"
+
+        with self.lock:
+            subs = [
+                (sub["symbol"], sub["exchange"], sub["mode"])
+                for sub in self.subscriptions.values()
+                if sub["scrip"] == scrip
+            ]
+
+        if not subs:
+            kind = "depth" if is_depth else "touchline"
+            self.logger.warning(f"Received {kind} data for unsubscribed token: {scrip}")
+            return
+
+        # Cache BEFORE normalization (raw field names drive the merge). Keyed on
+        # the full scrip so a token shared across exchanges never merges two
+        # different instruments into one slot (#1732)
+        cached_data = self.market_cache.update(scrip, message)
+        # A message from the depth feed is depth data even when it carries only
+        # level-1 fields; a touchline refresh publishes DEPTH only once the
+        # cache holds something only the depth feed sends.
+        has_depth = is_depth or any(key in cached_data for key in self._DEPTH_ONLY_KEYS)
+
+        published_topics = set()
+        for symbol, orig_exchange, mode in subs:
+            mode_str = {1: "LTP", 2: "QUOTE", 3: "DEPTH"}[mode]
+            topic = f"{orig_exchange}_{symbol}_{mode_str}"
+            if topic in published_topics:
+                continue
+
+            if mode == 3:
+                if not has_depth:
+                    continue
+                market_data = self._normalize_raw_depth_data(cached_data)
+            else:
+                market_data = self._normalize_raw_data(cached_data, mode)
+            if not market_data:
+                continue
+
+            market_data.update(
+                {
+                    "symbol": symbol,
+                    "exchange": orig_exchange,
+                    "mode": mode,
+                    "timestamp": int(time.time() * 1000),
+                }
+            )
+            self.logger.debug(f"Publishing market data on topic {topic}: {market_data}")
+            self.publish_market_data(topic, market_data)
+            published_topics.add(topic)
+
+    @staticmethod
+    def _last_trade_time(message: dict) -> Any:
+        """The broker's last trade time (depth feed), else the feed time."""
+        ltt = message.get("ltt")
+        if ltt not in (None, ""):
+            return ltt
+        return message.get("ft")
+
+    def _add_reference_keys(self, result: dict, message: dict, depth: bool) -> None:
+        """Add OpenAlgo reference key names, only for fields the feed sent."""
+        if message.get("pc") not in (None, "", "-"):
+            result["percent_change"] = self._safe_float(message.get("pc"))
+        if message.get("ltq") not in (None, "", "-"):
+            result["last_quantity"] = self._safe_int(message.get("ltq"))
+        if message.get("ltt") not in (None, ""):
+            result["last_trade_time"] = message.get("ltt")
+        if depth:
+            if message.get("tbq") not in (None, "", "-"):
+                result["total_buy_quantity"] = self._safe_int(message.get("tbq"))
+            if message.get("tsq") not in (None, "", "-"):
+                result["total_sell_quantity"] = self._safe_int(message.get("tsq"))
 
     def _normalize_raw_data(self, message, mode) -> dict[str, Any]:
         """
@@ -853,29 +957,23 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         if mode == 1:  # LTP mode
             # Only include fields that are actually present in the message
-            if "lp" in message:
-                result["ltp"] = float(message["lp"])
-            if "ft" in message:
-                result["ltt"] = message["ft"]
+            if message.get("lp") not in (None, "", "-"):
+                result["ltp"] = self._safe_float(message["lp"])
+                ltt = self._last_trade_time(message)
+                if ltt not in (None, ""):
+                    result["ltt"] = ltt
 
         elif mode == 2:  # Quote mode
-            # Similar to Shoonya, include all fields with safe conversion
-            result["ltp"] = self._safe_float(message.get("lp"))
-            result["ltt"] = message.get("ft")
-            result["volume"] = self._safe_int(message.get("v"))
-            result["open"] = self._safe_float(message.get("o"))
-            result["high"] = self._safe_float(message.get("h"))
-            result["low"] = self._safe_float(message.get("l"))
-            result["close"] = self._safe_float(message.get("c"))
-            result["change_percent"] = self._safe_float(message.get("pc"))
-            result["average_price"] = self._safe_float(message.get("ap"))
-            result["oi"] = self._safe_int(message.get("oi"))
-            result["prev_oi"] = self._safe_int(message.get("poi"))
-            result["total_oi"] = self._safe_int(message.get("toi"))
-            result["bid"] = self._safe_float(message.get("bp1"))
-            result["bid_qty"] = self._safe_int(message.get("bq1"))
-            result["ask"] = self._safe_float(message.get("sp1"))
-            result["ask_qty"] = self._safe_int(message.get("sq1"))
+            # Nothing to publish until the snapshot holds a price or OHLC
+            if not any(key in message for key in ("lp", "o", "h", "l", "c", "v")):
+                return result
+            # Only fields Definedge has sent: a field not received yet is left
+            # out, never published as 0 (a 0 open or close reads as real data).
+            result.update(self._present_fields(message, self._QUOTE_FIELDS))
+            ltt = self._last_trade_time(message)
+            if ltt not in (None, ""):
+                result["ltt"] = ltt
+            self._add_reference_keys(result, message, depth=True)
 
             # Debug logging for OHLC
             if any(message.get(f) for f in ["o", "h", "l", "c"]):
@@ -884,6 +982,44 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 )
 
         return result
+
+    # OpenAlgo key, Definedge raw key, numeric type
+    _QUOTE_FIELDS = (
+        ("ltp", "lp", float),
+        ("volume", "v", int),
+        ("open", "o", float),
+        ("high", "h", float),
+        ("low", "l", float),
+        ("close", "c", float),
+        ("change_percent", "pc", float),
+        ("average_price", "ap", float),
+        ("oi", "oi", int),
+        ("prev_oi", "poi", int),
+        ("total_oi", "toi", int),
+        ("bid", "bp1", float),
+        ("bid_qty", "bq1", int),
+        ("ask", "sp1", float),
+        ("ask_qty", "sq1", int),
+    )
+    _DEPTH_EXTRA_FIELDS = (
+        ("ltq", "ltq", int),
+        ("total_buy_qty", "tbq", int),
+        ("total_sell_qty", "tsq", int),
+        ("lower_circuit", "lc", float),
+        ("upper_circuit", "uc", float),
+        ("52w_high", "52h", float),
+        ("52w_low", "52l", float),
+    )
+
+    def _present_fields(self, message: dict, fields) -> dict[str, Any]:
+        """The listed fields Definedge has sent, converted; absent ones omitted."""
+        out = {}
+        for name, raw_key, kind in fields:
+            value = message.get(raw_key)
+            if value in (None, "", "-"):
+                continue
+            out[name] = self._safe_int(value) if kind is int else self._safe_float(value)
+        return out
 
     def _safe_float(self, value, default=0.0):
         """Safely convert value to float (similar to Shoonya)"""
@@ -940,6 +1076,40 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         return True
 
+    @staticmethod
+    def _feed_types(mode: int) -> tuple[str, ...]:
+        """Definedge feeds an OpenAlgo mode subscribes.
+
+        Quote takes the depth feed as well as the touchline. Touchline updates
+        carry only the fields that changed, so a touchline acknowledgement
+        without OHLC (which Definedge sends; the adapter logs it) left Quote
+        with no open, high, low or close for the rest of the day, and the
+        touchline never carries last trade time, last quantity or the book
+        totals. The depth acknowledgement carries all of them (10-websocket.md,
+        Subscribe Depth). Depth messages reach Quote subscribers through the
+        merged per-scrip snapshot; no DEPTH topic is published unless Depth
+        itself is subscribed.
+        """
+        if mode == 1:
+            return ("tick",)
+        if mode == 2:
+            return ("tick", "depth")
+        return ("depth",)
+
+    def _release_ws_ref(self, scrip: str, subscription_type: str) -> bool:
+        """Drop one reference to a feed; True when the feed is no longer needed.
+
+        Caller holds self.lock.
+        """
+        refs = self.ws_subscription_refs.get(scrip)
+        if refs is None:
+            return True
+        key = "tick_count" if subscription_type == "tick" else "depth_count"
+        refs[key] = max(refs[key] - 1, 0)
+        if refs["tick_count"] == 0 and refs["depth_count"] == 0:
+            del self.ws_subscription_refs[scrip]
+        return refs[key] == 0
+
     def _should_ws_unsubscribe(self, scrip: str, mode: int) -> bool:
         """
         Check if we should send WebSocket unsubscription using reference counting
@@ -985,29 +1155,15 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         Returns:
             Dict: Normalized depth data with safe defaults
         """
-        # Use safe conversion for all fields like Shoonya does
-        result = {
-            "ltp": self._safe_float(message.get("lp")),
-            "ltt": message.get("ft"),
-            "volume": self._safe_int(message.get("v")),
-            "open": self._safe_float(message.get("o")),
-            "high": self._safe_float(message.get("h")),
-            "low": self._safe_float(message.get("l")),
-            "close": self._safe_float(message.get("c")),
-            "change_percent": self._safe_float(message.get("pc")),
-            "average_price": self._safe_float(message.get("ap")),
-            "ltq": self._safe_int(message.get("ltq")),
-            "ltt_time": message.get("ltt"),
-            "total_buy_qty": self._safe_int(message.get("tbq")),
-            "total_sell_qty": self._safe_int(message.get("tsq")),
-            "lower_circuit": self._safe_float(message.get("lc")),
-            "upper_circuit": self._safe_float(message.get("uc")),
-            "52w_high": self._safe_float(message.get("52h")),
-            "52w_low": self._safe_float(message.get("52l")),
-            "oi": self._safe_int(message.get("oi")),
-            "prev_oi": self._safe_int(message.get("poi")),
-            "total_oi": self._safe_int(message.get("toi")),
-        }
+        # Quote fields only once Definedge has sent them; the proxy hands this
+        # payload to Quote subscribers too, so a 0 here would blank them.
+        result = self._present_fields(message, self._QUOTE_FIELDS + self._DEPTH_EXTRA_FIELDS)
+        ltt = self._last_trade_time(message)
+        if ltt not in (None, ""):
+            result["ltt"] = ltt
+        if message.get("ltt") not in (None, ""):
+            result["ltt_time"] = message.get("ltt")
+        self._add_reference_keys(result, message, depth=True)
 
         # Handle depth data separately (similar to Shoonya)
         depth_buy = []

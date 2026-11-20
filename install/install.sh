@@ -45,6 +45,85 @@ check_status() {
     fi
 }
 
+# >>> Telegram /chart browser (kept identical in install.sh, install-multi.sh and update.sh)
+# Telegram /chart draws its images with Kaleido, which starts a headless Chrome or
+# Chromium as the OpenAlgo service account. A snap browser cannot start as that
+# account: snap needs a writable home, and a service account's home (/var/www) is not
+# one ("cannot create snap home dir"), so every render fails with "The browser seemed
+# to close immediately after starting". Ubuntu's chromium and chromium-browser packages
+# only install that snap, so they are never used here.
+
+# Prints the browser Kaleido will start and succeeds when it is one the service account
+# can run. Kaleido looks for Google Chrome first, then takes the first Chromium on PATH,
+# so the first name found below is the one it uses.
+chart_browser_path() {
+    local name path real
+    for name in chrome google-chrome google-chrome-stable chromium chromium-browser; do
+        path="$(command -v "$name" 2>/dev/null)" || continue
+        real="$(readlink -f "$path")"
+        # A snap command is /snap/bin/<name>, a link to /usr/bin/snap; Ubuntu's
+        # chromium-browser is a small script that starts the snap.
+        case "$path" in /snap/*) return 1 ;; esac
+        [ "$(basename "$real")" = "snap" ] && return 1
+        if [ "$(head -c 2 "$real" 2>/dev/null)" = "#!" ] && grep -qs "/snap/" "$real"; then
+            return 1
+        fi
+        echo "$real"
+        return 0
+    done
+    return 1
+}
+
+# Installs a browser for Telegram /chart when there is none the service account can run.
+# With apt: Google Chrome's .deb on amd64 (it adds Google's apt source, so Chrome
+# updates with the system), else Debian's own chromium package, never Ubuntu's snap.
+# With dnf or yum: the distribution's chromium, else Google Chrome's rpm on x86_64.
+# With pacman: chromium. Never fatal: OpenAlgo runs without it, only /chart cannot draw.
+ensure_chart_browser() {
+    local found tmp candidate
+    if found="$(chart_browser_path)"; then
+        log_message "Telegram /chart browser: $found" "$GREEN"
+        return 0
+    fi
+    log_message "\nInstalling a browser for Telegram /chart rendering..." "$BLUE"
+    if command -v apt-get >/dev/null 2>&1; then
+        if [ "$(dpkg --print-architecture 2>/dev/null)" = "amd64" ]; then
+            tmp="$(mktemp -d)"
+            if curl -fsSL -o "$tmp/google-chrome.deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb; then
+                sudo apt-get install -y "$tmp/google-chrome.deb" fonts-liberation || true
+            fi
+            rm -rf "$tmp"
+        fi
+        if ! chart_browser_path >/dev/null; then
+            # On Ubuntu the only candidate is the snap stub, whose version names the snap.
+            candidate="$(apt-cache policy chromium 2>/dev/null | awk '/Candidate:/ {print $2}')"
+            if [ -n "$candidate" ] && [ "$candidate" != "(none)" ] && [[ "$candidate" != *snap* ]]; then
+                sudo apt-get install -y chromium fonts-liberation || true
+            fi
+        fi
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        local pm=dnf
+        command -v dnf >/dev/null 2>&1 || pm=yum
+        sudo "$pm" install -y chromium liberation-fonts || true
+        if ! chart_browser_path >/dev/null && [ "$(uname -m)" = "x86_64" ]; then
+            sudo "$pm" install -y https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm liberation-fonts || true
+        fi
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --noconfirm --needed chromium ttf-liberation || true
+    fi
+    if found="$(chart_browser_path)"; then
+        log_message "Telegram /chart will use $found" "$GREEN"
+        if command -v snap >/dev/null 2>&1 && snap list chromium >/dev/null 2>&1; then
+            log_message "The chromium snap is not used by OpenAlgo. If nothing else needs it: sudo snap remove chromium" "$YELLOW"
+        fi
+    else
+        log_message "No browser the OpenAlgo service can start was installed, so Telegram /chart will not draw charts" "$YELLOW"
+        log_message "Install Google Chrome (amd64) or your distribution's chromium package; on arm64 Ubuntu, Chromium exists only as a snap, which cannot run as a service" "$YELLOW"
+    fi
+    return 0
+}
+# <<< Telegram /chart browser
+
 # Function to check current timezone
 check_timezone() {
     current_tz=$(timedatectl | grep "Time zone" | awk '{print $3}')
@@ -103,44 +182,128 @@ generate_hex() {
     $PYTHON_CMD -c "import secrets; print(secrets.token_hex(32))"
 }
 
+# ---------------------------------------------------------------------------
+# Optional fail2ban for this server. Asked once on a fresh install, default No.
+# It guards SSH logins to the server and nothing else: OpenAlgo has its own IP
+# ban for the app, and nginx jails are left off on purpose, because the nginx
+# rate limit also covers the webhook paths and a burst of alerts would get the
+# sender banned. Nothing in this step may stop the installation.
+# This block is repeated in each server installer on purpose: they are
+# downloaded and run on their own, before the repository (and install/lib) exists.
+# ---------------------------------------------------------------------------
+FAIL2BAN_WANTED="false"
+FAIL2BAN_JAIL_FILE="/etc/fail2ban/jail.d/openalgo.conf"
+FAIL2BAN_AUTH_LOG="/var/log/auth.log"
 
+# Only an interactive run is asked; a piped or unattended run means No
+fail2ban_can_ask() {
+    [ -t 0 ]
+}
 
-
-# Function to validate broker name
-validate_broker() {
-    local broker=$1
-
-    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
-
-    if [[ $valid_brokers == *"$broker"* ]]; then
+ask_fail2ban() {
+    FAIL2BAN_WANTED="false"
+    if ! command -v apt-get >/dev/null 2>&1; then
+        log_message "fail2ban: skipped, this server has no apt-get." "$YELLOW"
         return 0
-    else
-        return 1
+    fi
+    fail2ban_can_ask || return 0
+    local answer=""
+    read -r -p "Set up fail2ban to block repeated failed logins on this server? [y/N]: " answer || answer=""
+    case "$answer" in
+        [Yy]|[Yy][Ee][Ss]) FAIL2BAN_WANTED="true" ;;
+    esac
+    return 0
+}
+
+# A real IP address, as Python's ipaddress module reads one
+fail2ban_valid_ip() {
+    [ -n "$1" ] && command -v python3 >/dev/null 2>&1 \
+        && python3 -c 'import ipaddress, sys; ipaddress.ip_address(sys.argv[1])' "$1" >/dev/null 2>&1
+}
+
+# The address of the SSH session running this installer, or nothing. A
+# terminal multiplexer or a local console leaves other text where the address
+# would be (for example "tmux(12345).%0" or ":0"); that is not used.
+fail2ban_ssh_client_ip() {
+    local ip="${SSH_CLIENT%% *}"
+    if [ -z "$ip" ]; then
+        ip="${SSH_CONNECTION%% *}"
+    fi
+    if [ -z "$ip" ]; then
+        # sudo drops SSH_CLIENT; this terminal's login record may still have it
+        ip=$(who -m 2>/dev/null | sed -n 's/.*(\([^)]*\)).*/\1/p' | head -n 1)
+    fi
+    # [2001:db8::1] and fe80::1%eth0 forms
+    ip="${ip#\[}"
+    ip="${ip%\]}"
+    ip="${ip%%\%*}"
+    if fail2ban_valid_ip "$ip"; then
+        printf '%s' "$ip"
     fi
 }
 
-# Function to check if broker is XTS based
-is_xts_broker() {
-    local broker=$1
-    local xts_brokers="fivepaisaxts,compositedge,ibulls,iifl,jainamxts,wisdom"
-    if [[ $xts_brokers == *"$broker"* ]]; then
+setup_fail2ban() {
+    [ "$FAIL2BAN_WANTED" = "true" ] || return 0
+    log_message "\n=== Setting up fail2ban ===" "$BLUE"
+    if ! sudo apt-get install -y fail2ban; then
+        log_message "Warning: fail2ban could not be installed. The installation continues without it." "$YELLOW"
         return 0
-    else
-        return 1
     fi
+
+    local ssh_ip ignore conf
+    ssh_ip=$(fail2ban_ssh_client_ip)
+    ignore="127.0.0.1/8 ::1"
+    if [ -n "$ssh_ip" ]; then
+        ignore="$ignore $ssh_ip"
+    fi
+
+    conf="# Written by the OpenAlgo installer. Running it again replaces this file.
+[sshd]
+enabled = true
+maxretry = 5
+findtime = 10m
+bantime = 1h
+ignoreip = $ignore"
+    # Without rsyslog (Debian 12) SSH logins are only in the journal
+    if [ ! -f "$FAIL2BAN_AUTH_LOG" ]; then
+        sudo apt-get install -y python3-systemd >/dev/null 2>&1 || true
+        conf="$conf
+backend = systemd"
+    fi
+
+    if ! printf '%s\n' "$conf" | sudo tee "$FAIL2BAN_JAIL_FILE" >/dev/null; then
+        log_message "Warning: could not write $FAIL2BAN_JAIL_FILE. The installation continues without fail2ban." "$YELLOW"
+        return 0
+    fi
+    if ! { sudo systemctl enable fail2ban >/dev/null 2>&1 && sudo systemctl restart fail2ban; }; then
+        log_message "Warning: fail2ban did not start (see: sudo journalctl -u fail2ban). The installation continues." "$YELLOW"
+        return 0
+    fi
+    # fail2ban needs a moment after a restart before it answers
+    local tries=0
+    until sudo fail2ban-client status >/dev/null 2>&1; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 10 ]; then
+            log_message "Warning: fail2ban is installed but not answering (see: sudo fail2ban-client status). The installation continues." "$YELLOW"
+            return 0
+        fi
+        sleep 1
+    done
+
+    log_message "fail2ban is on for SSH logins (jail: sshd)." "$GREEN"
+    log_message "An address is banned for 1 hour after 5 failed SSH logins within 10 minutes." "$BLUE"
+    if [ -n "$ssh_ip" ]; then
+        log_message "The address you are installing from ($ssh_ip) and this server itself are never banned." "$BLUE"
+    else
+        log_message "Your SSH address could not be detected, so it is not exempt; only this server itself is." "$YELLOW"
+        log_message "To exempt it, add it to the ignoreip line in $FAIL2BAN_JAIL_FILE and run: sudo systemctl restart fail2ban" "$YELLOW"
+    fi
+    log_message "To unban an address: sudo fail2ban-client set sshd unbanip <ip>" "$BLUE"
+    return 0
 }
 
-# Function to check if broker is crypto based (24/7 markets, no auto-logout)
-# Uses space-delimited boundary matching for exact broker ID checks
-is_crypto_broker() {
-    local broker=$1
-    local crypto_brokers=" deltaexchange "
-    if [[ $crypto_brokers == *" $broker "* ]]; then
-        return 0
-    else
-        return 1
-    fi
-}
+
+
 
 # Function to check and handle existing files/directories
 handle_existing() {
@@ -364,69 +527,39 @@ while true; do
     break
 done
 
-# Get broker name
-while true; do
-
-    log_message "\nValid brokers: fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha" "$BLUE"
-
-    read -p "Enter your broker name: " BROKER_NAME
-    if validate_broker "$BROKER_NAME"; then
-        break
-    else
-        log_message "Invalid broker name. Please choose from the list above." "$RED"
-    fi
-done
-
-# Show redirect URL for broker setup
-log_message "\nRedirect URL for broker developer portal:" "$YELLOW"
-log_message "https://$DOMAIN/$BROKER_NAME/callback" "$GREEN"
-log_message "\nPlease use this URL in your broker's developer portal to generate API credentials." "$BLUE"
-log_message "Once you have the credentials, you can proceed with the installation." "$BLUE"
-echo ""
-
-# Get broker API credentials
-read -p "Enter your broker API key: " BROKER_API_KEY
-read -p "Enter your broker API secret: " BROKER_API_SECRET
-
-if [ -z "$BROKER_API_KEY" ] || [ -z "$BROKER_API_SECRET" ]; then
-    log_message "Error: Broker API credentials are required" "$RED"
-    exit 1
+# Optional: Remote MCP for hosted AI clients (Claude.ai, ChatGPT).
+# Same-domain mode — /mcp and /oauth/* are served from the same nginx
+# vhost as the dashboard, so the existing reverse-proxy config covers it.
+# Local stdio MCP (Claude Desktop / Cursor / Windsurf) works regardless.
+log_message "\nRemote MCP lets hosted AI clients (Claude.ai, ChatGPT) connect to OpenAlgo over HTTPS." "$BLUE"
+log_message "Skip this if you only use the local MCP server with Claude Desktop / Cursor." "$YELLOW"
+read -p "Enable Remote MCP? (y/N): " enable_mcp_input
+ENABLE_REMOTE_MCP="false"
+if [[ $enable_mcp_input =~ ^[Yy]$ ]]; then
+    ENABLE_REMOTE_MCP="true"
+    log_message "Remote MCP will be enabled at https://$DOMAIN/mcp" "$GREEN"
 fi
 
-# Check if the broker is XTS-based and ask for additional credentials if needed
-BROKER_API_KEY_MARKET=""
-BROKER_API_SECRET_MARKET=""
-if is_xts_broker "$BROKER_NAME"; then
-    log_message "\nThis broker ($BROKER_NAME) is XTS API-based and requires additional market data credentials." "$YELLOW"
-    read -p "Enter your broker market data API key: " BROKER_API_KEY_MARKET
-    read -p "Enter your broker market data API secret: " BROKER_API_SECRET_MARKET
-    
-    if [ -z "$BROKER_API_KEY_MARKET" ] || [ -z "$BROKER_API_SECRET_MARKET" ]; then
-        log_message "Error: Market data API credentials are required for XTS-based brokers" "$RED"
-        exit 1
-    fi
-fi
-
-# Check if the broker is crypto-based and disable auto-logout
-DISABLE_SESSION_EXPIRY="false"
-if is_crypto_broker "$BROKER_NAME"; then
-    log_message "\nThis broker ($BROKER_NAME) operates on 24/7 crypto markets." "$YELLOW"
-    log_message "Auto-logout (session expiry at 3 AM IST) will be disabled." "$GREEN"
-    DISABLE_SESSION_EXPIRY="true"
-fi
+# Optional fail2ban for this server (default No)
+ask_fail2ban
 
 # Generate random keys
 APP_KEY=$(generate_hex)
 API_KEY_PEPPER=$(generate_hex)
 
-# Installation paths with unique deployment name
-DEPLOY_NAME="${DOMAIN/./-}-${BROKER_NAME}"  # e.g., opendash-app-fyers
-BASE_PATH="/var/python/openalgo-flask/$DEPLOY_NAME"
-OPENALGO_PATH="$BASE_PATH/openalgo"
-VENV_PATH="$BASE_PATH/venv"
-SOCKET_PATH="$BASE_PATH"
+# Installation paths — single deployment per server. For 2+ deployments
+# side-by-side use install/install-multi.sh (different scheme).
+#
+#   App, venv, socket, .env all live under /var/python/openalgo
+#   systemd unit:  openalgo.service
+#   nginx vhost:   openalgo.conf
+DEPLOY_NAME="openalgo"
+OPENALGO_PATH="/var/python/openalgo"
+BASE_PATH="$OPENALGO_PATH"
+VENV_PATH="$OPENALGO_PATH/.venv"
+SOCKET_PATH="$OPENALGO_PATH"
 SOCKET_FILE="$SOCKET_PATH/openalgo.sock"
-SERVICE_NAME="openalgo-$DEPLOY_NAME"
+SERVICE_NAME="openalgo"
 
 # Set Nginx configuration paths based on OS
 case "$OS_TYPE" in
@@ -443,7 +576,7 @@ case "$OS_TYPE" in
         sudo mkdir -p "$NGINX_AVAILABLE"
         ;;
 esac
-NGINX_CONFIG_FILE="$NGINX_AVAILABLE/$DOMAIN.conf"
+NGINX_CONFIG_FILE="$NGINX_AVAILABLE/openalgo.conf"
 
 log_message "\nStarting OpenAlgo installation for $DEPLOY_NAME..." "$YELLOW"
 
@@ -521,11 +654,14 @@ case "$OS_TYPE" in
         ;;
 esac
 
+ensure_chart_browser
+
 # Install uv package installer
 log_message "\nInstalling uv package installer..." "$BLUE"
 case "$OS_TYPE" in
     ubuntu | debian | raspbian)
-        # Use snap for Ubuntu/Debian (native support)
+        UV_INSTALLED=false
+        # 1) Try snap first (native on Ubuntu/Debian)
         if command -v snap >/dev/null 2>&1; then
             if [ ! -e /snap ] && [ -d /var/lib/snapd/snap ]; then
                 sudo ln -s /var/lib/snapd/snap /snap
@@ -533,19 +669,47 @@ case "$OS_TYPE" in
             sleep 2
             if sudo snap install astral-uv --classic 2>/dev/null; then
                 log_message "uv installed via snap" "$GREEN"
+                UV_INSTALLED=true
             else
-                log_message "Snap installation failed, using pip fallback" "$YELLOW"
-                sudo $PYTHON_CMD -m pip install uv
+                log_message "Snap installation failed (snap store unreachable or astral-uv unavailable)" "$YELLOW"
             fi
-        else
-            sudo $PYTHON_CMD -m pip install uv
+        fi
+        # 2) Astral standalone installer — required on PEP 668 systems
+        #    (Ubuntu 24.04+, Debian 12+, Python 3.12+) where 'pip install'
+        #    refuses with externally-managed-environment. Installs a single
+        #    static binary to /usr/local/bin so it is on root's PATH for the
+        #    rest of this script and on every user's PATH for later use.
+        if [ "$UV_INSTALLED" = false ]; then
+            log_message "Installing uv via astral standalone installer..." "$BLUE"
+            if curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh; then
+                log_message "uv installed to /usr/local/bin" "$GREEN"
+                UV_INSTALLED=true
+            fi
+        fi
+        # 3) Last resort: pip with --break-system-packages (PEP 668 override).
+        if [ "$UV_INSTALLED" = false ]; then
+            log_message "Astral installer failed, using pip with --break-system-packages..." "$YELLOW"
+            sudo $PYTHON_CMD -m pip install --break-system-packages uv
+            UV_INSTALLED=true
         fi
         check_status "Failed to install uv"
         ;;
     centos | fedora | rhel | amzn)
-        # Use pip for RHEL (more reliable than snap)
-        log_message "Installing uv via pip for better compatibility..." "$BLUE"
-        sudo $PYTHON_CMD -m pip install uv
+        UV_INSTALLED=false
+        # Prefer astral standalone installer — works on PEP 668 systems
+        # (Fedora 38+, RHEL/Rocky/Alma 9+ with newer Python) and avoids the
+        # 'externally-managed-environment' error from system pip.
+        log_message "Installing uv via astral standalone installer..." "$BLUE"
+        if curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh; then
+            log_message "uv installed to /usr/local/bin" "$GREEN"
+            UV_INSTALLED=true
+        fi
+        # Fallback to pip with --break-system-packages.
+        if [ "$UV_INSTALLED" = false ]; then
+            log_message "Astral installer failed, using pip fallback..." "$YELLOW"
+            sudo $PYTHON_CMD -m pip install --break-system-packages uv
+            UV_INSTALLED=true
+        fi
         check_status "Failed to install uv"
         ;;
     arch)
@@ -626,8 +790,47 @@ if ! command -v certbot >/dev/null 2>&1; then
 fi
 log_message "Certbot installed successfully" "$GREEN"
 
-# Check and handle existing OpenAlgo installation
-handle_existing "$BASE_PATH" "installation directory" "OpenAlgo directory for $DEPLOY_NAME"
+# Check and handle existing OpenAlgo installation. A backup carries its .env
+# (security keys) and db/ (your data) into the fresh copy below; deleting it
+# asks first, because the keys and the database go with it.
+CARRY_FROM=""
+
+# Stop the running service before its folder is moved or deleted: the database
+# is then complete (SQLite folds its write-ahead log in when it closes), and no
+# old process keeps serving from the moved folder.
+stop_running_service() {
+    if command -v systemctl >/dev/null 2>&1 && sudo systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        log_message "Stopping the running $SERVICE_NAME service first..." "$BLUE"
+        sudo systemctl stop "$SERVICE_NAME"
+        check_status "Failed to stop the $SERVICE_NAME service"
+    fi
+}
+
+if [ -e "$BASE_PATH" ]; then
+    log_message "Warning: OpenAlgo directory for $DEPLOY_NAME already exists at $BASE_PATH" "$YELLOW"
+    read -p "Would you like to backup the existing installation directory? (y/n): " backup_choice
+    if [[ $backup_choice =~ ^[Yy]$ ]]; then
+        CARRY_FROM="${BASE_PATH}_backup_$(date +%Y%m%d_%H%M%S)"
+        stop_running_service
+        log_message "Creating backup at $CARRY_FROM" "$BLUE"
+        sudo mv "$BASE_PATH" "$CARRY_FROM"
+        check_status "Failed to create backup of the OpenAlgo directory"
+        log_message "Its .env (security keys), db/ (your data), strategies/ and keys/ will be copied into the new installation." "$GREEN"
+    else
+        log_message "Deleting it also deletes its .env (security keys) and db/ (users, saved broker keys, history)." "$RED"
+        log_message "They cannot be recovered afterwards." "$RED"
+        read -p "Type DELETE to remove the existing installation, or press Enter to stop: " remove_choice
+        if [ "$remove_choice" = "DELETE" ]; then
+            stop_running_service
+            log_message "Removing existing installation directory..." "$BLUE"
+            sudo rm -rf "$BASE_PATH"
+            check_status "Failed to remove existing installation directory"
+        else
+            log_message "Installation stopped. Nothing was changed." "$YELLOW"
+            exit 1
+        fi
+    fi
+fi
 
 # Create base directory
 log_message "\nCreating base directory..." "$BLUE"
@@ -636,8 +839,43 @@ check_status "Failed to create base directory"
 
 # Clone repository
 log_message "\nCloning OpenAlgo repository..." "$BLUE"
-sudo git clone https://github.com/marketcalls/openalgo.git $OPENALGO_PATH
+# --filter=blob:none makes this a partial clone: the server sends every
+# commit and tree but no file contents, so it pulls ~20 MB instead of
+# ~280 MB. Blobs outside the current checkout are fetched on demand, so
+# the full history stays usable -- all 4,824 commits, 62 tags, every
+# branch -- which keeps `git reset --hard HEAD~n`, tag checkouts and
+# branch switching working. Nearly all of that 280 MB is superseded
+# frontend/dist bundles that a server never reads. A host without filter
+# support just full-clones, so this is never worse than no flag at all.
+sudo git clone --filter=blob:none https://github.com/marketcalls/openalgo.git $OPENALGO_PATH
 check_status "Failed to clone OpenAlgo repository"
+
+# Bring the backed-up .env and the trader's own files into the fresh copy,
+# unchanged. From db/ (databases, their -wal/-shm files, the strategy key,
+# backups), strategies/ (scripts, configs, indicators, OpenScript) and keys/,
+# every file the new checkout does not already have is copied; files that ship
+# with OpenAlgo come from the new checkout. The backup folder is left as it was.
+carry_user_files() {
+    local dir rel failed=0
+    for dir in db strategies keys; do
+        [ -d "$CARRY_FROM/$dir" ] || continue
+        while IFS= read -r rel; do
+            [ -e "$OPENALGO_PATH/$rel" ] && continue
+            sudo mkdir -p "$OPENALGO_PATH/$(dirname "$rel")" && sudo cp -a "$CARRY_FROM/$rel" "$OPENALGO_PATH/$rel" || failed=1
+        done < <(cd "$CARRY_FROM" && sudo find "$dir" ! -type d)
+    done
+    return $failed
+}
+if [ -n "$CARRY_FROM" ]; then
+    if [ -f "$CARRY_FROM/.env" ]; then
+        sudo cp -p "$CARRY_FROM/.env" "$OPENALGO_PATH/.env"
+        check_status "Failed to copy .env from $CARRY_FROM"
+    fi
+    carry_user_files
+    check_status "Failed to copy your files from $CARRY_FROM"
+    log_message "Copied .env, db/, strategies/ and keys/ from $CARRY_FROM into the new installation." "$GREEN"
+    log_message "Logs and anything else stay in $CARRY_FROM." "$BLUE"
+fi
 
 # Create virtual environment using uv
 log_message "\nSetting up Python virtual environment with uv..." "$BLUE"
@@ -678,7 +916,7 @@ check_status "Failed to install Python dependencies"
 log_message "\nVerifying gunicorn and eventlet installation..." "$BLUE"
 if ! sudo bash -c "$ACTIVATE_CMD && pip freeze | grep -q 'gunicorn=='"; then
     log_message "Installing gunicorn..." "$YELLOW"
-    sudo $UV_CMD pip install --python $VENV_PATH/bin/python gunicorn
+    sudo $UV_CMD pip install --python $VENV_PATH/bin/python "gunicorn>=25.0,<26"
     check_status "Failed to install gunicorn"
 fi
 if ! sudo bash -c "$ACTIVATE_CMD && pip freeze | grep -q 'eventlet=='"; then
@@ -689,37 +927,66 @@ fi
 
 # Configure .env file
 log_message "\nConfiguring environment file..." "$BLUE"
-handle_existing "$OPENALGO_PATH/.env" "environment file" ".env file"
 
-sudo cp $OPENALGO_PATH/.sample.env $OPENALGO_PATH/.env
-sudo sed -i "s|YOUR_BROKER_API_KEY|$BROKER_API_KEY|g" $OPENALGO_PATH/.env
-sudo sed -i "s|YOUR_BROKER_API_SECRET|$BROKER_API_SECRET|g" $OPENALGO_PATH/.env
+# A .env is written only for a new install. An existing one keeps its keys
+# and broker settings untouched.
+ENV_KEPT="false"
+if [ -e "$OPENALGO_PATH/.env" ]; then
+    log_message "Kept the existing .env and its keys. It was not changed." "$GREEN"
+    if ! sudo grep -qE "^HOST_SERVER *= *'https://$DOMAIN'" "$OPENALGO_PATH/.env"; then
+        log_message "Note: that .env is set for a different domain than $DOMAIN; its HOST_SERVER and CORS were left as they are." "$YELLOW"
+    fi
+    # Report Remote MCP as the kept .env has it, not as answered above
+    ENV_KEPT="true"
+    if sudo grep -qiE "^[[:space:]]*MCP_HTTP_ENABLED[[:space:]]*=[[:space:]]*['\"]?true" "$OPENALGO_PATH/.env"; then
+        ENABLE_REMOTE_MCP="true"
+    else
+        ENABLE_REMOTE_MCP="false"
+    fi
+else
+    sudo cp $OPENALGO_PATH/.sample.env $OPENALGO_PATH/.env
 
-# Update market data API credentials if the broker is XTS-based
-if is_xts_broker "$BROKER_NAME"; then
-    sudo sed -i "s|YOUR_BROKER_MARKET_API_KEY|$BROKER_API_KEY_MARKET|g" $OPENALGO_PATH/.env
-    sudo sed -i "s|YOUR_BROKER_MARKET_API_SECRET|$BROKER_API_SECRET_MARKET|g" $OPENALGO_PATH/.env
+    # No broker in .env: the trader adds broker keys in OpenAlgo after signing in
+    # (Broker Configuration). VALID_BROKERS keeps the full list of brokers keys can be saved for.
+    sudo sed -i \
+        -e "s|^BROKER_API_KEY *=.*|BROKER_API_KEY = ''|" \
+        -e "s|^BROKER_API_SECRET *=.*|BROKER_API_SECRET = ''|" \
+        -e "s|^BROKER_API_KEY_MARKET *=.*|BROKER_API_KEY_MARKET = ''|" \
+        -e "s|^BROKER_API_SECRET_MARKET *=.*|BROKER_API_SECRET_MARKET = ''|" \
+        -e "s|^REDIRECT_URL *=.*|REDIRECT_URL = ''|" \
+        $OPENALGO_PATH/.env
+
+    sudo sed -i "s|http://127.0.0.1:5000|https://$DOMAIN|g" $OPENALGO_PATH/.env
+    # Explicitly set HOST_SERVER in case the default value didn't match
+    sudo sed -i "s|HOST_SERVER = '.*'|HOST_SERVER = 'https://$DOMAIN'|g" $OPENALGO_PATH/.env
+    sudo sed -i "s|OPENALGO_PLACEHOLDER_APP_KEY_REGENERATE_BEFORE_USE|$APP_KEY|g" $OPENALGO_PATH/.env
+    sudo sed -i "s|OPENALGO_PLACEHOLDER_API_KEY_PEPPER_REGENERATE_BEFORE_USE|$API_KEY_PEPPER|g" $OPENALGO_PATH/.env
+
+    # This deployment runs gunicorn behind the nginx reverse proxy configured below
+    # (Unix socket bind, not directly reachable from the internet). The proxy sets
+    # X-Forwarded-For / X-Real-IP for IP-based features; trust those headers.
+    sudo sed -i "s|TRUST_PROXY_HEADERS = 'FALSE'|TRUST_PROXY_HEADERS = 'TRUE'|g" $OPENALGO_PATH/.env
+
+    # Update WebSocket URL for production
+    sudo sed -i "s|WEBSOCKET_URL='.*'|WEBSOCKET_URL='wss://$DOMAIN/ws'|g" $OPENALGO_PATH/.env
+
+    # Enable Remote MCP if the operator opted in. Same-domain mode: /mcp and
+    # /oauth/* are served from the same nginx vhost as the dashboard, no
+    # extra config needed. Other MCP_* keys (auto-approve, write scope, CORS
+    # allowlist) inherit their defaults from .sample.env — flip them later
+    # in .env if you want stricter behavior on a shared deployment.
+    if [ "$ENABLE_REMOTE_MCP" = "true" ]; then
+        sudo sed -i "s|MCP_HTTP_ENABLED = 'False'|MCP_HTTP_ENABLED = 'True'|g" $OPENALGO_PATH/.env
+        sudo sed -i "s|MCP_PUBLIC_URL = ''|MCP_PUBLIC_URL = 'https://$DOMAIN'|g" $OPENALGO_PATH/.env
+        log_message "Remote MCP enabled at https://$DOMAIN/mcp" "$GREEN"
+    fi
 fi
 
-sudo sed -i "s|http://127.0.0.1:5000|https://$DOMAIN|g" $OPENALGO_PATH/.env
-# Explicitly set HOST_SERVER in case the default value didn't match
-sudo sed -i "s|HOST_SERVER = '.*'|HOST_SERVER = 'https://$DOMAIN'|g" $OPENALGO_PATH/.env
-sudo sed -i "s|<broker>|$BROKER_NAME|g" $OPENALGO_PATH/.env
-sudo sed -i "s|3daa0403ce2501ee7432b75bf100048e3cf510d63d2754f952e93d88bf07ea84|$APP_KEY|g" $OPENALGO_PATH/.env
-sudo sed -i "s|a25d94718479b170c16278e321ea6c989358bf499a658fd20c90033cef8ce772|$API_KEY_PEPPER|g" $OPENALGO_PATH/.env
-
-# Disable session expiry for crypto brokers (24/7 markets)
-if [ "$DISABLE_SESSION_EXPIRY" = "true" ]; then
-    sudo sed -i "s|DISABLE_SESSION_EXPIRY = 'false'|DISABLE_SESSION_EXPIRY = 'true'|g" $OPENALGO_PATH/.env
-    log_message "Session auto-logout disabled for crypto broker" "$GREEN"
-fi
-
-# Update WebSocket URL for production
-sudo sed -i "s|WEBSOCKET_URL='.*'|WEBSOCKET_URL='wss://$DOMAIN/ws'|g" $OPENALGO_PATH/.env
-
-# Update host bindings to allow external connections
-sudo sed -i "s|WEBSOCKET_HOST='127.0.0.1'|WEBSOCKET_HOST='0.0.0.0'|g" $OPENALGO_PATH/.env
-sudo sed -i "s|ZMQ_HOST='127.0.0.1'|ZMQ_HOST='0.0.0.0'|g" $OPENALGO_PATH/.env
+# Host bindings intentionally left at 127.0.0.1 (the .sample.env default):
+# - nginx on this host reverse-proxies /ws -> 127.0.0.1:WEBSOCKET_PORT, so the
+#   WebSocket server does not need to listen on all interfaces.
+# - ZMQ is an internal message bus between broker adapters and the WS proxy;
+#   binding it to 0.0.0.0 would expose the raw tick feed to the public IP.
 
 check_status "Failed to configure environment file"
 
@@ -743,6 +1010,13 @@ server {
     listen [::]:80;
     server_name $DOMAIN;
     root /var/www/html;
+
+    # OPENALGO_WEBHOOK_LOG_GUARD: URL credentials never enter nginx access logs.
+    set \$openalgo_loggable 1;
+    if (\$uri ~ ^/(strategy|flow|chartink)/webhook/) {
+        set \$openalgo_loggable 0;
+    }
+    access_log /var/log/nginx/${DOMAIN}_access.log combined if=\$openalgo_loggable;
     
     location / {
         try_files \$uri \$uri/ =404;
@@ -843,10 +1117,13 @@ fi
 
 # Configure final Nginx setup with SSL and socket
 log_message "\nConfiguring final Nginx setup..." "$BLUE"
-# Remove old config files to ensure clean write (with and without .conf extension)
+# Remove the existing openalgo nginx config and any legacy domain-keyed
+# files left over from older installs (pre-simple-paths) so the rewrite
+# below leaves exactly one openalgo vhost on disk.
 sudo rm -f $NGINX_CONFIG_FILE
-sudo rm -f ${NGINX_AVAILABLE}/${DOMAIN}
+sudo rm -f ${NGINX_AVAILABLE}/${DOMAIN} ${NGINX_AVAILABLE}/${DOMAIN}.conf
 if [ "$NGINX_CONFIG_MODE" = "sites" ]; then
+    sudo rm -f /etc/nginx/sites-enabled/openalgo.conf
     sudo rm -f /etc/nginx/sites-enabled/${DOMAIN}
     sudo rm -f /etc/nginx/sites-enabled/${DOMAIN}.conf
 fi
@@ -856,6 +1133,13 @@ server {
     listen 80;
     listen [::]:80;
     server_name $DOMAIN;
+
+    # OPENALGO_WEBHOOK_LOG_GUARD: suppress URL-secret routes before redirect logs.
+    set \$openalgo_loggable 1;
+    if (\$uri ~ ^/(strategy|flow|chartink)/webhook/) {
+        set \$openalgo_loggable 0;
+    }
+    access_log /var/log/nginx/${DOMAIN}_access.log combined if=\$openalgo_loggable;
 
     # WebSocket path exceptions to avoid 301 redirect loop
     location = /ws {
@@ -877,6 +1161,13 @@ server {
     listen [::]:443 ssl;
     
     server_name $DOMAIN;
+
+    # OPENALGO_WEBHOOK_LOG_GUARD: URL credentials never enter nginx access logs.
+    set \$openalgo_loggable 1;
+    if (\$uri ~ ^/(strategy|flow|chartink)/webhook/) {
+        set \$openalgo_loggable 0;
+    }
+    access_log /var/log/nginx/${DOMAIN}_access.log combined if=\$openalgo_loggable;
     
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
@@ -926,18 +1217,42 @@ server {
     location /ws/ {
         proxy_pass http://127.0.0.1:8765/;
         proxy_http_version 1.1;
-        
+
         # Extended timeouts for long-running connections (up to 24 hours)
         proxy_read_timeout 86400s;
         proxy_send_timeout 86400s;
-        
+
         # Disable proxy buffering for real-time data
         proxy_buffering off;
-        
+
         # WebSocket headers
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
-        
+
+        # Other headers
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+    }
+
+    # Socket.IO (Flask-SocketIO real-time events)
+    location /socket.io/ {
+        proxy_pass http://unix:$SOCKET_FILE;
+        proxy_http_version 1.1;
+
+        # Extended timeouts for long-lived Socket.IO sessions
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+
+        # Disable proxy buffering for real-time events
+        proxy_buffering off;
+
+        # WebSocket upgrade headers (required for Socket.IO WebSocket transport)
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+
         # Other headers
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -961,8 +1276,12 @@ server {
         proxy_buffers 4 256k;
         proxy_busy_buffers_size 256k;
 
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        # Plain HTTP only: /ws, /ws/ and /socket.io/ have their own blocks.
+        # Forcing "Connection: upgrade" here sent every ordinary request
+        # upstream with a bogus upgrade header and an empty Upgrade:, which
+        # breaks HTTP/1.1 keep-alive to gunicorn and shows up as intermittent
+        # truncated asset responses and 5xx (GitHub issue #1807).
+        proxy_set_header Connection "";
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -997,6 +1316,10 @@ After=network.target
 User=$WEB_USER
 Group=$WEB_GROUP
 WorkingDirectory=$OPENALGO_PATH
+# Set HOME so Kaleido/choreographer can write temp files for Telegram /chart.
+# Kaleido 1.x creates temp dirs in Path.home() (not TMPDIR); the default
+# www-data home /var/www/ is typically root-owned and not writable.
+Environment="HOME=$OPENALGO_PATH/tmp"
 # Environment variables for numba/scipy support
 Environment="TMPDIR=$OPENALGO_PATH/tmp"
 Environment="NUMBA_CACHE_DIR=$OPENALGO_PATH/tmp/numba_cache"
@@ -1027,35 +1350,6 @@ WantedBy=multi-user.target
 EOL
 check_status "Failed to create systemd service"
 
-# Create separate scheduler systemd service
-log_message "\nCreating scheduler systemd service..." "$BLUE"
-sudo tee /etc/systemd/system/openalgo-scheduler-${DEPLOY_NAME}.service > /dev/null << EOL
-[Unit]
-Description=OpenAlgo Strategy Scheduler ($DEPLOY_NAME)
-After=network.target ${SERVICE_NAME}.service
-Wants=${SERVICE_NAME}.service
-
-[Service]
-Type=simple
-User=$WEB_USER
-Group=$WEB_GROUP
-WorkingDirectory=$OPENALGO_PATH
-Environment="PATH=$VENV_PATH/bin:/usr/local/bin:/usr/bin:/bin"
-Environment="TMPDIR=$OPENALGO_PATH/tmp"
-Environment="NUMBA_CACHE_DIR=$OPENALGO_PATH/tmp/numba_cache"
-Environment="MPLCONFIGDIR=$OPENALGO_PATH/tmp/matplotlib"
-Environment="TZ=Asia/Kolkata"
-ExecStart=$VENV_PATH/bin/python $OPENALGO_PATH/scheduler.py
-Restart=always
-RestartSec=10
-StandardOutput=append:$OPENALGO_PATH/log/scheduler.log
-StandardError=append:$OPENALGO_PATH/log/scheduler.log
-
-[Install]
-WantedBy=multi-user.target
-EOL
-check_status "Failed to create scheduler systemd service"
-
 # Set correct permissions
 log_message "\nSetting permissions..." "$BLUE"
 
@@ -1077,6 +1371,10 @@ sudo chown -R $WEB_USER:$WEB_GROUP $OPENALGO_PATH
 sudo chmod -R 755 $OPENALGO_PATH
 # Set more restrictive permissions for sensitive directories
 sudo chmod 700 $OPENALGO_PATH/keys
+# Restrict .env to the service account only — contains APP_KEY, API_KEY_PEPPER,
+# broker API credentials, and SMTP password. The recursive chmod 755 above
+# would otherwise leave it world-readable on shared boxes.
+sudo chmod 600 $OPENALGO_PATH/.env
 
 # Remove existing socket file if it exists
 [ -S "$SOCKET_FILE" ] && sudo rm -f $SOCKET_FILE
@@ -1093,9 +1391,8 @@ check_status "Failed to set permissions"
 log_message "\nStarting services..." "$BLUE"
 sudo systemctl daemon-reload
 sudo systemctl enable $SERVICE_NAME
-sudo systemctl start $SERVICE_NAME
-sudo systemctl enable openalgo-scheduler-${DEPLOY_NAME}
-sudo systemctl start openalgo-scheduler-${DEPLOY_NAME}
+# restart, not start: a reinstall over a still-running unit must load the new code
+sudo systemctl restart $SERVICE_NAME
 sudo systemctl restart nginx
 check_status "Failed to start services"
 
@@ -1131,36 +1428,38 @@ if [ "$OS_TYPE" = "centos" ] || [ "$OS_TYPE" = "fedora" ] || [ "$OS_TYPE" = "rhe
     fi
 fi
 
+setup_fail2ban
+
 log_message "\nInstallation completed successfully!" "$GREEN"
 log_message "\nInstallation Summary:" "$YELLOW"
 log_message "Operating System: $OS_TYPE $OS_VERSION" "$BLUE"
 log_message "Deployment Name: $DEPLOY_NAME" "$BLUE"
 log_message "Domain: $DOMAIN" "$BLUE"
-log_message "Broker: $BROKER_NAME" "$BLUE"
 log_message "Installation Directory: $OPENALGO_PATH" "$BLUE"
-log_message "Environment File: $OPENALGO_PATH/.env" "$BLUE"
+if [ "$ENV_KEPT" = "true" ]; then
+    log_message "Environment File: $OPENALGO_PATH/.env (kept from before, not changed)" "$BLUE"
+else
+    log_message "Environment File: $OPENALGO_PATH/.env" "$BLUE"
+fi
 log_message "Socket File: $SOCKET_FILE" "$BLUE"
 log_message "Service Name: $SERVICE_NAME" "$BLUE"
 log_message "Nginx Config: $NGINX_CONFIG_FILE" "$BLUE"
 log_message "SSL: Enabled with Let's Encrypt" "$BLUE"
-if [ "$DISABLE_SESSION_EXPIRY" = "true" ]; then
-    log_message "Auto-Logout: Disabled (24/7 crypto market)" "$BLUE"
+if [ "$ENABLE_REMOTE_MCP" = "true" ]; then
+    log_message "Remote MCP: Enabled at https://$DOMAIN/mcp" "$BLUE"
 else
-    log_message "Auto-Logout: Enabled (3 AM IST daily)" "$BLUE"
+    log_message "Remote MCP: Disabled" "$BLUE"
 fi
 log_message "Installation Log: $LOG_FILE" "$BLUE"
 
 log_message "\nNext Steps:" "$YELLOW"
 log_message "1. Visit https://$DOMAIN to access your OpenAlgo instance" "$GREEN"
-log_message "2. Configure your broker settings in the web interface" "$GREEN"
+log_message "2. Sign in, open Broker Configuration and add your broker's keys. The page shows the redirect URL to register in your broker's developer console." "$GREEN"
 log_message "3. Review the logs using: sudo journalctl -u $SERVICE_NAME" "$GREEN"
 log_message "4. Monitor the application status: sudo systemctl status $SERVICE_NAME" "$GREEN"
 
 log_message "\nUseful Commands:" "$YELLOW"
 log_message "Restart OpenAlgo: sudo systemctl restart $SERVICE_NAME" "$BLUE"
-log_message "Restart Scheduler: sudo systemctl restart openalgo-scheduler-${DEPLOY_NAME}" "$BLUE"
 log_message "View Logs: sudo journalctl -u $SERVICE_NAME" "$BLUE"
-log_message "View Scheduler Logs: sudo journalctl -u openalgo-scheduler-${DEPLOY_NAME}" "$BLUE"
 log_message "Check Status: sudo systemctl status $SERVICE_NAME" "$BLUE"
-log_message "Check Scheduler: sudo systemctl status openalgo-scheduler-${DEPLOY_NAME}" "$BLUE"
 log_message "View Installation Log: cat $LOG_FILE" "$BLUE"

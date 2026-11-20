@@ -8,7 +8,20 @@ export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
+    // No build-time compression plugin. The .br/.gz variants it used to emit
+    // were force-committed with frontend/dist/ by CI, and because compressed
+    // output can be neither deflated nor delta-compressed by git, they grew
+    // into two thirds of the repository history and tripled clone times.
+    // utils/precompress_assets.py regenerates the gzip variants at app
+    // startup instead, from the tracked raw assets, in about 30ms once warm.
   ],
+  // plotly.js-dist-min's UMD wrapper has an unguarded `global.matchMedia`
+  // reference. Vite 8 no longer shims Node's `global` in the browser, so the
+  // /tools pages that load Plotly (StrategyBuilder, MaxPain, OI Tracker, etc.)
+  // threw "global is not defined". Map `global` to the browser `globalThis`.
+  define: {
+    global: 'globalThis',
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -29,41 +42,34 @@ export default defineConfig({
         target: 'http://localhost:5000',
         changeOrigin: true,
       },
+      // User indicator modules are served by Flask from strategies/indicators,
+      // never bundled, so the dev server has to pass them through too.
+      '/custom-indicators': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+      },
     },
   },
   build: {
     outDir: 'dist',
     sourcemap: false,
-    chunkSizeWarningLimit: 600,
+    // The OpenUI visualization package has a 1.96MB vendor chunk. Keep the
+    // warning above that known cost so builds stay signal-rich without
+    // splitting the package's tightly coupled visualization components.
+    chunkSizeWarningLimit: 2000,
     rollupOptions: {
       output: {
-        manualChunks: (id) => {
-          if (id.includes('node_modules')) {
-            // Core React - most stable, cached long-term
-            if (id.includes('/react-dom/') || id.includes('/react/') || id.includes('/scheduler/')) {
-              return 'vendor-react'
-            }
-            // Router
-            if (id.includes('react-router')) {
-              return 'vendor-router'
-            }
-            // Radix UI primitives
-            if (id.includes('@radix-ui')) {
-              return 'vendor-radix'
-            }
-            // Icons - frequently updated
-            if (id.includes('lucide-react')) {
-              return 'vendor-icons'
-            }
-            // Syntax highlighting - only needed on code pages
-            if (id.includes('react-syntax-highlighter') || id.includes('prismjs') || id.includes('refractor')) {
-              return 'vendor-syntax'
-            }
-            // Charts - only needed on chart pages
-            if (id.includes('recharts') || id.includes('d3-')) {
-              return 'vendor-charts'
-            }
+        // Split the stable framework libs into their own long-cached chunk
+        // so an app-code change doesn't bust react/router/query for returning
+        // users, and the browser can fetch vendor + page chunks in parallel.
+        // Vite already splits the heavy charting libs (plotly, openalgo-charts)
+        // automatically, so we only carve out the framework core here.
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return
+          if (/[\\/]node_modules[\\/](react|react-dom|react-router|react-router-dom|scheduler)[\\/]/.test(id)) {
+            return 'react-vendor'
           }
+          if (id.includes('tanstack/react-query')) return 'tanstack'
         },
       },
     },

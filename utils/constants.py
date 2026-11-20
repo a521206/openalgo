@@ -12,8 +12,11 @@ EXCHANGE_BFO = "BFO"  # BSE Futures & Options
 EXCHANGE_BCD = "BCD"  # BSE Currency
 EXCHANGE_MCX = "MCX"  # MCX Commodity
 EXCHANGE_NCDEX = "NCDEX"  # NCDEX Commodity
+EXCHANGE_NCO = "NCO"  # NSE Commodities (futures + options)
 EXCHANGE_NSE_INDEX = "NSE_INDEX"  # NSE Index
 EXCHANGE_BSE_INDEX = "BSE_INDEX"  # BSE Index
+EXCHANGE_MCX_INDEX = "MCX_INDEX"  # MCX Index (declared by Angel + Zerodha plugins)
+EXCHANGE_GLOBAL_INDEX = "GLOBAL_INDEX"  # Global indices (US30, JAPAN225, HANGSENG, GIFTNIFTY, etc.)
 EXCHANGE_CRYPTO = "CRYPTO"  # Crypto Exchanges (broker-agnostic; brexchange carries broker name)
 
 # Set of all crypto-family exchanges.
@@ -43,6 +46,7 @@ FNO_EXCHANGES: set[str] = {
     EXCHANGE_CDS,
     EXCHANGE_BCD,
     EXCHANGE_NCDEX,
+    EXCHANGE_NCO,
 } | CRYPTO_EXCHANGES
 
 VALID_EXCHANGES = [
@@ -54,8 +58,11 @@ VALID_EXCHANGES = [
     EXCHANGE_BCD,
     EXCHANGE_MCX,
     EXCHANGE_NCDEX,
+    EXCHANGE_NCO,
     EXCHANGE_NSE_INDEX,
     EXCHANGE_BSE_INDEX,
+    EXCHANGE_MCX_INDEX,
+    EXCHANGE_GLOBAL_INDEX,
     EXCHANGE_CRYPTO,
 ]
 
@@ -90,8 +97,11 @@ EXCHANGE_BADGE_COLORS = {
     EXCHANGE_BCD: "badge-error",
     EXCHANGE_MCX: "badge-primary",
     EXCHANGE_NCDEX: "badge-success",
+    EXCHANGE_NCO: "badge-success",
     EXCHANGE_NSE_INDEX: "badge-accent",
     EXCHANGE_BSE_INDEX: "badge-neutral",
+    EXCHANGE_MCX_INDEX: "badge-primary",
+    EXCHANGE_GLOBAL_INDEX: "badge-info",
     EXCHANGE_CRYPTO: "badge-primary",
 }
 
@@ -132,6 +142,53 @@ REQUIRED_MODIFY_ORDER_FIELDS = [
     "quantity",
     "disclosed_quantity",
     "trigger_price",
+]
+
+# Every interval the history API accepts, and therefore the only ones any
+# endpoint may advertise.
+#
+# Two endpoints have to agree about this and did not. `/api/v1/history`
+# validates against this list, while `/api/v1/intervals` advertised whatever
+# keys the broker's own timeframe map happened to hold. A broker map often
+# carries an alias for a resolution it already has: Zerodha maps both "60m" and
+# "1h" to Kite's "60minute". So `/intervals` offered "60m", the chart put it in
+# its timeframe dropdown, a user picked it, and every history request from then
+# on returned 400.
+#
+# That failure is worse than it sounds, because the choice is remembered. The
+# chart reloads, asks for the same rejected interval, fails again, and shows no
+# symbol and no bars, so there is no obvious way back to a working state.
+#
+# An alias outside this set stays usable as input to a broker module; it is
+# simply never offered. `services.intervals_service` filters on it.
+SUPPORTED_INTERVALS = [
+    # Seconds
+    "1s",
+    "5s",
+    "10s",
+    "15s",
+    "30s",
+    "45s",
+    # Minutes
+    "1m",
+    "2m",
+    "3m",
+    "5m",
+    "10m",
+    "15m",
+    "20m",
+    "30m",
+    # Hours
+    "1h",
+    "2h",
+    "3h",
+    "4h",
+    # Daily and longer
+    "D",
+    "W",
+    "M",
+    "Q",
+    "Y",
 ]
 
 # Default Values for Optional Fields

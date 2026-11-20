@@ -4,10 +4,12 @@ import os
 import time
 
 import pandas as pd
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine, text
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from broker.deltaexchange.api.rate_limiter import PUBLIC, consume
+from database.engine_factory import create_db_engine
 from extensions import socketio  # Import SocketIO
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
@@ -17,14 +19,7 @@ logger = get_logger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
 
 # Create engine with optimized settings for SQLite concurrency
-engine = create_engine(
-    DATABASE_URL,
-    pool_size=20,
-    max_overflow=50,
-    pool_timeout=30,
-    pool_recycle=3600,
-    connect_args={"timeout": 30, "check_same_thread": False},
-)
+engine = create_db_engine(DATABASE_URL)
 
 # Enable WAL mode for better concurrent access
 try:
@@ -83,6 +78,7 @@ def init_db():
             f"the column is added. Run: sqlite3 db/openalgo.db "
             f"\"ALTER TABLE symtoken ADD COLUMN contract_value REAL DEFAULT 1.0\" | Error: {e}"
         )
+
 
 
 def delete_symtoken_table():
@@ -241,7 +237,11 @@ def _to_canonical_symbol(delta_symbol: str, instrument_type: str, expiry: str) -
     # .P is the TradingView-standard suffix for perpetuals and avoids colliding
     # with BTCUSDT (Binance BTC/Tether spot pair — a completely different asset).
     if instrument_type == "PERPFUT":
-        return delta_symbol + ".P"
+        return delta_symbol + "FUT"
+
+    # ── Spot: BTC_INR → BTCINR (strip underscores) ─────────────────────────
+    if instrument_type == "SPOT":
+        return delta_symbol.replace("_", "")
 
     # ── All other types (SPREAD, COMBO, IRS, …): keep as-is ────────────────
     return delta_symbol
@@ -253,6 +253,8 @@ CONTRACT_TYPE_MAP = {
     "futures": "FUT",
     "call_options": "CE",
     "put_options": "PE",
+    "spot": "SPOT",
+    "move_options": "MOVE",
     "interest_rate_swaps": "IRS",
     "spreads": "SPREAD",
     "options_combos": "COMBO",
@@ -317,6 +319,9 @@ def fetch_delta_products():
             params["after"] = after_cursor
 
         try:
+            # Weight 3 per page against the public (IP) quota; a full master
+            # contract download is several pages.
+            consume("/v2/products", method="GET", bucket=PUBLIC)
             response = get_httpx_client().get(
                 url,
                 params=params,
@@ -380,13 +385,13 @@ def process_delta_products(products):
         token          ← id                    (int → str)
         brsymbol       ← symbol                (Delta-native, e.g. "C-BTC-80000-280225")
         symbol         ← canonical             (OpenAlgo format, e.g. "BTC28FEB2580000CE")
-        name           ← description
+        name           ← underlying_asset.symbol  (underlying root, e.g. "BTC")
         exchange       ← "CRYPTO"              (OpenAlgo exchange abstraction)
         brexchange     ← "DELTAIN"             (broker identifier — Delta Exchange India)
         expiry         ← settlement_time       (None → "" for perpetuals;
                                                 ISO string → "DD-MON-YY" for futures/options)
         strike         ← 0.0                   (strike is encoded in the symbol for options)
-        lotsize        ← 1                     (1 contract; contract_value gives underlying units)
+        lotsize        ← product_specs.min_order_size or 1  (fractional for spot, e.g. 0.0001 BTC)
         instrumenttype ← contract_type         (mapped via CONTRACT_TYPE_MAP)
         tick_size      ← tick_size             (string → float)
     """
@@ -437,31 +442,55 @@ def process_delta_products(products):
         except (ValueError, TypeError):
             tick_size = 0.0
 
-        # Extract strike for option contracts from symbol (e.g. C-BTC-80000-280225 -> 80000.0)
+        # Extract strike price — use the API field directly when available,
+        # fall back to parsing from the symbol (e.g. C-BTC-80000-280225 -> 80000.0)
         symbol_str = p.get("symbol", "")
         strike_val = 0.0
         if instrument_type in ("CE", "PE", "TCE", "TPE", "SYNCE", "SYNPE"):
-            parts_s = symbol_str.split("-")
-            if len(parts_s) >= 3:
-                try:
-                    strike_val = float(parts_s[2])
-                except (ValueError, TypeError):
-                    strike_val = 0.0
+            try:
+                strike_val = float(p.get("strike_price") or 0)
+            except (ValueError, TypeError):
+                strike_val = 0.0
+            # Fallback: parse from symbol if API field missing
+            if strike_val == 0.0:
+                parts_s = symbol_str.split("-")
+                if len(parts_s) >= 3:
+                    try:
+                        strike_val = float(parts_s[2])
+                    except (ValueError, TypeError):
+                        strike_val = 0.0
+
+        # Lot size: use min_order_size from product_specs (important for spot
+        # instruments where fractional quantities are allowed, e.g. 0.0001 BTC)
+        try:
+            lotsize = float(product_specs.get("min_order_size") or 1)
+        except (ValueError, TypeError):
+            lotsize = 1.0
 
         # Build OpenAlgo canonical symbol (exchange = CRYPTO, broker-agnostic format)
         canonical_symbol = _to_canonical_symbol(symbol_str, instrument_type, expiry)
+
+        # `name` must be the underlying root (BTC, ETH, SOL) — not a human
+        # description. database/symbol.py resolves option-chain expiries with
+        # `SymToken.name.ilike(underlying)`, an exact match, so storing
+        # "BTC call option expiring on 12-8-2026" here leaves the expiry
+        # dropdown empty with no error anywhere. Delta returns the root in
+        # underlying_asset.symbol for every contract type.
+        underlying_name = (p.get("underlying_asset") or {}).get("symbol") or ""
+        if not underlying_name:
+            underlying_name = p.get("description", symbol_str)
 
         rows.append(
             {
                 "token": str(p["id"]),
                 "symbol": canonical_symbol,   # OpenAlgo canonical (e.g. BTC28FEB2580000CE)
                 "brsymbol": symbol_str,        # Delta-native (e.g. C-BTC-80000-280225)
-                "name": p.get("description", symbol_str),
+                "name": underlying_name,       # Underlying root (e.g. BTC)
                 "exchange": "CRYPTO",          # OpenAlgo exchange abstraction
                 "brexchange": "DELTAIN",       # Broker identifier (Delta Exchange India)
                 "expiry": expiry,
                 "strike": strike_val,
-                "lotsize": 1,
+                "lotsize": lotsize,
                 "instrumenttype": instrument_type,
                 "tick_size": tick_size,
                 "contract_value": float(p.get("contract_value") or 1.0),

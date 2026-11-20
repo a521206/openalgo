@@ -5,13 +5,15 @@ Based on Noren WebSocket API (same as Flattrade)
 """
 
 import json
-import logging
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from typing import Any, Dict, Optional
 
 import websocket
+
+from utils.logging import get_logger
 
 
 class ZebuWebSocket:
@@ -20,10 +22,10 @@ class ZebuWebSocket:
     # Connection constants
     # Try different URL patterns based on other Noren brokers:
     # - Shoonya: wss://api.shoonya.com/NorenWSTP/
-    # - Flattrade: wss://piconnect.flattrade.in/PiConnectWSTp/
+    # - Flattrade: wss://piconnect.flattrade.in/PiConnectWSAPI/
     # - AliceBlue: wss://ws1.aliceblueonline.com/NorenWS/
     # - DefinEdge: wss://trade.definedgesecurities.com/NorenWSTRTP/
-    WS_URL = "wss://go.mynt.in/NorenWSTP/"  # Try NorenWSTP pattern
+    WS_URL = "wss://go.mynt.in/NorenWSAPI/"  # Zebu OAuth WebSocket endpoint
     CONNECTION_TIMEOUT = 15
     THREAD_JOIN_TIMEOUT = 5
 
@@ -32,18 +34,39 @@ class ZebuWebSocket:
     HEARTBEAT_TIMEOUT = 120
     PING_INTERVAL = 30
     PING_TIMEOUT = 10
+    HEARTBEAT_JOIN_TIMEOUT = 3
 
-    # Message types (same as Noren/Flattrade)
-    MSG_TYPE_CONNECT = "c"
+    # Market-data silence watchdog (issue #2075, same defect as Flattrade and
+    # Shoonya). A Noren session that keeps answering heartbeats while
+    # delivering no ticks is indistinguishable from a healthy one on
+    # _last_message_time alone, because every inbound frame stamps it -
+    # heartbeat acks included. Tick flow therefore gets its own clock, and the
+    # watchdog only arms once data has been arriving over time: frames in
+    # DATA_ARM_BUCKETS distinct buckets of DATA_ARM_BUCKET seconds, all within
+    # DATA_ARM_WINDOW. See _update_last_data_time for why spread matters and a
+    # frame count does not.
+    DATA_SILENCE_TIMEOUT = 180
+    DATA_ARM_BUCKET = 30
+    DATA_ARM_BUCKETS = 3
+    DATA_ARM_WINDOW = 300
+
+    # Message types (OAuth WebSocket API)
+    MSG_TYPE_CONNECT = "a"
     MSG_TYPE_HEARTBEAT = "h"
-    MSG_TYPE_AUTH_ACK = "ck"
+    # The doc's heartbeat ack is "hk"; "h" is kept because some Noren
+    # deployments echo the request type back instead. Only "h" was matched
+    # before, so an "hk" ack fell through to the market-data path - harmless
+    # while nothing read it, but it would have counted as a tick and defeated
+    # the silence watchdog below.
+    MSG_TYPE_HEARTBEAT_ACK = "hk"
+    MSG_TYPE_AUTH_ACK = "ak"
     MSG_TYPE_TOUCHLINE_SUB = "t"
     MSG_TYPE_TOUCHLINE_UNSUB = "u"
     MSG_TYPE_DEPTH_SUB = "d"
     MSG_TYPE_DEPTH_UNSUB = "ud"
 
     # Authentication response
-    AUTH_SUCCESS = "Ok"
+    AUTH_SUCCESS = "OK"
 
     def __init__(
         self,
@@ -89,8 +112,15 @@ class ZebuWebSocket:
         self._last_message_time = None
         self._heartbeat_lock = threading.Lock()
 
+        # Market-data liveness, kept apart from _last_message_time above so a
+        # socket that only answers heartbeats cannot pass for a live feed.
+        # Per connection: _reset_data_liveness() clears all three on open.
+        self._last_data_message_time = None
+        self._data_watchdog_armed = False
+        self._data_bucket_starts = deque(maxlen=self.DATA_ARM_BUCKETS)
+
         # Logging
-        self.logger = logging.getLogger("zebu_websocket")
+        self.logger = get_logger("zebu_websocket")
 
     def connect(self) -> bool:
         """
@@ -177,19 +207,24 @@ class ZebuWebSocket:
                 self.ws.close()
             except Exception as e:
                 self.logger.error(f"Error closing WebSocket: {e}")
+            finally:
+                self.ws = None
 
     def _wait_for_thread_completion(self) -> None:
         """Wait for WebSocket thread to complete"""
-        if self.ws_thread and self.ws_thread.is_alive():
-            self.ws_thread.join(timeout=self.THREAD_JOIN_TIMEOUT)
-            if self.ws_thread.is_alive():
+        ws_thread = self.ws_thread
+        if ws_thread and ws_thread.is_alive():
+            ws_thread.join(timeout=self.THREAD_JOIN_TIMEOUT)
+            if ws_thread.is_alive():
                 self.logger.warning("WebSocket thread did not terminate within timeout")
+        self.ws_thread = None
 
     # WebSocket Event Handlers
     def _on_open(self, ws) -> None:
         """Handle WebSocket connection open event"""
         self.connected = True
         self._update_last_message_time()
+        self._reset_data_liveness()
 
         self.logger.info("WebSocket connection opened, sending authentication")
 
@@ -206,20 +241,18 @@ class ZebuWebSocket:
         """
         auth_msg = {
             "t": self.MSG_TYPE_CONNECT,
-            "actid*": self.actid,  # Required field with asterisk as per Zebu docs
             "uid": self.user_id,
             "actid": self.actid,
-            "source": "API",  # Source of login request
-            "susertoken": self.susertoken,
+            "source": "API",
+            "accesstoken": self.susertoken,
         }
-
-        # No vendor code needed in WebSocket auth for Zebu
 
         # Log the authentication message for debugging (mask the token)
         debug_msg = auth_msg.copy()
-        if debug_msg.get("susertoken"):
-            debug_msg["susertoken"] = (
-                debug_msg["susertoken"][:10] + "..." if len(debug_msg["susertoken"]) > 10 else "***"
+        token_val = debug_msg.get("accesstoken", "")
+        if token_val:
+            debug_msg["accesstoken"] = (
+                token_val[:10] + "..." if len(token_val) > 10 else "***"
             )
         self.logger.info(f"Sending auth message: {debug_msg}")
 
@@ -237,6 +270,11 @@ class ZebuWebSocket:
 
         if self._handle_internal_message(message):
             return
+
+        # Everything that is not an auth ack or a heartbeat ack is a market
+        # data frame (tk/tf/dk/df), so this is the point where the feed - as
+        # opposed to the socket - proves it is alive. Issue #2075.
+        self._update_last_data_time()
 
         self._call_external_callback(self.on_message, ws, message)
 
@@ -256,7 +294,7 @@ class ZebuWebSocket:
 
             if msg_type == self.MSG_TYPE_AUTH_ACK:
                 return self._handle_auth_response(data)
-            elif msg_type == self.MSG_TYPE_HEARTBEAT:
+            elif msg_type in (self.MSG_TYPE_HEARTBEAT_ACK, self.MSG_TYPE_HEARTBEAT):
                 self.logger.debug("Received heartbeat response")
                 return True
 
@@ -311,6 +349,58 @@ class ZebuWebSocket:
                 self.logger.error(f"Error in external callback: {e}")
 
     # Heartbeat Management
+    def _update_last_data_time(self) -> None:
+        """Record a market-data frame and arm the data-silence watchdog.
+
+        Arming asks that data arrived *spread over time*, not that a lot of it
+        arrived. Noren answers every subscribe with a snapshot frame, so a
+        session opened overnight receives one frame per subscribed scrip
+        within a second of connecting - fifty symbols is fifty frames. Any
+        rule counting frames would arm on that burst and then recycle the
+        socket every DATA_SILENCE_TIMEOUT until the market opened, which on a
+        Noren gateway also risks a server-side session cooldown.
+
+        Bucketing is what separates the two. A burst lands in one bucket (two
+        if it straddles a boundary), while a live feed keeps producing frames
+        bucket after bucket. Requiring DATA_ARM_BUCKETS distinct buckets means
+        at least a couple of DATA_ARM_BUCKET-second spans of real flow before
+        the watchdog can fire, and DATA_ARM_WINDOW stops stray after-hours
+        ticks hours apart from accumulating into a false arm.
+
+        Arming lasts only for this connection. If the market closes while the
+        watchdog is armed, the feed falls silent, the socket is recycled once,
+        and the replacement starts disarmed - so the cost of a wrong guess is
+        bounded at one reconnect rather than a loop against the adapter's
+        reconnect budget.
+        """
+        now = time.time()
+        newly_armed = False
+
+        with self._heartbeat_lock:
+            self._last_data_message_time = now
+
+            if not self._data_watchdog_armed:
+                bucket_start = now - (now % self.DATA_ARM_BUCKET)
+                if not self._data_bucket_starts or self._data_bucket_starts[-1] != bucket_start:
+                    self._data_bucket_starts.append(bucket_start)
+
+                if (
+                    len(self._data_bucket_starts) == self._data_bucket_starts.maxlen
+                    and now - self._data_bucket_starts[0] <= self.DATA_ARM_WINDOW
+                ):
+                    self._data_watchdog_armed = True
+                    newly_armed = True
+
+        if newly_armed:
+            self.logger.info("Market data is flowing; watching for tick silence from here on")
+
+    def _reset_data_liveness(self) -> None:
+        """Clear the per-connection market-data liveness state."""
+        with self._heartbeat_lock:
+            self._last_data_message_time = None
+            self._data_watchdog_armed = False
+            self._data_bucket_starts.clear()
+
     def _update_last_message_time(self) -> None:
         """Update the timestamp of the last received message"""
         with self._heartbeat_lock:
@@ -326,10 +416,14 @@ class ZebuWebSocket:
         self.logger.debug("Heartbeat thread started")
 
     def _stop_heartbeat(self) -> None:
-        """Stop heartbeat monitoring thread"""
-        # Thread will stop when self.running becomes False
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+        """Stop heartbeat monitoring thread and wait for it to terminate"""
+        hb_thread = self._heartbeat_thread
+        if hb_thread and hb_thread.is_alive():
             self.logger.debug("Waiting for heartbeat thread to stop")
+            hb_thread.join(timeout=self.HEARTBEAT_JOIN_TIMEOUT)
+            if hb_thread.is_alive():
+                self.logger.warning("Heartbeat thread did not terminate within timeout")
+        self._heartbeat_thread = None
 
     def _heartbeat_worker(self) -> None:
         """Heartbeat worker thread - sends periodic heartbeats and monitors connection"""
@@ -368,21 +462,48 @@ class ZebuWebSocket:
             return False
 
     def _check_connection_health(self) -> bool:
-        """
-        Check connection health based on last message timestamp
+        """Recycle the socket when the session has stopped being useful.
+
+        Two independent timeouts, because a Noren session fails in two ways:
+
+        * HEARTBEAT_TIMEOUT catches a socket that has gone quiet altogether.
+        * DATA_SILENCE_TIMEOUT catches one that still answers heartbeats while
+          delivering no market data. That case used to be invisible here - the
+          heartbeat ack itself refreshed _last_message_time - so the feed could
+          stay dead for the rest of the session with the app still reporting a
+          healthy connection, and nothing downstream that runs on ticks (stop
+          losses, sandbox order triggers, Flow conditions) would fire. Checked
+          only once the watchdog is armed; see _update_last_data_time.
+          Issue #2075.
 
         Returns:
-            bool: True if connection is healthy, False if timed out
+            bool: True if connection is healthy, False if it was recycled
         """
-        with self._heartbeat_lock:
-            if self._last_message_time:
-                time_since_message = time.time() - self._last_message_time
-                if time_since_message > self.HEARTBEAT_TIMEOUT:
-                    self.logger.error("Connection timeout - no messages received")
-                    self._close_websocket()
-                    return False
+        now = time.time()
+        reason = None
 
-        return True
+        with self._heartbeat_lock:
+            if self._last_message_time and now - self._last_message_time > self.HEARTBEAT_TIMEOUT:
+                reason = "no messages received"
+            elif (
+                self._data_watchdog_armed
+                and self._last_data_message_time
+                and now - self._last_data_message_time > self.DATA_SILENCE_TIMEOUT
+            ):
+                silent_for = now - self._last_data_message_time
+                reason = (
+                    f"no market data for {silent_for:.0f}s while the session kept "
+                    "answering heartbeats"
+                )
+
+        if reason is None:
+            return True
+
+        # Closed outside the lock: the reader thread runs _on_close, which can
+        # route back through _stop_heartbeat on this very thread.
+        self.logger.error(f"Connection timeout - {reason}")
+        self._close_websocket()
+        return False
 
     # Subscription Management
     def subscribe_touchline(self, scrip_list: str) -> bool:

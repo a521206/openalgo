@@ -8,10 +8,11 @@ from datetime import datetime
 # Import httpx and shared client
 import httpx
 import pandas as pd
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from database.engine_factory import create_db_engine
 from extensions import socketio  # Import SocketIO
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
@@ -21,7 +22,7 @@ logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
 
-engine = create_engine(DATABASE_URL)
+engine = create_db_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -240,27 +241,166 @@ def process_5paisa_csv(path):
     new_df = pd.DataFrame()
     new_df["symbol"] = filtered_df["TradingSymbol"]
     new_df["brsymbol"] = filtered_df["Name"].str.upper().str.rstrip()
-    new_df["name"] = filtered_df["FullName"]
+    # `name` is derived below, once the index symbol normalization has run.
+    new_df["_symbolroot"] = filtered_df["SymbolRoot"].astype(str).str.strip()
     new_df["exchange"] = filtered_df["exchange"]
     new_df["brexchange"] = filtered_df["exchange"]
     new_df["token"] = filtered_df["ScripCode"]
     new_df["expiry"] = filtered_df["Expiry"]
     new_df["strike"] = filtered_df["StrikeRate"]
     new_df["lotsize"] = filtered_df["LotSize"]
-    new_df["instrumenttype"] = filtered_df["Series"]
+    # Futures arrive as Series "XX" (5Paisa's ScripType for a non-option
+    # contract), but every expiry/F&O lookup in OpenAlgo matches on the
+    # canonical "FUT" — services/expiry_service.py filters
+    # instrumenttype.in_(["FUTSTK", "FUTIDX", "FUT"]) and arbitrage_service
+    # asks for instrumenttype="FUT". Storing "XX" made futures expiries come
+    # back empty on every exchange. The symbol itself is already built with a
+    # FUT suffix above, so only the column was wrong.
+    # Cash rows in the "BE" series (trade-for-trade) are still equity: OpenAlgo
+    # has only EQ/FUT/CE/PE, so storing "BE" left 600 NSE/BSE stocks outside
+    # every EQ filter.
+    new_df["instrumenttype"] = filtered_df["Series"].replace({"XX": "FUT", "BE": "EQ"})
     new_df["tick_size"] = filtered_df["TickSize"]
-    # Common Index Symbol Formats
+    # Common Index Symbol Normalization
 
-    new_df["symbol"] = new_df["symbol"].replace(
+    # Step 1: Normalize NSE_INDEX symbols - uppercase and remove spaces/hyphens
+    nse_idx_mask = new_df["exchange"] == "NSE_INDEX"
+    new_df.loc[nse_idx_mask, "symbol"] = (
+        new_df.loc[nse_idx_mask, "symbol"]
+        .str.upper()
+        .str.replace(" ", "", regex=False)
+        .str.replace("-", "", regex=False)
+    )
+
+    # Step 2: Normalize BSE_INDEX symbols - uppercase and remove spaces/hyphens
+    bse_idx_mask = new_df["exchange"] == "BSE_INDEX"
+    new_df.loc[bse_idx_mask, "symbol"] = (
+        new_df.loc[bse_idx_mask, "symbol"]
+        .str.upper()
+        .str.replace(" ", "", regex=False)
+        .str.replace("-", "", regex=False)
+    )
+
+    # Step 3: Explicit rename map for symbols whose cleaned form differs from OpenAlgo standard
+    # Only apply to index exchanges to avoid renaming non-index symbols (e.g., ENERGY, FIN on NSE/BSE)
+    idx_rename_mask = new_df["exchange"].isin(["NSE_INDEX", "BSE_INDEX"])
+    new_df.loc[idx_rename_mask, "symbol"] = new_df.loc[idx_rename_mask, "symbol"].replace(
         {
-            "Nifty Next 50": "NIFTYNXT50",
-            "MIDCPNifty": "MIDCPNIFTY",
-            "India VIX": "INDIAVIX",
-            "BSE BANKEX": "BANKEX",
-            "BSE SENSEX 50": "SENSEX50",
+            # NSE Index symbols (post-cleanup: uppercase, no spaces/hyphens)
+            "NIFTY50": "NIFTY",
+            "NIFTYNEXT50": "NIFTYNXT50",
+            "NIFTYFINSERVICE": "FINNIFTY",
+            "NIFTYFINANCIALSERVICES": "FINNIFTY",
+            "NIFTYFIN": "FINNIFTY",
+            "NIFTYBANK": "BANKNIFTY",
+            "NIFTYMIDSELECT": "MIDCPNIFTY",
+            "NIFTYMIDCAPSELECT": "MIDCPNIFTY",
+            "NIFTYMCAP50": "NIFTYMIDCAP50",
+            "NIFTYMIDSMALLCAP400": "NIFTYMIDSML400",
+            "NIFTYSMALLCAP100": "NIFTYSMLCAP100",
+            "NIFTYSMALLCAP250": "NIFTYSMLCAP250",
+            "NIFTYSMALLCAP50": "NIFTYSMLCAP50",
+            "NIFTY100EQUALWEIGHT": "NIFTY100EQLWGT",
+            "NIFTY100LOWVOLATILITY30": "NIFTY100LOWVOL30",
+            "NIFTYMID100FREE": "NIFTYMIDCAP100",
+            # BSE Index symbols - short forms (raw SymbolRoot without BSE prefix)
+            "SNSX50": "SENSEX50",
+            "SNXT50": "BSESENSEXNEXT50",
+            "MID150": "BSE150MIDCAPINDEX",
+            "LMI250": "BSE250LARGEMIDCAPINDEX",
+            "MSL400": "BSE400MIDSMALLCAPINDEX",
+            "ENERGY": "BSEENERGY",
+            "FIN": "BSEFINANCIALSERVICES",
+            "FINSER": "BSEFINANCIALSERVICES",
+            "INDSTR": "BSEINDUSTRIALS",
+            "LRGCAP": "BSELARGECAP",
+            "MIDSEL": "BSEMIDCAPSELECTINDEX",
+            "SMLSEL": "BSESMALLCAPSELECTINDEX",
+            "TELCOM": "BSETELECOM",
+            # BSE Index symbols - BSE-prefixed forms (after cleanup of "BSE XXX" SymbolRoots)
+            "BSESENSEX50": "SENSEX50",
+            "BSEBANKEX": "BANKEX",
+            "BSEAUTO": "BSEAUTO",
+            "BSECAPGOOD": "BSECAPITALGOODS",
+            "BSECG": "BSECAPITALGOODS",
+            "BSECARBON": "BSECARBONEX",
+            "BSECONSDUR": "BSECONSUMERDURABLES",
+            "BSECD": "BSECONSUMERDURABLES",
+            "BSECPSE": "BSECPSE",
+            "BSEDOL100": "BSEDOLLEX100",
+            "BSEDOL200": "BSEDOLLEX200",
+            "BSEDOL30": "BSEDOLLEX30",
+            "BSEFMCG": "BSEFASTMOVINGCONSUMERGOODS",
+            "BSEFMC": "BSEFASTMOVINGCONSUMERGOODS",
+            "BSEGREENX": "BSEGREENEX",
+            "BSEHEALTHC": "BSEHEALTHCARE",
+            "BSEHC": "BSEHEALTHCARE",
+            "BSEINDIA150": "BSE150MIDCAPINDEX",
+            "BSEINFRA": "BSEINDIAINFRASTRUCTUREINDEX",
+            "BSEIT": "BSEINFORMATIONTECHNOLOGY",
+            "BSEIPO": "BSEIPO",
+            "BSEMETAL": "BSEMETAL",
+            "BSEMIDCAP": "BSEMIDCAP",
+            "BSEOIL&GAS": "BSEOIL&GAS",
+            "BSEPOWER": "BSEPOWER",
+            "BSEPSU": "BSEPSU",
+            "BSEPBI": "BSEPSU",
+            "BSEREALTY": "BSEREALTY",
+            "BSESMLCAP": "BSESMALLCAP",
+            "BSESMEIPO": "BSESMEIPO",
+            "BSETECK": "BSETECK",
+            "BSEPSUBANK": "BSEPSU",
         }
     )
-    # Return the processed DataFrame
+
+    # Step 3b: Derive `name` — the UNDERLYING root, not the contract description.
+    #
+    # Every F&O tool filters `name` with an exact match: the underlying dropdown
+    # is `distinct(SymToken.name)` and the expiry lookup is
+    # `SymToken.name.ilike("NIFTY")` (database/symbol.py). 5Paisa's FullName is
+    # the full contract description on derivatives ("NIFTY 01 SEP 2026 CE
+    # 18500.00") and the company name on cash ("AARTI INDUSTRIES LTD"), so
+    # storing it made the dropdown list 76,084 contract names instead of ~263
+    # roots and every expiry lookup return zero rows — the tools rendered empty
+    # with no error.
+    #
+    # SymbolRoot is exactly the underlying (verified against all 165,605 master
+    # rows: never blank on derivatives, never contains a space, and carries the
+    # OpenAlgo index names NIFTY / BANKNIFTY / FINNIFTY / MIDCPNIFTY /
+    # NIFTYNXT50 / SENSEX / BANKEX / SENSEX50). Cash and index rows take the
+    # normalized `symbol` instead, so the index rename map above
+    # ("NIFTY NEXT 50" -> NIFTYNXT50) is already applied — which is why this
+    # runs after Step 3 rather than beside the other column assignments.
+    is_derivative = new_df["instrumenttype"].isin(["CE", "PE", "FUT"])
+    new_df["name"] = new_df["symbol"].astype(str)
+    new_df.loc[is_derivative, "name"] = new_df.loc[is_derivative, "_symbolroot"]
+    # Fall back to the symbol wherever SymbolRoot was blank.
+    blank_root = new_df["name"].isna() | (new_df["name"].astype(str).str.strip() == "")
+    new_df.loc[blank_root, "name"] = new_df.loc[blank_root, "symbol"].astype(str)
+    new_df = new_df.drop(columns=["_symbolroot"])
+
+    # Step 4: Remove duplicate index symbols (keep first occurrence)
+    idx_mask = new_df["exchange"].isin(["NSE_INDEX", "BSE_INDEX"])
+    idx_df = new_df[idx_mask]
+    non_idx_df = new_df[~idx_mask]
+    idx_df = idx_df.drop_duplicates(subset=["symbol", "exchange"], keep="first")
+
+    # Step 5: Remove duplicate contracts (keep the highest ScripCode).
+    # 5Paisa's master lists some contracts under several ScripCodes whose rows
+    # are identical in every other column (seen on BFO for ITC around the
+    # ITC Hotels demerger and long-dated SENSEX strikes), so they all build
+    # the same OpenAlgo symbol and lookups by (symbol, exchange) became
+    # ambiguous. The newest listing carries the highest ScripCode.
+    before = len(non_idx_df)
+    non_idx_df = non_idx_df.sort_values("token", ascending=False).drop_duplicates(
+        subset=["symbol", "exchange"], keep="first"
+    )
+    if before != len(non_idx_df):
+        logger.info(
+            f"Dropped {before - len(non_idx_df)} duplicate (symbol, exchange) rows, "
+            "kept highest ScripCode"
+        )
+    new_df = pd.concat([non_idx_df, idx_df], ignore_index=True)
 
     return new_df
 

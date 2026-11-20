@@ -6,6 +6,66 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _log_unavailable_book(response, book):
+    """Log a Flattrade book read that returned no rows, at the level it deserves.
+
+    PiConnect answers an empty order, trade or position book with
+    {"stat": "Not_Ok", "emsg": "no data"}. That is the normal answer on a flat
+    account, and the order-update poller reads the order book every
+    ORDER_POLL_INTERVAL seconds (5 by default), so it is logged at debug. Any
+    other Not_Ok, such as "Session Expired :  Invalid Session Key", is a failed
+    read and is logged as a warning carrying the broker's message.
+
+    Args:
+        response: The raw PiConnect response, a dict or None.
+        book: The book's name for the log line, e.g. "order book".
+    """
+    if response is None:
+        logger.warning(f"Flattrade returned no response for the {book}.")
+        return
+    emsg = str(response.get("emsg", "")).strip()
+    if "no data" in emsg.lower():
+        logger.debug(f"Flattrade {book} is empty ({emsg}).")
+        return
+    logger.warning(f"Flattrade could not read the {book}: {emsg or response}")
+
+
+# Flattrade (Noren) order statuses arrive with underscores ("TRIGGER_PENDING")
+# and inconsistent casing ("Open" / "OPEN", "REJECT" / "REJECTED"), so normalize
+# the separator and case before matching.
+_COMPLETE_STATUSES = {"COMPLETE"}
+_REJECTED_STATUSES = {"REJECTED", "REJECT"}
+_CANCELLED_STATUSES = {"CANCELED", "CANCELLED"}
+# Still working at the exchange, i.e. modifiable/cancellable. A stop-loss order
+# waiting for its trigger sits in TRIGGER_PENDING and must surface as "open" so
+# the order book offers Modify/Cancel.
+_OPEN_STATUSES = {
+    "OPEN",
+    "PENDING",
+    "TRIGGER PENDING",
+    "NEW",
+    "REPLACED",
+    "OPEN PENDING",
+    "MODIFY PENDING",
+    "CANCEL PENDING",
+    "AFTER MARKET ORDER REQ RECEIVED",
+}
+
+
+def normalize_order_status(raw_status):
+    """Map a Flattrade status to an OpenAlgo status (open/complete/cancelled/rejected)."""
+    status = str(raw_status or "").strip().upper().replace("_", " ")
+    if status in _COMPLETE_STATUSES:
+        return "complete"
+    if status in _OPEN_STATUSES:
+        return "open"
+    if status in _REJECTED_STATUSES:
+        return "rejected"
+    if status in _CANCELLED_STATUSES:
+        return "cancelled"
+    return status.lower()
+
+
 def map_order_data(order_data):
     """
     Processes and modifies a list of order dictionaries based on specific conditions.
@@ -17,9 +77,8 @@ def map_order_data(order_data):
     - The modified order_data with updated 'tradingsymbol' and 'product' fields.
     """
     # Check if 'data' is None
-    if order_data is None or (isinstance(order_data, dict) and (order_data["stat"] == "Not_Ok")):
-        # Handle the case where there is no data
-        logger.warning("No data available.")
+    if order_data is None or (isinstance(order_data, dict) and order_data.get("stat") == "Not_Ok"):
+        _log_unavailable_book(order_data, "order book")
         order_data = {}  # or set it to an empty list if it's supposed to be a list
     else:
         order_data = order_data
@@ -36,46 +95,52 @@ def map_order_data(order_data):
             # Check if a symbol was found; if so, update the trading_symbol in the current order
             if symbol_from_db:
                 order["tsym"] = symbol_from_db
-                if (order["exch"] == "NSE" or order["exch"] == "BSE") and order["prd"] == "C":
-                    order["prd"] = "CNC"
-
-                elif order["prd"] == "I":
-                    order["prd"] = "MIS"
-
-                elif order["exch"] in ["NFO", "MCX", "BFO", "CDS"] and order["prd"] == "M":
-                    order["prd"] = "NRML"
-
-                if order["prctyp"] == "MKT":
-                    order["prctyp"] = "MARKET"
-                elif order["prctyp"] == "LMT":
-                    order["prctyp"] = "LIMIT"
-                elif order["prctyp"] == "SL-MKT":
-                    order["prctyp"] = "SL-M"
-                elif order["prctyp"] == "SL-LMT":
-                    order["prctyp"] = "SL"
-
-                # 🔥 NEW: Use avgprc if instname and avgprc are present (highest priority)
-                if order.get("instname") and order.get("avgprc"):
-                    avgprc = order.get("avgprc", 0)
-                    if avgprc and float(avgprc) > 0:
-                        order["prc"] = avgprc
-                        logger.debug(
-                            f"Updated price from avgprc for order with instname: {order.get('norenordno', '')} - Price: {avgprc}"
-                        )
-
-                # 🔥 EXISTING: Price logic for MARKET and SL-M orders (fallback)
-                elif order["prctyp"] in ["MARKET", "SL-M"] and float(order.get("prc", 0)) == 0.0:
-                    rprc = order.get("rprc", 0)
-                    if rprc and float(rprc) > 0:
-                        order["prc"] = rprc
-                        logger.debug(
-                            f"Updated price from rprc for {order['prctyp']} order: {order.get('norenordno', '')}"
-                        )
-
             else:
                 logger.warning(
                     f"Symbol not found for token {symboltoken} and exchange {exchange}. Keeping original trading symbol."
                 )
+
+            # Product, price type and the price fallback are independent of the
+            # symbol lookup, so map them unconditionally - otherwise a lookup
+            # miss leaves raw Noren values (e.g. "SL-LMT") that the order book's
+            # Modify dialog cannot match.
+            if (order["exch"] == "NSE" or order["exch"] == "BSE") and order["prd"] == "C":
+                order["prd"] = "CNC"
+
+            elif order["prd"] == "I":
+                order["prd"] = "MIS"
+
+            elif order["exch"] in ["NFO", "MCX", "BFO", "CDS"] and order["prd"] == "M":
+                order["prd"] = "NRML"
+
+            price_type = str(order.get("prctyp") or "").upper()
+            if price_type == "MKT":
+                order["prctyp"] = "MARKET"
+            elif price_type == "LMT":
+                order["prctyp"] = "LIMIT"
+            elif price_type in ("SL-MKT", "SLMKT"):
+                order["prctyp"] = "SL-M"
+            elif price_type in ("SL-LMT", "SLLMT"):
+                order["prctyp"] = "SL"
+
+            # NEW: Use avgprc if instname and avgprc are present (highest priority)
+            # Runs after the price-type mapping above, which the fallback reads.
+            if order.get("instname") and order.get("avgprc"):
+                avgprc = order.get("avgprc", 0)
+                if avgprc and float(avgprc) > 0:
+                    order["prc"] = avgprc
+                    logger.debug(
+                        f"Updated price from avgprc for order with instname: {order.get('norenordno', '')} - Price: {avgprc}"
+                    )
+
+            # EXISTING: Price logic for MARKET and SL-M orders (fallback)
+            elif order.get("prctyp") in ["MARKET", "SL-M"] and float(order.get("prc", 0)) == 0.0:
+                rprc = order.get("rprc", 0)
+                if rprc and float(rprc) > 0:
+                    order["prc"] = rprc
+                    logger.debug(
+                        f"Updated price from rprc for {order['prctyp']} order: {order.get('norenordno', '')}"
+                    )
 
     return order_data
 
@@ -106,11 +171,12 @@ def calculate_order_statistics(order_data):
                 total_sell_orders += 1
 
             # Count orders based on their status
-            if order["status"] == "COMPLETE":
+            status = normalize_order_status(order.get("status"))
+            if status == "complete":
                 total_completed_orders += 1
-            elif order["status"] == "OPEN":
+            elif status == "open":
                 total_open_orders += 1
-            elif order["status"] == "REJECTED":
+            elif status == "rejected":
                 total_rejected_orders += 1
 
     # Compile and return the statistics
@@ -123,6 +189,23 @@ def calculate_order_statistics(order_data):
     }
 
 
+def _int_or_zero(value) -> int:
+    """Coerce a Noren numeric field to int. Noren sends them as strings and
+    omits them entirely on an order that has never traded."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float_or_zero(value) -> float:
+    """Coerce a Noren numeric field to float, defaulting to 0.0."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def transform_order_data(orders):
     # Handle None or empty orders
     if orders is None:
@@ -130,7 +213,7 @@ def transform_order_data(orders):
         return []
 
     if not orders:
-        logger.info("No orders found - empty list")
+        logger.debug("No orders found - empty list")
         return []
 
     transformed_orders = []
@@ -153,8 +236,27 @@ def transform_order_data(orders):
             "pricetype": order.get("prctyp", ""),
             "product": order.get("prd", ""),
             "orderid": order.get("norenordno", ""),
-            "order_status": order.get("status", "").lower(),
+            "order_status": normalize_order_status(order.get("status")),
             "timestamp": order.get("norentm", ""),
+            # Fill state. Flattrade's OrderBook returns "fillshares" (total
+            # traded quantity) and "avgprc" (average traded price) - see
+            # broker-api-docs/flattrade-api-docs/03-orders.md, Order Book
+            # response - but this mapping used to drop both.
+            #
+            # That is load-bearing for order updates. Flattrade now ingests them
+            # by polling the normalized orderbook
+            # (websocket_proxy/order_adapter.py::PollingOrderUpdateAdapter),
+            # which detects a change by diffing (order_status, filled_quantity)
+            # per orderid. With filled_quantity absent it read 0 on every poll,
+            # so a partial fill that left the order OPEN changed nothing and
+            # published no event - the fill was invisible until the order
+            # reached a terminal state. Emitting these three fields is what
+            # makes partial fills observable on that path (issue #1806).
+            "filled_quantity": _int_or_zero(order.get("fillshares")),
+            "pending_quantity": max(
+                _int_or_zero(order.get("qty")) - _int_or_zero(order.get("fillshares")), 0
+            ),
+            "average_price": _float_or_zero(order.get("avgprc")),
         }
 
         transformed_orders.append(transformed_order)
@@ -173,11 +275,8 @@ def map_trade_data(trade_data):
     - The modified order_data with updated 'tradingsymbol' and 'product' fields.
     """
     # Check if 'data' is None
-    if trade_data is None or (isinstance(trade_data, dict) and (trade_data["stat"] == "Not_Ok")):
-        # Handle the case where there is no data
-        # For example, you might want to display a message to the user
-        # or pass an empty list or dictionary to the template.
-        logger.warning("No data available.")
+    if trade_data is None or (isinstance(trade_data, dict) and trade_data.get("stat") == "Not_Ok"):
+        _log_unavailable_book(trade_data, "trade book")
         trade_data = {}  # or set it to an empty list if it's supposed to be a list
     else:
         trade_data = trade_data
@@ -250,10 +349,9 @@ def map_position_data(position_data):
     - The modified position_data with updated 'tradingsymbol' and 'product' fields.
     """
     if position_data is None or (
-        isinstance(position_data, dict) and (position_data["stat"] == "Not_Ok")
+        isinstance(position_data, dict) and position_data.get("stat") == "Not_Ok"
     ):
-        # Handle the case where there is no data
-        logger.warning("No data available.")
+        _log_unavailable_book(position_data, "position book")
         position_data = {}  # or set it to an empty list if it's supposed to be a list
     else:
         position_data = position_data

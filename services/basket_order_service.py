@@ -1,18 +1,13 @@
 import copy
 import importlib
 import time
-import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from database.analyzer_db import async_log_analyzer
-from database.apilog_db import async_log_order
-from database.apilog_db import executor as log_executor
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
-from extensions import socketio
-from services.telegram_alert_service import telegram_alert_service
-from utils.api_analyzer import analyze_request, generate_order_id
+from events import AnalyzerErrorEvent, BasketCompletedEvent, OrderFailedEvent
+from utils.broker_backpressure import BrokerBusyError
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -20,6 +15,8 @@ from utils.constants import (
     VALID_PRICE_TYPES,
     VALID_PRODUCT_TYPES,
 )
+from utils.event_bus import bus
+from utils.httpx_client import UNANSWERED_ORDER_MESSAGE, watch_for_unanswered_writes
 from utils.logging import get_logger
 
 # Initialize logger
@@ -29,7 +26,7 @@ logger = get_logger(__name__)
 
 def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dict[str, Any]:
     """
-    Helper function to emit analyzer error events
+    Helper function to emit analyzer error events via the event bus.
 
     Args:
         request_data: Original request data
@@ -46,13 +43,14 @@ def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dic
         del analyzer_request["apikey"]
     analyzer_request["api_type"] = "basketorder"
 
-    # Log to analyzer database
-    log_executor.submit(async_log_analyzer, analyzer_request, error_response, "basketorder")
-
-    # Emit socket event asynchronously (non-blocking)
-    socketio.start_background_task(
-        socketio.emit, "analyzer_update", {"request": analyzer_request, "response": error_response}
-    )
+    bus.publish(AnalyzerErrorEvent(
+        mode="analyze",
+        api_type="basketorder",
+        request_data=analyzer_request,
+        response_data=error_response,
+        error_message=error_message,
+        api_key=request_data.get("apikey", ""),
+    ))
 
     return error_response
 
@@ -137,27 +135,51 @@ def place_single_order(
     Returns:
         Order result dictionary
     """
+    unanswered: list[str] = []
     try:
         # Place the order
-        res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
+        with watch_for_unanswered_writes() as unanswered:
+            res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
 
         if res.status == 200:
-            # No per-order event emission - a summary event is emitted at the end of all orders
-            return {"symbol": order_data["symbol"], "status": "success", "orderid": order_id}
+            # No per-order event emission - a summary event is emitted at the end of all orders.
+            # exchange/product identify the leg: a basket spans several contracts, so the
+            # summary event cannot supply them and subscribers have only this dict to key on.
+            return {
+                "symbol": order_data["symbol"],
+                "exchange": order_data.get("exchange", ""),
+                "product": order_data.get("product", ""),
+                "status": "success",
+                "orderid": order_id,
+            }
         else:
             message = (
                 response_data.get("message", "Failed to place order")
                 if isinstance(response_data, dict)
                 else "Failed to place order"
             )
+            if unanswered:
+                message = UNANSWERED_ORDER_MESSAGE
             return {"symbol": order_data["symbol"], "status": "error", "message": message}
 
+    except BrokerBusyError as e:
+        # Refused before it was sent: the broker's request queue was longer
+        # than a caller may wait under the gthread worker. Never raised under
+        # eventlet or the development server.
+        logger.warning(f"Basket leg {order_data.get('symbol', 'Unknown')} not sent: {e}")
+        return {
+            "symbol": order_data.get("symbol", "Unknown"),
+            "status": "error",
+            "message": str(e),
+        }
     except Exception as e:
         logger.exception(f"Error placing order for {order_data.get('symbol', 'Unknown')}: {e}")
         return {
             "symbol": order_data.get("symbol", "Unknown"),
             "status": "error",
-            "message": "Failed to place order due to internal error",
+            "message": UNANSWERED_ORDER_MESSAGE
+            if unanswered
+            else "Failed to place order due to internal error",
         }
 
 
@@ -201,6 +223,37 @@ def process_basket_order_with_auth(
         ]
         sorted_orders = buy_orders + sell_orders
 
+        # Pre-fetch all quotes in a single multiquotes call instead of
+        # N individual REST calls (one per order). This reduces basket
+        # order latency from N*300-500ms to ~150ms total.
+        quote_cache = {}
+        try:
+            from services.quotes_service import get_multiquotes
+
+            unique_symbols = {
+                (o.get("symbol"), o.get("exchange")) for o in sorted_orders
+                if o.get("symbol") and o.get("exchange")
+            }
+            if unique_symbols:
+                symbols_list = [
+                    {"symbol": s, "exchange": e} for s, e in unique_symbols
+                ]
+                success_mq, mq_response, _ = get_multiquotes(
+                    symbols=symbols_list, api_key=api_key
+                )
+                if success_mq and "results" in mq_response:
+                    for result in mq_response["results"]:
+                        sym = result.get("symbol")
+                        exch = result.get("exchange")
+                        data = result.get("data")
+                        if sym and exch and data:
+                            quote_cache[(sym, exch)] = data
+                    logger.info(
+                        f"Pre-fetched {len(quote_cache)} quotes for sandbox basket order"
+                    )
+        except Exception as e:
+            logger.debug(f"Multiquotes pre-fetch failed, falling back to per-order fetch: {e}")
+
         for i, order in enumerate(sorted_orders):
             # Create order data with common fields from basket order
             order_with_auth = order.copy()
@@ -219,15 +272,23 @@ def process_basket_order_with_auth(
                 )
                 continue
 
-            # Place order in sandbox
+            # Look up pre-fetched quote for this symbol
+            prefetched = quote_cache.get(
+                (order.get("symbol"), order.get("exchange"))
+            )
+
+            # Place order in sandbox with pre-fetched quote
             success, response, status_code = sandbox_place_order(
-                order_with_auth, api_key, {"apikey": api_key, "order_type": "basket"}
+                order_with_auth, api_key, {"apikey": api_key, "order_type": "basket"},
+                prefetched_quote=prefetched,
             )
 
             if success:
                 analyze_results.append(
                     {
                         "symbol": order.get("symbol", "Unknown"),
+                        "exchange": order.get("exchange", ""),
+                        "product": order.get("product", ""),
                         "status": "success",
                         "orderid": response.get("orderid"),
                         "batch_order": True,
@@ -249,31 +310,33 @@ def process_basket_order_with_auth(
         analyzer_request = basket_request_data.copy()
         analyzer_request["api_type"] = "basketorder"
 
-        # Log to analyzer database
-        log_executor.submit(async_log_analyzer, analyzer_request, response_data, "basketorder")
+        successful_orders = sum(1 for r in analyze_results if r.get("status") == "success")
+        bus.publish(BasketCompletedEvent(
+            mode="analyze",
+            api_type="basketorder",
+            strategy=basket_data.get("strategy", ""),
+            results=analyze_results,
+            successful=successful_orders,
+            total=total_orders,
+            request_data=analyzer_request,
+            response_data=response_data,
+            api_key=basket_data.get("apikey", ""),
+        ))
 
-        # Emit socket event for toast notification asynchronously (non-blocking)
-        socketio.start_background_task(
-            socketio.emit,
-            "analyzer_update",
-            {"request": analyzer_request, "response": response_data},
-        )
-
-        # Send Telegram alert in background task (non-blocking)
-        socketio.start_background_task(
-            telegram_alert_service.send_order_alert,
-            "basketorder",
-            basket_data,
-            response_data,
-            basket_data.get("apikey"),
-        )
         return True, response_data, 200
 
     # Live mode - process actual orders
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}
-        log_executor.submit(async_log_order, "basketorder", original_data, error_response)
+        bus.publish(OrderFailedEvent(
+            mode="live",
+            api_type="basketorder",
+            request_data=basket_request_data,
+            response_data=error_response,
+            error_message="Broker-specific module not found",
+            api_key=basket_data.get("apikey", ""),
+        ))
         return False, error_response, 404
 
     # Sort orders to prioritize BUY orders before SELL orders
@@ -318,34 +381,19 @@ def process_basket_order_with_auth(
 
     # Log the basket order results
     response_data = {"status": "success", "results": results}
-    log_executor.submit(async_log_order, "basketorder", basket_request_data, response_data)
 
-    # Emit single summary order event at the end (page refreshes only once)
     successful_orders = sum(1 for r in results if r.get("status") == "success")
-    socketio.start_background_task(
-        socketio.emit,
-        "order_event",
-        {
-            "symbol": basket_data.get("strategy", "Basket"),
-            "action": f"{successful_orders}/{len(results)} orders",
-            "orderid": f"basket_{successful_orders}",
-            "exchange": "MULTI",
-            "price_type": "BASKET",
-            "product_type": "BASKET",
-            "mode": "live",
-            "batch_order": True,
-            "is_last_order": True,
-        },
-    )
-
-    # Send Telegram alert in background task (non-blocking)
-    socketio.start_background_task(
-        telegram_alert_service.send_order_alert,
-        "basketorder",
-        basket_data,
-        response_data,
-        original_data.get("apikey"),
-    )
+    bus.publish(BasketCompletedEvent(
+        mode="live",
+        api_type="basketorder",
+        strategy=basket_data.get("strategy", ""),
+        results=results,
+        successful=successful_orders,
+        total=len(results),
+        request_data=basket_request_data,
+        response_data=response_data,
+        api_key=original_data.get("apikey", ""),
+    ))
 
     return True, response_data, 200
 

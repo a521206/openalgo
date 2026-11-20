@@ -7,14 +7,17 @@ Optimized for backtesting and analytical queries.
 """
 
 import os
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from dotenv import load_dotenv
 
+from utils import real_threading
 from utils.logging import get_logger
 
 # Initialize logger
@@ -25,6 +28,53 @@ load_dotenv()
 
 # Database path - in /db folder like other OpenAlgo databases
 HISTORIFY_DB_PATH = os.getenv("HISTORIFY_DATABASE_PATH", "db/historify.duckdb")
+
+# DuckDB permits concurrent connections, but conflicting writes are optimistic:
+# one transaction loses rather than waiting for another to finish.  Historify is
+# deliberately a single-process service, so serialize every logical mutation in
+# this process.  Keep the lock at the function boundary: several mutations are
+# read-then-write sequences and locking individual statements does not make
+# those sequences atomic.
+# Mutations can yield during connection/conflict retries. This must be green
+# under eventlet so another waiting writer cannot block the lock holder's hub.
+# Native background callers enter through run_on_hub below.
+_historify_write_lock = threading.Lock()
+
+
+def _serialized_write(func):
+    """Run one complete Historify mutation without an in-process writer race."""
+
+    def write(*args, **kwargs):
+        with _historify_write_lock:
+            return func(*args, **kwargs)
+
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        # Do not impose a new write deadline. Under eventlet a native thread
+        # cannot take a green lock directly; elsewhere this is inline.
+        return real_threading.run_on_hub(write, *args, timeout=None, **kwargs)
+
+    return wrapped
+
+
+def _retry_duckdb_conflict(func):
+    """Retry the rare conflict from a writer outside this process."""
+
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        import time
+
+        import duckdb
+
+        for attempt in range(3):
+            try:
+                return func(*args, **kwargs)
+            except (duckdb.ConstraintException, duckdb.TransactionException):
+                if attempt == 2:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+
+    return wrapped
 
 
 def get_db_path() -> str:
@@ -91,6 +141,83 @@ def get_connection(max_retries: int = 3, retry_delay: float = 0.5):
         conn.close()
 
 
+# Tables whose IDs come from DuckDB sequences. They predate the sequences, and
+# a checkout without them (main, or an older release) assigns MAX(id) + 1 itself,
+# which never advances a sequence left in the file.
+ID_SEQUENCES: tuple[tuple[str, str], ...] = (
+    ("watchlist_id_seq", "watchlist"),
+    ("data_catalog_id_seq", "data_catalog"),
+    ("job_items_id_seq", "job_items"),
+    ("historify_schedule_executions_id_seq", "historify_schedule_executions"),
+)
+
+
+def _next_sequence_value(start: int, last: int | None, step: int) -> int:
+    """The value a sequence hands out next, or one below it, never above.
+
+    ``duckdb_sequences()`` means two things by ``last_value``. Within the
+    session that drew from a sequence it is the value last handed out, so the
+    next is ``last + step``. Once the database is reopened, both ``start_value``
+    and ``last_value`` hold the value still to come. The two look the same when
+    exactly one value has been drawn since the sequence was created or the
+    database opened, and that case is read as the lower one: the worst it can
+    cause is re-creating a sequence at the value it already had, where the
+    higher reading would miss a sequence one behind its table.
+    """
+    if last is None or last == start:
+        return start
+    return last + step
+
+
+def sync_id_sequences(conn, apply: bool = True) -> list[dict[str, Any]]:
+    """Make each ID sequence hand out the next unused ID.
+
+    A missing sequence is created at its table's high-water mark, which is how
+    an existing installation first gains them. A sequence that is behind its
+    table is moved past it: after a return from a checkout without sequences,
+    the one left in the file still points at IDs that code has since used, so
+    every insert collides. Each call here opens its own connection, and a draw
+    made by a failed insert is not kept once the database is reopened, so the
+    collision repeats on every attempt until something moves the sequence. A
+    sequence already ahead of its table is left alone, as is a table that does
+    not exist yet (whatever creates it later runs this again).
+
+    No column default refers to these sequences, so replacing one is safe.
+
+    Args:
+        conn: An open DuckDB connection.
+        apply: False to report what would change without changing anything.
+
+    Returns:
+        One entry per sequence that needed work: ``sequence``, ``action``
+        ("create" or "advance"), ``next_before`` (None when it did not exist)
+        and ``next_after``.
+    """
+    existing_tables = {row[0] for row in conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()}
+    changes: list[dict[str, Any]] = []
+    for sequence, table in ID_SEQUENCES:
+        if table not in existing_tables:
+            continue
+        next_id = conn.execute(f"SELECT COALESCE(MAX(id), 0) + 1 FROM {table}").fetchone()[0]
+        row = conn.execute(
+            "SELECT start_value, last_value, increment_by FROM duckdb_sequences() WHERE sequence_name = ?",
+            [sequence],
+        ).fetchone()
+        if row is None:
+            action, current = "create", None
+        else:
+            current = _next_sequence_value(*row)
+            if current >= next_id:
+                continue
+            action = "advance"
+        if apply:
+            verb = "CREATE SEQUENCE" if action == "create" else "CREATE OR REPLACE SEQUENCE"
+            conn.execute(f"{verb} {sequence} START {next_id}")
+        changes.append({"sequence": sequence, "action": action, "next_before": current, "next_after": next_id})
+    return changes
+
+
+@_serialized_write
 def init_database():
     """
     Initialize the Historify database schema.
@@ -240,19 +367,25 @@ def init_database():
             )
         """)
 
-        # Create indexes for common query patterns
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_market_data_timestamp
-            ON market_data (timestamp)
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_market_data_exchange_time
-            ON market_data (exchange, timestamp)
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_market_data_interval_time
-            ON market_data (interval, timestamp)
-        """)
+        # These tables predate DuckDB sequences. Create each missing sequence at
+        # the table's high-water mark, and move one that fell behind past it;
+        # upgrade/migrate_historify_sequences.py applies the same step.
+        for change in sync_id_sequences(conn):
+            if change["action"] == "advance":
+                logger.warning(
+                    f"Historify ID sequence {change['sequence']} was behind its table "
+                    f"(next {change['next_before']}); moved to {change['next_after']}"
+                )
+            else:
+                logger.info(
+                    f"Created Historify ID sequence {change['sequence']} "
+                    f"starting at {change['next_after']}"
+                )
+
+        # No secondary indexes on market_data: every query leads with
+        # `symbol`, DuckDB serves range scans from per-row-group zone maps,
+        # and ART index memory stays fully resident as the table grows,
+        # which OOMs large 1m backfills. See #1779.
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_job_items_job_id
             ON job_items (job_id)
@@ -293,6 +426,7 @@ def get_watchlist() -> list[dict[str, Any]]:
         return result.to_dict("records")
 
 
+@_serialized_write
 def add_to_watchlist(symbol: str, exchange: str, display_name: str = None) -> tuple[bool, str]:
     """
     Add a symbol to the watchlist.
@@ -313,16 +447,12 @@ def add_to_watchlist(symbol: str, exchange: str, display_name: str = None) -> tu
             if existing:
                 return True, f"{symbol} already in watchlist"
 
-            # DuckDB doesn't auto-generate IDs, so we need to calculate the next ID
-            result = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM watchlist").fetchone()
-            next_id = result[0] if result else 1
-
             conn.execute(
                 """
                 INSERT INTO watchlist (id, symbol, exchange, display_name)
-                VALUES (?, ?, ?, ?)
+                VALUES (nextval('watchlist_id_seq'), ?, ?, ?)
             """,
-                [next_id, symbol.upper(), exchange.upper(), display_name],
+                [symbol.upper(), exchange.upper(), display_name],
             )
 
         logger.info(f"Added {symbol}:{exchange} to watchlist")
@@ -332,6 +462,7 @@ def add_to_watchlist(symbol: str, exchange: str, display_name: str = None) -> tu
         return False, str(e)
 
 
+@_serialized_write
 def bulk_add_to_watchlist(symbols: list[dict[str, str]]) -> tuple[int, int, list[dict[str, str]]]:
     """
     Add multiple symbols to the watchlist in a single transaction.
@@ -353,10 +484,6 @@ def bulk_add_to_watchlist(symbols: list[dict[str, str]]) -> tuple[int, int, list
                 SELECT symbol, exchange FROM watchlist
             """).fetchall()
             existing_set = {(row[0], row[1]) for row in existing_result}
-
-            # Get the current max ID
-            max_id_result = conn.execute("SELECT COALESCE(MAX(id), 0) FROM watchlist").fetchone()
-            next_id = max_id_result[0] + 1
 
             # Prepare records for bulk insert
             records_to_insert = []
@@ -380,16 +507,15 @@ def bulk_add_to_watchlist(symbols: list[dict[str, str]]) -> tuple[int, int, list
                     skipped += 1
                     continue
 
-                records_to_insert.append((next_id, symbol, exchange, display_name))
+                records_to_insert.append((symbol, exchange, display_name))
                 existing_set.add((symbol, exchange))  # Prevent duplicates within batch
-                next_id += 1
 
             # Bulk insert all records at once
             if records_to_insert:
                 conn.executemany(
                     """
                     INSERT INTO watchlist (id, symbol, exchange, display_name)
-                    VALUES (?, ?, ?, ?)
+                    VALUES (nextval('watchlist_id_seq'), ?, ?, ?)
                 """,
                     records_to_insert,
                 )
@@ -403,6 +529,7 @@ def bulk_add_to_watchlist(symbols: list[dict[str, str]]) -> tuple[int, int, list
         return 0, 0, [{"symbol": "batch", "exchange": "", "error": str(e)}]
 
 
+@_serialized_write
 def remove_from_watchlist(symbol: str, exchange: str) -> tuple[bool, str]:
     """
     Remove a symbol from the watchlist.
@@ -427,6 +554,7 @@ def remove_from_watchlist(symbol: str, exchange: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+@_serialized_write
 def bulk_remove_from_watchlist(
     symbols: list[dict[str, str]],
 ) -> tuple[int, int, list[dict[str, str]]]:
@@ -493,6 +621,7 @@ def bulk_remove_from_watchlist(
         return 0, 0, [{"symbol": "ALL", "exchange": "ALL", "error": str(e)}]
 
 
+@_serialized_write
 def clear_watchlist() -> tuple[bool, str]:
     """Clear all symbols from watchlist."""
     try:
@@ -510,6 +639,8 @@ def clear_watchlist() -> tuple[bool, str]:
 # =============================================================================
 
 
+@_serialized_write
+@_retry_duckdb_conflict
 def upsert_market_data(df: pd.DataFrame, symbol: str, exchange: str, interval: str) -> int:
     """
     Insert or update OHLCV data from a pandas DataFrame.
@@ -558,8 +689,10 @@ def upsert_market_data(df: pd.DataFrame, symbol: str, exchange: str, interval: s
         ]
 
         with get_connection() as conn:
-            # Use INSERT with ON CONFLICT for upsert (DuckDB requires explicit conflict target)
-            conn.execute("""
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                # Use INSERT with ON CONFLICT for upsert (DuckDB requires explicit conflict target)
+                conn.execute("""
                 INSERT INTO market_data
                 (symbol, exchange, interval, timestamp, open, high, low, close, volume, oi)
                 SELECT symbol, exchange, interval, timestamp, open, high, low, close, volume, oi
@@ -571,20 +704,20 @@ def upsert_market_data(df: pd.DataFrame, symbol: str, exchange: str, interval: s
                     close = EXCLUDED.close,
                     volume = EXCLUDED.volume,
                     oi = EXCLUDED.oi
-            """)
+                """)
 
-            # Update catalog - check if exists first due to multiple constraints
-            existing = conn.execute(
+                # Update catalog in the same transaction as the candle upsert.
+                existing = conn.execute(
                 """
                 SELECT id FROM data_catalog
                 WHERE symbol = ? AND exchange = ? AND interval = ?
             """,
                 [symbol.upper(), exchange.upper(), interval],
-            ).fetchone()
+                ).fetchone()
 
-            if existing:
+                if existing:
                 # Update existing record
-                conn.execute(
+                    conn.execute(
                     """
                     UPDATE data_catalog SET
                         first_timestamp = (SELECT MIN(timestamp) FROM market_data
@@ -610,28 +743,21 @@ def upsert_market_data(df: pd.DataFrame, symbol: str, exchange: str, interval: s
                         exchange.upper(),
                         interval,
                     ],
-                )
-            else:
-                # Insert new record
-                next_id_result = conn.execute(
-                    "SELECT COALESCE(MAX(id), 0) + 1 FROM data_catalog"
-                ).fetchone()
-                next_id = next_id_result[0] if next_id_result else 1
-
-                conn.execute(
+                    )
+                else:
+                    conn.execute(
                     """
                     INSERT INTO data_catalog
                     (id, symbol, exchange, interval, first_timestamp, last_timestamp,
                      record_count, last_download_at)
                     SELECT
-                        ?, ?, ?, ?,
+                        nextval('data_catalog_id_seq'), ?, ?, ?,
                         MIN(timestamp), MAX(timestamp), COUNT(*),
                         current_timestamp
                     FROM market_data
                     WHERE symbol = ? AND exchange = ? AND interval = ?
                 """,
                     [
-                        next_id,
                         symbol.upper(),
                         exchange.upper(),
                         interval,
@@ -639,7 +765,11 @@ def upsert_market_data(df: pd.DataFrame, symbol: str, exchange: str, interval: s
                         exchange.upper(),
                         interval,
                     ],
-                )
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
         logger.info(f"Upserted {len(df)} records for {symbol}:{exchange}:{interval}")
         return len(df)
@@ -789,7 +919,7 @@ def is_daily_aggregated_interval(interval: str) -> bool:
         return False
 
     # Weekly, Monthly, Quarterly, Yearly need aggregation from D data
-    return parsed["type"] in ("weekly", "monthly", "quarterly", "yearly")
+    return interval != "D" and parsed["type"] in ("daily", "weekly", "monthly", "quarterly", "yearly")
 
 
 def get_ohlcv(
@@ -1053,49 +1183,25 @@ def _get_daily_aggregated_ohlcv(
         # IST timezone offset from UTC (5 hours 30 minutes = 19800 seconds)
         ist_offset = 19800
 
-        # Build the GROUP BY expression based on interval type
-        if interval_type == "weekly":
-            # Group by ISO week number, adjusting for multi-week intervals
-            # ISO week starts on Monday
-            if interval_value == 1:
-                group_expr = f"DATE_TRUNC('week', to_timestamp(timestamp + {ist_offset}))"
-            else:
-                # For multi-week intervals, group weeks together
-                group_expr = f"""
-                    DATE_TRUNC('week', to_timestamp(timestamp + {ist_offset})) -
-                    INTERVAL ((EXTRACT(WEEK FROM to_timestamp(timestamp + {ist_offset})) - 1) % {interval_value}) WEEK
-                """
-        elif interval_type == "monthly":
-            # Group by calendar month
-            if interval_value == 1:
-                group_expr = f"DATE_TRUNC('month', to_timestamp(timestamp + {ist_offset}))"
-            else:
-                # For multi-month intervals, group months together
-                group_expr = f"""
-                    DATE_TRUNC('month', to_timestamp(timestamp + {ist_offset})) -
-                    INTERVAL ((EXTRACT(MONTH FROM to_timestamp(timestamp + {ist_offset})) - 1) % {interval_value}) MONTH
-                """
-        elif interval_type == "quarterly":
-            # Group by calendar quarter (3 months)
-            months = parsed.get("months", 3)
-            if months == 3:
-                group_expr = f"DATE_TRUNC('quarter', to_timestamp(timestamp + {ist_offset}))"
-            else:
-                # For multi-quarter intervals
-                group_expr = f"""
-                    DATE_TRUNC('quarter', to_timestamp(timestamp + {ist_offset})) -
-                    INTERVAL ((EXTRACT(QUARTER FROM to_timestamp(timestamp + {ist_offset})) - 1) % {interval_value}) QUARTER
-                """
-        elif interval_type == "yearly":
-            # Group by calendar year
-            if interval_value == 1:
-                group_expr = f"DATE_TRUNC('year', to_timestamp(timestamp + {ist_offset}))"
-            else:
-                # For multi-year intervals
-                group_expr = f"""
-                    DATE_TRUNC('year', to_timestamp(timestamp + {ist_offset})) -
-                    INTERVAL ((EXTRACT(YEAR FROM to_timestamp(timestamp + {ist_offset})) % {interval_value})) YEAR
-                """
+        # Use continuous civil-day and absolute-month anchors. Restarting a
+        # multiple at January splits one candle across two calendar years.
+        instant = f"to_timestamp(timestamp + {ist_offset})"
+        if interval_type in ("daily", "weekly"):
+            days = interval_value * (7 if interval_type == "weekly" else 1)
+            anchor = 4 if interval_type == "weekly" else 0  # Monday 1970-01-05
+            group_expr = (
+                f"DATE_TRUNC('day', {instant}) - "
+                f"((FLOOR((timestamp + {ist_offset}) / 86400) - {anchor}) "
+                f"% {days})::BIGINT * INTERVAL '1 day'"
+            )
+        elif interval_type in ("monthly", "quarterly", "yearly"):
+            months = parsed["months"]
+            group_expr = (
+                f"DATE_TRUNC('month', {instant}) - "
+                f"((EXTRACT(YEAR FROM {instant}) * 12 + "
+                f"EXTRACT(MONTH FROM {instant}) - 1) % {months})::BIGINT "
+                "* INTERVAL '1 month'"
+            )
         else:
             logger.error(f"Unsupported interval type for daily aggregation: {interval_type}")
             return pd.DataFrame()
@@ -1225,6 +1331,7 @@ def get_data_range(symbol: str, exchange: str, interval: str) -> dict[str, Any] 
         return None
 
 
+@_serialized_write
 def delete_market_data(symbol: str, exchange: str, interval: str | None = None) -> tuple[bool, str]:
     """
     Delete market data for a symbol.
@@ -1280,6 +1387,7 @@ def delete_market_data(symbol: str, exchange: str, interval: str | None = None) 
         return False, str(e)
 
 
+@_serialized_write
 def bulk_delete_market_data(
     symbols: list[dict[str, str]],
 ) -> tuple[int, int, list[dict[str, str]]]:
@@ -1503,6 +1611,7 @@ def get_database_stats() -> dict[str, Any]:
         }
 
 
+@_serialized_write
 def vacuum_database():
     """
     Vacuum the database to reclaim space and optimize performance.
@@ -1516,7 +1625,14 @@ def vacuum_database():
 
 
 # Supported exchanges (these are static across brokers)
-SUPPORTED_EXCHANGES = ["NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD", "NSE_INDEX", "BSE_INDEX", "CRYPTO"]
+# Keep aligned with utils/constants.VALID_EXCHANGES — Historify must accept any
+# exchange the platform validates as legal, otherwise /history download/upload
+# rejects symbols that the live /quote and /history-API paths happily serve.
+SUPPORTED_EXCHANGES = [
+    "NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD", "NCO",
+    "NSE_INDEX", "BSE_INDEX", "MCX_INDEX", "GLOBAL_INDEX",
+    "CRYPTO",
+]
 
 
 def get_supported_intervals(api_key: str) -> list[str]:
@@ -1756,6 +1872,7 @@ def import_from_parquet(
 # =============================================================================
 
 
+@_serialized_write
 def create_download_job(
     job_id: str,
     job_type: str,
@@ -1821,12 +1938,12 @@ def create_download_job(
                         ]
                     )
 
-                    # Atomic batch insert with computed IDs using ROW_NUMBER
-                    # This generates IDs atomically without race conditions
+                    # Sequence allocation is atomic and independent of other
+                    # jobs, unlike MAX(id) + ROW_NUMBER().
                     conn.execute("""
                         INSERT INTO job_items (id, job_id, symbol, exchange, status)
                         SELECT
-                            (SELECT COALESCE(MAX(id), 0) FROM job_items) + ROW_NUMBER() OVER () as id,
+                            nextval('job_items_id_seq') as id,
                             job_id, symbol, exchange, status
                         FROM symbols_df
                     """)
@@ -1855,7 +1972,8 @@ def _safe_timestamp(val) -> str | None:
         if hasattr(val, "isoformat"):
             return val.isoformat()
         return str(val)
-    except:
+    except Exception as e:
+        logger.warning(f"Failed to convert timestamp {val!r} to ISO format: {e}")
         return None
 
 
@@ -1989,6 +2107,7 @@ def get_job_items(job_id: str, status: str = None) -> list[dict[str, Any]]:
         return []
 
 
+@_serialized_write
 def update_job_status(job_id: str, status: str, error_message: str = None) -> bool:
     """Update the status of a download job."""
     try:
@@ -2029,6 +2148,7 @@ def update_job_status(job_id: str, status: str, error_message: str = None) -> bo
         return False
 
 
+@_serialized_write
 def update_job_item_status(
     item_id: int, status: str, records_downloaded: int = 0, error_message: str = None
 ) -> bool:
@@ -2071,6 +2191,7 @@ def update_job_item_status(
         return False
 
 
+@_serialized_write
 def update_job_progress(job_id: str, completed: int, failed: int) -> bool:
     """Update job progress counters."""
     try:
@@ -2090,6 +2211,7 @@ def update_job_progress(job_id: str, completed: int, failed: int) -> bool:
         return False
 
 
+@_serialized_write
 def delete_download_job(job_id: str) -> tuple[bool, str]:
     """Delete a download job and its items."""
     try:
@@ -2110,6 +2232,7 @@ def delete_download_job(job_id: str) -> tuple[bool, str]:
 # =============================================================================
 
 
+@_serialized_write
 def upsert_symbol_metadata(symbols: list[dict[str, Any]]) -> int:
     """
     Insert or update symbol metadata.
@@ -2296,13 +2419,24 @@ def export_to_parquet(
     """
     Export market data to Parquet format with ZSTD compression.
 
-    DuckDB has native Parquet support, making this very efficient
-    for large datasets and ideal for backtesting tools.
+    Mirrors export_to_zip's three-branch interval handling so that computed
+    intervals (5m/15m/30m/1h, custom intraday, W/M/Q/Y) aggregate from stored
+    1m or D data on the fly instead of returning empty:
+
+    - Daily-aggregated (W, M, Q, Y, multi-D): aggregated from D via
+      _get_daily_aggregated_ohlcv()
+    - Intraday computed (5m/15m/30m/1h, plus custom intraday like 25m, 2h):
+      aggregated from 1m using DuckDB time-bucket SQL
+    - Stored intervals (1m, D): direct query against market_data
+
+    All symbols/rows are concatenated into a single Parquet file with columns:
+    symbol, exchange, interval, timestamp, open, high, low, close, volume, oi,
+    datetime.
 
     Args:
         output_path: Path to save the Parquet file
         symbols: List of dicts with 'symbol' and 'exchange' keys (optional - all if None)
-        interval: Filter by interval (optional)
+        interval: Interval to export (required for aggregation correctness)
         start_timestamp: Start epoch timestamp (optional)
         end_timestamp: End epoch timestamp (optional)
         compression: Compression codec ('zstd', 'snappy', 'gzip', 'none')
@@ -2313,94 +2447,205 @@ def export_to_parquet(
     import tempfile
 
     try:
-        # Build WHERE clause
-        conditions = []
-        params = []
-
-        if symbols and len(symbols) > 0:
-            symbol_conditions = []
-            for sym in symbols:
-                symbol_conditions.append("(symbol = ? AND exchange = ?)")
-                params.extend([sym["symbol"].upper(), sym["exchange"].upper()])
-            conditions.append(f"({' OR '.join(symbol_conditions)})")
-
-        if interval:
-            conditions.append("interval = ?")
-            params.append(interval)
-        if start_timestamp:
-            conditions.append("timestamp >= ?")
-            params.append(start_timestamp)
-        if end_timestamp:
-            conditions.append("timestamp <= ?")
-            params.append(end_timestamp)
-
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
-
         # Validate output path - must be within temp directory
         temp_dir = tempfile.gettempdir()
         abs_output = os.path.abspath(output_path)
         if not abs_output.startswith(os.path.abspath(temp_dir)):
             return False, "Invalid output path: must be within temp directory", 0
 
-        # Get record count first
-        count_query = f"SELECT COUNT(*) FROM market_data WHERE {where_clause}"
+        # IST timezone offset from UTC (5 hours 30 minutes = 19800 seconds)
+        ist_offset = 19800
+
+        skipped_intervals: list[str] = []
+        frames: list[pd.DataFrame] = []
 
         with get_connection() as conn:
-            record_count = conn.execute(count_query, params).fetchone()[0]
-
-            if record_count == 0:
-                return False, "No data matching the criteria", 0
-
-            # Export using DuckDB's native COPY TO PARQUET
-            # Build the query string for COPY - need to embed values for COPY command
-            export_query = f"""
-                COPY (
-                    SELECT
-                        symbol, exchange, interval, timestamp,
-                        open, high, low, close, volume, oi,
-                        to_timestamp(timestamp) as datetime
-                    FROM market_data
-                    WHERE {where_clause}
-                    ORDER BY symbol, exchange, interval, timestamp
-                ) TO '{abs_output}'
-                (FORMAT PARQUET, COMPRESSION '{compression}')
-            """
-
-            # For COPY command, we need to execute without parameters
-            # Build the full query with values embedded safely
-            if params:
-                # Re-execute with DataFrame approach for safety
-                select_query = f"""
-                    SELECT
-                        symbol, exchange, interval, timestamp,
-                        open, high, low, close, volume, oi
-                    FROM market_data
-                    WHERE {where_clause}
-                    ORDER BY symbol, exchange, interval, timestamp
-                """
-                df = conn.execute(select_query, params).fetchdf()
-                df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
-                df.to_parquet(abs_output, compression=compression, index=False)
+            # Resolve symbol list — explicit, or every symbol in the catalog
+            if symbols and len(symbols) > 0:
+                symbols_list = [(s["symbol"].upper(), s["exchange"].upper()) for s in symbols]
             else:
-                # No params - can use COPY directly
-                conn.execute(f"""
-                    COPY (
-                        SELECT
-                            symbol, exchange, interval, timestamp,
-                            open, high, low, close, volume, oi,
-                            to_timestamp(timestamp) as datetime
-                        FROM market_data
-                        ORDER BY symbol, exchange, interval, timestamp
-                    ) TO '{abs_output}'
-                    (FORMAT PARQUET, COMPRESSION '{compression}')
-                """)
+                symbols_df = conn.execute("""
+                    SELECT DISTINCT symbol, exchange FROM data_catalog
+                    ORDER BY symbol, exchange
+                """).fetchdf()
+                symbols_list = [(row["symbol"], row["exchange"]) for _, row in symbols_df.iterrows()]
 
+            if not symbols_list:
+                return False, "No symbols found to export", 0
+
+            # Single-interval export. interval=None falls back to "D" (matches export_to_zip default).
+            target_interval = interval if interval else "D"
+
+            is_daily_agg = is_daily_aggregated_interval(target_interval)
+            is_intraday_computed = (
+                target_interval in COMPUTED_INTERVALS or is_custom_interval(target_interval)
+            )
+
+            for sym, exch in symbols_list:
+                df: pd.DataFrame | None = None
+
+                if is_daily_agg:
+                    # Aggregate from stored D rows
+                    check_query = """
+                        SELECT COUNT(*) FROM market_data
+                        WHERE symbol = ? AND exchange = ? AND interval = 'D'
+                    """
+                    check_params: list[Any] = [sym, exch]
+                    if start_timestamp:
+                        check_query += " AND timestamp >= ?"
+                        check_params.append(start_timestamp)
+                    if end_timestamp:
+                        check_query += " AND timestamp <= ?"
+                        check_params.append(end_timestamp)
+                    if conn.execute(check_query, check_params).fetchone()[0] == 0:
+                        logger.warning(
+                            f"No D data for {sym}:{exch}, skipping daily-aggregated interval {target_interval}"
+                        )
+                        skipped_intervals.append(f"{sym}:{exch}:{target_interval}")
+                        continue
+
+                    df = _get_daily_aggregated_ohlcv(
+                        symbol=sym,
+                        exchange=exch,
+                        target_interval=target_interval,
+                        start_timestamp=start_timestamp,
+                        end_timestamp=end_timestamp,
+                    )
+
+                elif is_intraday_computed:
+                    # Aggregate from stored 1m rows via DuckDB time-bucket
+                    check_query = """
+                        SELECT COUNT(*) FROM market_data
+                        WHERE symbol = ? AND exchange = ? AND interval = '1m'
+                    """
+                    check_params = [sym, exch]
+                    if start_timestamp:
+                        check_query += " AND timestamp >= ?"
+                        check_params.append(start_timestamp)
+                    if end_timestamp:
+                        check_query += " AND timestamp <= ?"
+                        check_params.append(end_timestamp)
+                    if conn.execute(check_query, check_params).fetchone()[0] == 0:
+                        logger.warning(
+                            f"No 1m data for {sym}:{exch}, skipping computed interval {target_interval}"
+                        )
+                        skipped_intervals.append(f"{sym}:{exch}:{target_interval}")
+                        continue
+
+                    minutes = INTERVAL_MINUTES.get(target_interval)
+                    if minutes is None:
+                        parsed = parse_interval(target_interval)
+                        if parsed and parsed["type"] == "intraday":
+                            minutes = parsed["minutes"]
+                        else:
+                            logger.warning(
+                                f"Cannot parse interval {target_interval}, skipping"
+                            )
+                            skipped_intervals.append(f"{sym}:{exch}:{target_interval}")
+                            continue
+                    interval_seconds = minutes * 60
+                    market_open_seconds = _get_market_open_seconds(exch)
+
+                    query = f"""
+                        SELECT
+                            (FLOOR((timestamp + {ist_offset}) / 86400) * 86400 - {ist_offset}) +
+                            {market_open_seconds} +
+                            FLOOR((((timestamp + {ist_offset}) % 86400) - {market_open_seconds}) / {interval_seconds}) * {interval_seconds}
+                            as ts,
+                            FIRST(open ORDER BY timestamp) as open,
+                            MAX(high) as high,
+                            MIN(low) as low,
+                            LAST(close ORDER BY timestamp) as close,
+                            SUM(volume) as volume,
+                            LAST(oi ORDER BY timestamp) as oi
+                        FROM market_data
+                        WHERE symbol = ? AND exchange = ? AND interval = '1m'
+                        AND ((timestamp + {ist_offset}) % 86400) >= {market_open_seconds}
+                    """
+                    params: list[Any] = [sym, exch]
+                    if start_timestamp:
+                        query += " AND timestamp >= ?"
+                        params.append(start_timestamp)
+                    if end_timestamp:
+                        query += " AND timestamp <= ?"
+                        params.append(end_timestamp)
+                    query += f"""
+                        GROUP BY (FLOOR((timestamp + {ist_offset}) / 86400) * 86400 - {ist_offset}) +
+                                 {market_open_seconds} +
+                                 FLOOR((((timestamp + {ist_offset}) % 86400) - {market_open_seconds}) / {interval_seconds}) * {interval_seconds}
+                        ORDER BY ts ASC
+                    """
+
+                    df = conn.execute(query, params).fetchdf()
+                    if not df.empty:
+                        df = df.rename(columns={"ts": "timestamp"})
+
+                else:
+                    # Stored interval (1m, D) — direct read
+                    query = """
+                        SELECT timestamp, open, high, low, close, volume, oi
+                        FROM market_data
+                        WHERE symbol = ? AND exchange = ? AND interval = ?
+                    """
+                    params = [sym, exch, target_interval]
+                    if start_timestamp:
+                        query += " AND timestamp >= ?"
+                        params.append(start_timestamp)
+                    if end_timestamp:
+                        query += " AND timestamp <= ?"
+                        params.append(end_timestamp)
+                    query += " ORDER BY timestamp"
+                    df = conn.execute(query, params).fetchdf()
+
+                if df is None or df.empty:
+                    continue
+
+                # Decorate with symbol metadata + datetime so the parquet schema matches
+                # the original export contract (symbol, exchange, interval, timestamp,
+                # OHLCV+oi, datetime) regardless of which branch produced the rows.
+                df = df.assign(symbol=sym, exchange=exch, interval=target_interval)
+                df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
+                df = df[
+                    [
+                        "symbol", "exchange", "interval", "timestamp",
+                        "open", "high", "low", "close", "volume", "oi",
+                        "datetime",
+                    ]
+                ]
+                frames.append(df)
+
+        if not frames:
+            if skipped_intervals:
+                return (
+                    False,
+                    f"No data exported. Missing source data for computed interval: {len(skipped_intervals)} symbol(s)",
+                    0,
+                )
+            return False, "No data matching the criteria", 0
+
+        combined = pd.concat(frames, ignore_index=True)
+        combined = combined.sort_values(["symbol", "exchange", "interval", "timestamp"])
+
+        # pyarrow's "none" isn't a valid codec — translate the API value
+        pq_compression = None if compression == "none" else compression
+        combined.to_parquet(abs_output, compression=pq_compression, index=False)
+
+        record_count = len(combined)
         file_size = os.path.getsize(abs_output) / (1024 * 1024)  # MB
-        logger.info(f"Exported {record_count} records to Parquet ({file_size:.2f} MB)")
-        return True, f"Exported {record_count} records ({file_size:.2f} MB)", record_count
+        message = f"Exported {record_count} records ({file_size:.2f} MB)"
+        if skipped_intervals:
+            message += f". Note: {len(skipped_intervals)} symbol(s) skipped due to missing source data."
+        logger.info(message)
+        return True, message, record_count
 
     except Exception as e:
         logger.exception(f"Error exporting to Parquet: {e}")
+        # Clean up partial file on error
+        if "abs_output" in locals() and os.path.exists(abs_output):
+            try:
+                os.remove(abs_output)
+            except Exception:
+                pass
         return False, str(e), 0
 
 
@@ -2962,6 +3207,7 @@ def get_export_preview(
 # =============================================================================
 
 
+@_serialized_write
 def create_schedule(
     schedule_id: str,
     name: str,
@@ -3105,6 +3351,7 @@ def get_all_schedules() -> list[dict[str, Any]]:
         return []
 
 
+@_serialized_write
 def update_schedule(
     schedule_id: str,
     name: str | None = None,
@@ -3195,6 +3442,7 @@ def update_schedule(
         return False, str(e)
 
 
+@_serialized_write
 def delete_schedule(schedule_id: str) -> tuple[bool, str]:
     """Delete a schedule and its execution history."""
     try:
@@ -3214,6 +3462,7 @@ def delete_schedule(schedule_id: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+@_serialized_write
 def increment_schedule_run_counts(schedule_id: str, is_success: bool) -> tuple[bool, str]:
     """Increment run counts for a schedule."""
     try:
@@ -3248,6 +3497,7 @@ def increment_schedule_run_counts(schedule_id: str, is_success: bool) -> tuple[b
         return False, str(e)
 
 
+@_serialized_write
 def create_schedule_execution(schedule_id: str, download_job_id: str | None = None) -> int | None:
     """
     Create a new execution record for a schedule.
@@ -3255,31 +3505,19 @@ def create_schedule_execution(schedule_id: str, download_job_id: str | None = No
     Returns:
         Execution ID or None on failure
     """
-    import time
-
     try:
-        # Use timestamp-based ID to minimize collision risk
-        # Format: last 9 digits of current timestamp in microseconds
-        execution_id = int(time.time() * 1000000) % 1000000000
-
         with get_connection() as conn:
-            # Try inserting, if collision occurs retry with incremented ID
-            for attempt in range(3):
-                try:
-                    conn.execute(
-                        """
-                        INSERT INTO historify_schedule_executions
-                        (id, schedule_id, download_job_id, status, started_at)
-                        VALUES (?, ?, ?, 'running', current_timestamp)
-                    """,
-                        [execution_id + attempt, schedule_id, download_job_id],
-                    )
-                    execution_id = execution_id + attempt
-                    break
-                except Exception:
-                    if attempt == 2:
-                        raise
-                    continue
+            execution_id = conn.execute(
+                "SELECT nextval('historify_schedule_executions_id_seq')"
+            ).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO historify_schedule_executions
+                (id, schedule_id, download_job_id, status, started_at)
+                VALUES (?, ?, ?, 'running', current_timestamp)
+            """,
+                [execution_id, schedule_id, download_job_id],
+            )
 
         logger.info(f"Created execution {execution_id} for schedule {schedule_id}")
         return execution_id
@@ -3289,6 +3527,7 @@ def create_schedule_execution(schedule_id: str, download_job_id: str | None = No
         return None
 
 
+@_serialized_write
 def update_schedule_execution(
     execution_id: int,
     status: str | None = None,

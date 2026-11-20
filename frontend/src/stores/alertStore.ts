@@ -1,7 +1,13 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 
-export type ToastPosition = 'top-right' | 'top-center' | 'top-left' | 'bottom-right' | 'bottom-center' | 'bottom-left'
+export type ToastPosition =
+  | 'top-right'
+  | 'top-center'
+  | 'top-left'
+  | 'bottom-right'
+  | 'bottom-center'
+  | 'bottom-left'
 
 export interface AlertCategories {
   // Real-time Socket.IO events (High-frequency)
@@ -12,13 +18,13 @@ export interface AlertCategories {
 
   // User-initiated operations (Tier 1 - High Impact)
   historify: boolean // Historify job operations, file uploads, schedules (67 toasts)
-  strategy: boolean // Strategy management, symbol configuration (39 toasts)
   positions: boolean // Position close/update operations
 
   // User-initiated operations (Tier 2 - Medium Impact)
   chartink: boolean // Chartink strategy operations (26 toasts)
   pythonStrategy: boolean // Python strategy operations (34 toasts)
   telegram: boolean // Telegram bot operations (19 toasts)
+  whatsapp: boolean // WhatsApp bot operations
   flow: boolean // Workflow management (15 toasts)
 
   // User-initiated operations (Tier 3 - Low Impact)
@@ -68,12 +74,12 @@ const DEFAULT_STATE = {
     actionCenter: true,
     // Tier 1
     historify: true,
-    strategy: true,
     positions: true,
     // Tier 2
     chartink: true,
     pythonStrategy: true,
     telegram: true,
+    whatsapp: true,
     flow: true,
     // Tier 3
     admin: true,
@@ -120,6 +126,8 @@ export const useAlertStore = create<AlertStore>()(
       },
     }),
     {
+      // Unversioned, so an existing install keeps the retired `categories.strategy`
+      // key in localStorage. Harmless: zustand shallow-merges and nothing reads it.
       name: 'openalgo-alerts',
       partialize: (state) => ({
         toastsEnabled: state.toastsEnabled,

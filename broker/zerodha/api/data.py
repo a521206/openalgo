@@ -14,6 +14,49 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+# OpenAlgo→Kite exchange-prefix translation for /quote, /quote/ltp, /quote/ohlc.
+# Kite uses NSE/BSE/NFO/BFO/MCX/NCO/CDS/BCD/GLOBAL/NSEIX as the prefix in
+# `i=EXCHANGE:tradingsymbol`. NSE_INDEX/BSE_INDEX/MCX_INDEX use NSE/BSE/MCX on
+# the broker side. GLOBAL_INDEX folds two Kite feeds (GLOBAL + NSEIX) — the
+# per-row brexchange column carries the original Kite exchange code.
+_OA_INDEX_TO_KITE = {
+    "NSE_INDEX": "NSE",
+    "BSE_INDEX": "BSE",
+    "MCX_INDEX": "MCX",
+}
+
+
+def _kite_quote_exchange(oa_exchange: str, brexchange: str | None) -> str:
+    """Resolve the OpenAlgo exchange + per-row brexchange to the Kite-side
+    exchange prefix used in /quote* endpoints."""
+    if oa_exchange == "GLOBAL_INDEX":
+        # brexchange holds the original Kite exchange code (GLOBAL or NSEIX).
+        # Fall back to GLOBAL for legacy rows where the loader set brexchange
+        # to the OA-side code.
+        if brexchange and brexchange != "GLOBAL_INDEX":
+            return brexchange
+        return "GLOBAL"
+    return _OA_INDEX_TO_KITE.get(oa_exchange, oa_exchange)
+
+
+def _best_depth(quote: dict) -> tuple[dict, dict]:
+    """Top of book from a Kite /quote entry, as ``(best_bid, best_ask)``.
+
+    Each depth entry carries ``price``, ``quantity`` and ``orders`` together,
+    so reading the two sides once gives every caller the price and the size
+    resting behind it without walking the structure twice.
+
+    An instrument with no depth (an index, a permission-restricted feed, a
+    pre-open snapshot) yields empty dicts rather than raising, so the caller's
+    ``.get(..., 0)`` supplies the zero. That is the one case where a zero is
+    honest: there genuinely is no book.
+    """
+    depth = quote.get("depth") or {}
+    buy = depth.get("buy") or []
+    sell = depth.get("sell") or []
+    return (buy[0] if buy else {}), (sell[0] if sell else {})
+
+
 class ZerodhaPermissionError(Exception):
     """Custom exception for Zerodha API permission errors"""
 
@@ -26,17 +69,15 @@ class ZerodhaAPIError(Exception):
     pass
 
 
-def get_api_response(endpoint, auth, method="GET", payload=None, max_retries=3):
+def get_api_response(endpoint, auth, method="GET", payload=None):
     """
     Make an API request to Zerodha's API using shared httpx client with connection pooling.
-    Includes automatic retry with exponential backoff for rate limit errors.
 
     Args:
         endpoint (str): API endpoint (e.g., '/quote')
         auth (str): Authentication token
         method (str): HTTP method (GET, POST, etc.)
         payload (dict, optional): Request payload for POST requests
-        max_retries (int): Maximum number of retries for rate limit errors (default: 3)
 
     Returns:
         dict: API response data
@@ -60,82 +101,62 @@ def get_api_response(endpoint, auth, method="GET", payload=None, max_retries=3):
     # Keep query params in URL to preserve duplicate keys (e.g., multiple i= for quotes)
     url = f"{base_url}{endpoint}"
 
-    for attempt in range(max_retries + 1):
-        try:
-            # Log the complete request details for debugging
-            # logger.info("=== API Request Details ===")
-            # logger.info(f"URL: {url}")
-            # logger.info(f"Method: {method}")
-            # logger.info(f"Headers: {json.dumps(headers, indent=2)}")
-            if payload:
-                logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
+    try:
+        # Log the complete request details for debugging
+        # logger.info("=== API Request Details ===")
+        # logger.info(f"URL: {url}")
+        # logger.info(f"Method: {method}")
+        # logger.info(f"Headers: {json.dumps(headers, indent=2)}")
+        if payload:
+            logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
 
-            # Make the request using the shared client
-            if method.upper() == "GET":
-                response = client.get(url, headers=headers)
-            elif method.upper() == "POST":
-                headers["Content-Type"] = "application/json"
-                response = client.post(url, headers=headers, json=payload)
+        # Make the request using the shared client
+        if method.upper() == "GET":
+            response = client.get(url, headers=headers)
+        elif method.upper() == "POST":
+            headers["Content-Type"] = "application/json"
+            response = client.post(url, headers=headers, json=payload)
+        else:
+            raise ZerodhaAPIError(f"Unsupported HTTP method: {method}")
+
+        # Log the complete response
+        # logger.info("=== API Response Details ===")
+        logger.debug(f"Status Code: {response.status_code}")
+        logger.debug(f"Response Headers: {dict(response.headers)}")
+        logger.debug(f"Response Body: {response.text}")
+
+        # Parse JSON response
+        response_data = response.json()
+
+        # Check for permission errors
+        if response_data.get("status") == "error":
+            error_type = response_data.get("error_type")
+            error_message = response_data.get("message", "Unknown error")
+
+            if error_type == "PermissionException" or "permission" in error_message.lower():
+                raise ZerodhaPermissionError(f"API Permission denied: {error_message}.")
             else:
-                raise ZerodhaAPIError(f"Unsupported HTTP method: {method}")
+                raise ZerodhaAPIError(f"API Error: {error_message}")
 
-            # Log the complete response
-            # logger.info("=== API Response Details ===")
-            logger.debug(f"Status Code: {response.status_code}")
-            logger.debug(f"Response Headers: {dict(response.headers)}")
-            logger.debug(f"Response Body: {response.text}")
+        return response_data
 
-            # Parse JSON response
-            response_data = response.json()
+    except ZerodhaPermissionError:
+        raise
+    except ZerodhaAPIError:
+        raise
+    except Exception as e:
+        error_msg = str(e)
+        logger.exception(f"API request failed: {error_msg}")
 
-            # Check for permission errors
-            if response_data.get("status") == "error":
-                error_type = response_data.get("error_type")
-                error_message = response_data.get("message", "Unknown error")
+        # Try to extract more error details if available
+        try:
+            if hasattr(e, "response") and e.response is not None:
+                error_detail = e.response.json()
+                error_msg = error_detail.get("message", error_msg)
+        except Exception:
+            pass
 
-                # Check for rate limit errors - retry with exponential backoff
-                if "Too many requests" in error_message or response.status_code == 429:
-                    if attempt < max_retries:
-                        # Exponential backoff: 1s, 2s, 4s
-                        delay = 2**attempt
-                        logger.warning(
-                            f"Rate limit hit (Too many requests), retrying in {delay}s... (attempt {attempt + 1}/{max_retries})"
-                        )
-                        time.sleep(delay)
-                        continue
-                    else:
-                        logger.error(
-                            f"Rate limit exceeded after {max_retries} retries. Endpoint: {endpoint}"
-                        )
-                        raise ZerodhaAPIError(f"Rate limit exceeded: {error_message}")
-
-                if error_type == "PermissionException" or "permission" in error_message.lower():
-                    raise ZerodhaPermissionError(f"API Permission denied: {error_message}.")
-                else:
-                    raise ZerodhaAPIError(f"API Error: {error_message}")
-
-            return response_data
-
-        except ZerodhaPermissionError:
-            raise
-        except ZerodhaAPIError:
-            raise
-        except Exception as e:
-            error_msg = str(e)
-            logger.exception(f"API request failed: {error_msg}")
-
-            # Try to extract more error details if available
-            try:
-                if hasattr(e, "response") and e.response is not None:
-                    error_detail = e.response.json()
-                    error_msg = error_detail.get("message", error_msg)
-            except:
-                pass
-
-            raise ZerodhaAPIError(f"API request failed: {error_msg}")
-
-    # Should not reach here, but just in case
-    raise ZerodhaAPIError("Max retries exceeded")
+        raise ZerodhaAPIError(f"API request failed: {error_msg}")
 
 
 class BrokerData:
@@ -203,11 +224,9 @@ class BrokerData:
 
                 # Split token to get exchange_token for quotes
                 exchange_token = symbol_info.token.split("::::")[1]
+                row_brexchange = symbol_info.brexchange
 
-            if exchange == "NSE_INDEX":
-                exchange = "NSE"
-            elif exchange == "BSE_INDEX":
-                exchange = "BSE"
+            exchange = _kite_quote_exchange(exchange, row_brexchange)
 
             # URL encode the symbol to handle special characters
             encoded_symbol = urllib.parse.quote(f"{exchange}:{br_symbol}")
@@ -219,36 +238,24 @@ class BrokerData:
             if not quote:
                 raise ZerodhaAPIError("No quote data found")
 
-            # Extract depth data for debugging
-            depth = quote.get("depth", {})
-            sell_depth = depth.get("sell", [])
-            buy_depth = depth.get("buy", [])
-
-            # Log depth structure for debugging zero ask/bid prices
-            if not sell_depth or not buy_depth:
-                logger.warning(
-                    f"Depth data missing for {exchange}:{br_symbol}. "
-                    f"Sell depth: {len(sell_depth)} levels, Buy depth: {len(buy_depth)} levels. "
-                    f"Full quote keys: {list(quote.keys())}"
-                )
-
-            # Log raw depth data if ask or bid is 0
-            ask_price = sell_depth[0].get("price", 0) if sell_depth else 0
-            bid_price = buy_depth[0].get("price", 0) if buy_depth else 0
-
-            if ask_price == 0 or bid_price == 0:
-                logger.info(
-                    f"QUOTE_DEBUG: {exchange}:{br_symbol} - "
-                    f"ask={ask_price}, bid={bid_price}, ltp={quote.get('last_price', 0)}. "
-                    f"Sell depth: {sell_depth[:2] if sell_depth else 'empty'}, "
-                    f"Buy depth: {buy_depth[:2] if buy_depth else 'empty'}. "
-                    f"Quote keys: {list(quote.keys())}"
-                )
+            # Best bid and ask, with the size resting at each.
+            #
+            # Kite's /quote carries the size beside the price in the same depth
+            # entry (quantity + price + orders), and `get_market_depth` below
+            # already reads it from this very response. Reading only the price
+            # here is what made `bid_qty` and `ask_qty` absent, so every
+            # consumer's `.get("bid_qty", 0)` defaulted and the option chain
+            # reported a confident 0 on every leg. A 0 reads as "nothing on
+            # offer" rather than "not reported", which is the wrong answer to
+            # give a strategy sizing an order against the book.
+            best_bid, best_ask = _best_depth(quote)
 
             # Return quote data
             return {
-                "ask": ask_price,
-                "bid": bid_price,
+                "ask": best_ask.get("price", 0),
+                "bid": best_bid.get("price", 0),
+                "ask_qty": best_ask.get("quantity", 0),
+                "bid_qty": best_bid.get("quantity", 0),
                 "high": quote.get("ohlc", {}).get("high", 0),
                 "low": quote.get("ohlc", {}).get("low", 0),
                 "ltp": quote.get("last_price", 0),
@@ -348,12 +355,16 @@ class BrokerData:
                 )
                 continue
 
-            # Normalize exchange for indices
-            api_exchange = exchange
-            if exchange == "NSE_INDEX":
-                api_exchange = "NSE"
-            elif exchange == "BSE_INDEX":
-                api_exchange = "BSE"
+            # Normalize exchange for indices and GLOBAL_INDEX (uses brexchange to
+            # disambiguate between Kite's GLOBAL and NSEIX feeds).
+            with db_session() as session:
+                row = (
+                    session.query(SymToken.brexchange)
+                    .filter(SymToken.exchange == exchange, SymToken.brsymbol == br_symbol)
+                    .first()
+                )
+                row_brexchange = row[0] if row else None
+            api_exchange = _kite_quote_exchange(exchange, row_brexchange)
 
             instrument_key = f"{api_exchange}:{br_symbol}"
             instruments.append(instrument_key)
@@ -375,11 +386,13 @@ class BrokerData:
         endpoint = f"/quote?{query_params}"
 
         # Log the instruments being requested
+        logger.info(f"Requesting quotes for {len(instruments)} instruments")
         logger.info(
-            f"Requesting quotes for: {instruments[:5]}..."
+            f"Instruments: {instruments[:5]}..."
             if len(instruments) > 5
-            else f"Requesting quotes for: {instruments}"
+            else f"Instruments: {instruments}"
         )
+        logger.info(f"Endpoint length: {len(endpoint)} characters")
         logger.info(
             f"Full endpoint: {endpoint}"
             if len(instruments) <= 10
@@ -390,7 +403,7 @@ class BrokerData:
         response = get_api_response(endpoint, self.auth_token)
         logger.info(f"Zerodha API response status: {response.get('status')}")
         logger.info(f"Zerodha API response data keys: {list(response.get('data', {}).keys())[:10]}")
-        logger.debug(f"Full Zerodha response: {json.dumps(response, indent=2)[:1000]}...")
+        logger.info(f"Full Zerodha response: {json.dumps(response, indent=2)[:1000]}...")
 
         # Parse response and build results
         results = []
@@ -411,39 +424,21 @@ class BrokerData:
                 )
                 continue
 
-            # Extract depth data for debugging
-            depth = quote.get("depth", {})
-            sell_depth = depth.get("sell", [])
-            buy_depth = depth.get("buy", [])
-
-            ask_price = sell_depth[0].get("price", 0) if sell_depth else 0
-            bid_price = buy_depth[0].get("price", 0) if buy_depth else 0
-
-            # Log depth structure for debugging zero ask/bid prices
-            if not sell_depth or not buy_depth:
-                logger.warning(
-                    f"Depth data missing for {original['exchange']}:{original['symbol']}. "
-                    f"Sell depth: {len(sell_depth)} levels, Buy depth: {len(buy_depth)} levels. "
-                    f"Full quote keys: {list(quote.keys())}"
-                )
-
-            # Log raw depth data if ask or bid is 0
-            if ask_price == 0 or bid_price == 0:
-                logger.info(
-                    f"QUOTE_DEBUG: {original['exchange']}:{original['symbol']} - "
-                    f"ask={ask_price}, bid={bid_price}, ltp={quote.get('last_price', 0)}. "
-                    f"Sell depth: {sell_depth[:2] if sell_depth else 'empty'}, "
-                    f"Buy depth: {buy_depth[:2] if buy_depth else 'empty'}. "
-                    f"Quote keys: {list(quote.keys())}"
-                )
+            # Same mapping as `get_quotes`, including the size at the best bid
+            # and ask. The two are kept in step deliberately: a caller cannot
+            # tell whether it reached one symbol or many, so a field present in
+            # one and absent in the other is a difference it cannot act on.
+            best_bid, best_ask = _best_depth(quote)
 
             # Parse and format quote data
             result_item = {
                 "symbol": original["symbol"],
                 "exchange": original["exchange"],
                 "data": {
-                    "ask": ask_price,
-                    "bid": bid_price,
+                    "ask": best_ask.get("price", 0),
+                    "bid": best_bid.get("price", 0),
+                    "ask_qty": best_ask.get("quantity", 0),
+                    "bid_qty": best_bid.get("quantity", 0),
                     "high": quote.get("ohlc", {}).get("high", 0),
                     "low": quote.get("ohlc", {}).get("low", 0),
                     "ltp": quote.get("last_price", 0),
@@ -500,11 +495,9 @@ class BrokerData:
 
                 # Split token to get instrument_token for historical data
                 instrument_token = symbol_info.token.split("::::")[0]
+                row_brexchange = symbol_info.brexchange
 
-            if exchange == "NSE_INDEX":
-                exchange = "NSE"
-            elif exchange == "BSE_INDEX":
-                exchange = "BSE"
+            exchange = _kite_quote_exchange(exchange, row_brexchange)
 
             # Convert dates to datetime objects
             start_date = pd.to_datetime(from_date)
@@ -513,14 +506,11 @@ class BrokerData:
             # Initialize empty list to store DataFrames
             dfs = []
 
-            # Rate limit delay between 60-day chunks (Zerodha historical API rate limit)
-            CHUNK_DELAY = 0.5  # 500ms between chunks to avoid rate limiting
-
-            # Process data in 60-day chunks
+            # Kite per-request limits: 2000 days for `day`, 60 days for everything else.
+            chunk_days = 2000 if resolution == "day" else 60
             current_start = start_date
             while current_start <= end_date:
-                # Calculate chunk end date (60 days or remaining period)
-                current_end = min(current_start + timedelta(days=59), end_date)
+                current_end = min(current_start + timedelta(days=chunk_days - 1), end_date)
 
                 # Format dates for API call
                 from_str = current_start.strftime("%Y-%m-%d+00:00:00")
@@ -535,7 +525,7 @@ class BrokerData:
                 endpoint = f"/instruments/historical/{instrument_token}/{resolution}?from={from_str}&to={to_str}&oi=1"
                 logger.debug(f"Making request to endpoint: {endpoint}")
 
-                # Use get_api_response with retry logic for rate limits
+                # Use get_api_response
                 response = get_api_response(endpoint, self.auth_token)
 
                 if not response or response.get("status") != "success":
@@ -555,10 +545,6 @@ class BrokerData:
 
                 # Move to next chunk
                 current_start = current_end + timedelta(days=1)
-
-                # Add delay between chunks to prevent rate limiting (skip after last chunk)
-                if current_start <= end_date:
-                    time.sleep(CHUNK_DELAY)
 
             # If no data was found, return empty DataFrame
             if not dfs:
@@ -627,11 +613,9 @@ class BrokerData:
 
                 # Split token to get exchange_token for quotes
                 exchange_token = symbol_info.token.split("::::")[1]
+                row_brexchange = symbol_info.brexchange
 
-            if exchange == "NSE_INDEX":
-                exchange = "NSE"
-            elif exchange == "BSE_INDEX":
-                exchange = "BSE"
+            exchange = _kite_quote_exchange(exchange, row_brexchange)
 
             # URL encode the symbol to handle special characters
             encoded_symbol = urllib.parse.quote(f"{exchange}:{br_symbol}")

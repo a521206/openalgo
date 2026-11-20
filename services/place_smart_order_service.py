@@ -1,24 +1,16 @@
 import copy
 import importlib
-import time
-import traceback
 from typing import Any
 
-from database.analyzer_db import async_log_analyzer
-from database.apilog_db import async_log_order, executor
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
-from extensions import socketio
-from services.quotes_service import get_quotes
-from services.smart_trade_rules_service import (
-    PositionFetchResult,
-    PositionFetchStatus,
-    get_lot_size_with_status,
-    validate_against_smart_trade_rules,
+from events import (
+    AnalyzerErrorEvent,
+    OrderFailedEvent,
+    OrderPlacedEvent,
+    SmartOrderNoActionEvent,
 )
-from services.symbol_service import get_symbol_info_with_auth
-from services.telegram_alert_service import telegram_alert_service
-from utils.config import get_execution_buffer
+from utils.broker_backpressure import BrokerBusyError
 from utils.constants import (
     REQUIRED_SMART_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -26,46 +18,38 @@ from utils.constants import (
     VALID_PRICE_TYPES,
     VALID_PRODUCT_TYPES,
 )
+from utils.event_bus import bus
+from utils.httpx_client import UNANSWERED_ORDER_MESSAGE, watch_for_unanswered_writes
 from utils.logging import get_logger
-from utils.price_utils import round_price_to_tick_size
+from services.quotes_service import get_quotes
+from services.smart_trade_rules_service import (
+    PositionFetchResult,
+    PositionFetchStatus,
+    validate_against_smart_trade_rules,
+)
+from utils.config import get_execution_buffer
 
 # Initialize logger
 logger = get_logger(__name__)
 
-# Smart order delay
-SMART_ORDER_DELAY = "0.5"  # Default value, can be overridden by environment variable
-
-# Position fetch configuration
-POSITION_FETCH_MAX_RETRIES = 2
-POSITION_FETCH_RETRY_DELAY = 0.5
 
 
 def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dict[str, Any]:
-    """
-    Helper function to emit analyzer error events
-
-    Args:
-        request_data: Original request data
-        error_message: Error message to emit
-
-    Returns:
-        Error response dictionary
-    """
+    """Publish an analyzer error event and return the error response dict."""
     error_response = {"mode": "analyze", "status": "error", "message": error_message}
 
-    # Store complete request data without apikey
     analyzer_request = request_data.copy()
     if "apikey" in analyzer_request:
         del analyzer_request["apikey"]
     analyzer_request["api_type"] = "placesmartorder"
 
-    # Log to analyzer database
-    executor.submit(async_log_analyzer, analyzer_request, error_response, "placesmartorder")
-
-    # Emit socket event asynchronously (non-blocking)
-    socketio.start_background_task(
-        socketio.emit, "analyzer_update", {"request": analyzer_request, "response": error_response}
-    )
+    bus.publish(AnalyzerErrorEvent(
+        mode="analyze",
+        api_type="placesmartorder",
+        request_data=analyzer_request,
+        response_data=error_response,
+        error_message=error_message,
+    ))
 
     return error_response
 
@@ -89,70 +73,34 @@ def import_broker_module(broker_name: str) -> Any | None:
         return None
 
 
-def _fetch_position_for_validation(
-    broker: str,
-    order_data: dict[str, Any],
-    auth_token: str,
-) -> PositionFetchResult:
-    """
-    Fetch current position with retry logic and proper error handling.
-
-    Args:
-        broker: Broker name
-        order_data: Order data containing symbol, exchange, product
-        auth_token: Broker authentication token
-
-    Returns:
-        PositionFetchResult with quantity, status, and error message
-    """
+def _validate_smart_trade_rules(order_data: dict[str, Any], broker: str, auth_token: str) -> tuple[bool, str | None]:
     broker_module = import_broker_module(broker)
-
-    if not broker_module or not hasattr(broker_module, "get_open_position"):
-        logger.info(f"Broker {broker} does not support position fetching")
-        return PositionFetchResult(
-            quantity=0,
-            status=PositionFetchStatus.NOT_SUPPORTED,
-            error_message="Position fetch not supported for this broker",
-        )
-
-    last_error = None
-    product = order_data.get("product") or order_data.get("product_type") or "MIS"
-    for attempt in range(POSITION_FETCH_MAX_RETRIES + 1):
-        try:
-            position_qty_str = broker_module.get_open_position(
-                order_data.get("symbol"),
-                order_data.get("exchange"),
-                product,
-                auth_token,
-            )
-            quantity = int(position_qty_str) if position_qty_str else 0
-            logger.debug(f"Position fetch successful: {quantity} for {order_data.get('symbol')}")
-            return PositionFetchResult(quantity=quantity, status=PositionFetchStatus.SUCCESS)
-        except Exception as e:
-            last_error = e
-            logger.warning(
-                f"Position fetch attempt {attempt + 1} failed for {order_data.get('symbol')}: {e}"
-            )
-            if attempt < POSITION_FETCH_MAX_RETRIES:
-                time.sleep(POSITION_FETCH_RETRY_DELAY)
-
-    # All retries failed
-    logger.error(
-        f"Position fetch failed after {POSITION_FETCH_MAX_RETRIES + 1} attempts: {last_error}"
-    )
-    return PositionFetchResult(
-        quantity=0, status=PositionFetchStatus.FAILED, error_message=str(last_error)
-    )
+    try:
+        product = order_data.get("product", "MIS")
+        current = 0
+        if broker_module and hasattr(broker_module, "get_open_position"):
+            current = int(broker_module.get_open_position(order_data.get("symbol"), order_data.get("exchange"), product, auth_token) or 0)
+            status = PositionFetchStatus.SUCCESS
+        else:
+            status = PositionFetchStatus.NOT_SUPPORTED
+        result = PositionFetchResult(quantity=current, status=status)
+    except Exception as exc:
+        result = PositionFetchResult(quantity=0, status=PositionFetchStatus.FAILED, error_message=str(exc))
+    return validate_against_smart_trade_rules(order_data, result, broker)
 
 
-def _build_error_response(
-    original_data: dict[str, Any], error_message: str
-) -> tuple[bool, dict[str, Any], int]:
-    if get_analyze_mode():
-        return False, emit_analyzer_error(original_data, error_message), 400
-    error_response = {"status": "error", "message": error_message}
-    executor.submit(async_log_order, "placesmartorder", original_data, error_response)
-    return False, error_response, 400
+def _discover_limit_price(order_data: dict[str, Any], original_data: dict[str, Any]) -> None:
+    if order_data.get("pricetype") != "LIMIT" or float(order_data.get("price", 0) or 0) != 0:
+        return
+    success, response, _ = get_quotes(symbol=order_data.get("symbol"), exchange=order_data.get("exchange"), api_key=original_data.get("apikey"))
+    if not success:
+        return
+    quote = response.get("data", {})
+    action = order_data.get("action", "BUY").upper()
+    reference = quote.get("ask" if action == "BUY" else "bid") or quote.get("ltp", 0)
+    if reference and float(reference) > 0:
+        buffer = get_execution_buffer()
+        order_data["price"] = round(float(reference) * (1 + buffer if action == "BUY" else 1 - buffer), 2)
 
 
 def validate_smart_order(order_data: dict[str, Any]) -> tuple[bool, str | None]:
@@ -201,7 +149,6 @@ def place_smart_order_with_auth(
     auth_token: str,
     broker: str,
     original_data: dict[str, Any],
-    smart_order_delay: str = SMART_ORDER_DELAY,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Place a smart order using provided auth token.
@@ -211,7 +158,6 @@ def place_smart_order_with_auth(
         auth_token: Authentication token for the broker API
         broker: Name of the broker
         original_data: Original request data for logging
-        smart_order_delay: Delay in seconds between order placement and response
 
     Returns:
         Tuple containing:
@@ -220,84 +166,35 @@ def place_smart_order_with_auth(
         - HTTP status code (int)
     """
     order_request_data = copy.deepcopy(original_data)
-    order_request_data.pop("apikey", None)
+    if "apikey" in order_request_data:
+        order_request_data.pop("apikey", None)
+
+    api_key = original_data.get("apikey", "")
 
     # Validate order data
     is_valid, error_message = validate_smart_order(order_data)
     if not is_valid:
-        return _build_error_response(original_data, error_message or "Validation failed")
+        if get_analyze_mode():
+            return False, emit_analyzer_error(original_data, error_message), 400
+        error_response = {"status": "error", "message": error_message}
+        bus.publish(OrderFailedEvent(
+            mode="live", api_type="placesmartorder",
+            request_data=order_request_data, response_data=error_response,
+            error_message=error_message,
+        ))
+        return False, error_response, 400
 
-    # Get current position with fail-safe handling
-    position_result = _fetch_position_for_validation(broker, order_data, auth_token)
-    current_position = position_result.quantity
-    if position_result.error_message:
-        error_msg = f", error={position_result.error_message}"
-    else:
-        error_msg = ""
-    logger.info(
-        f"DIAG: Position fetch - symbol={order_data.get('symbol')}, exchange={order_data.get('exchange')}, "
-        f"product={order_data.get('product')}, current_position={current_position}, "
-        f"status={position_result.status}{error_msg}"
-    )
+    rules_valid, rules_error = _validate_smart_trade_rules(order_data, broker, auth_token)
+    if not rules_valid:
+        message = rules_error or "Smart trade validation failed"
+        if get_analyze_mode():
+            return False, emit_analyzer_error(original_data, message), 400
+        return False, {"status": "error", "message": message}, 400
 
-    # Calculate target position_size for scale-out (single location)
-    scale_pct = int(order_data.get("scale_pct", 0) or 0)
-    scale_qty = int(order_data.get("scale_qty", 0) or 0)
-    position_size = int(order_data.get("position_size", 0))
-    logger.info(
-        f"DIAG: Scale inputs - position_size={position_size}, scale_pct={scale_pct}, scale_qty={scale_qty}"
-    )
-
-    # Scale condition check
-    scale_condition_met = (
-        position_size == 0 and current_position != 0 and (scale_pct > 0 or scale_qty > 0)
-    )
-    logger.info(
-        f"DIAG: Scale condition check - pos_size_z={position_size == 0}, curr_pos_nz={current_position != 0}, scale_pct_z={scale_pct > 0}, scale_qty_z={scale_qty > 0} => {scale_condition_met}"
-    )
-
-    if scale_condition_met:
-        logger.info(
-            f"DIAG: Scale calculation START - current={current_position}, scale_pct={scale_pct}"
-        )
-
-        # Get lot size for F&O position rounding
-        symbol = order_data.get("symbol")
-        exchange = order_data.get("exchange")
-        lot_size_result = get_lot_size_with_status(symbol, exchange)
-        lot_size = lot_size_result.lot_size if lot_size_result.lot_size > 1 else 1
-
-        if scale_pct > 0:
-            position_size = int(current_position * (100 - scale_pct) / 100)
-        else:
-            if current_position > 0:
-                position_size = max(0, current_position - scale_qty)
-            else:
-                position_size = min(0, current_position + scale_qty)
-
-        # Round to lot size multiple for F&O instruments
-        if lot_size > 1:
-            position_size = int(abs(position_size) // lot_size * lot_size) * (1 if position_size >= 0 else -1)
-
-        logger.info(f"DIAG: Scale calculation DONE - new target position_size={position_size}")
-        order_data["position_size"] = str(position_size)
-        logger.info(
-            f"Scale-out: current={current_position}, scale={scale_pct or scale_qty}, target={position_size}, lot_size={lot_size}"
-        )
-
-    # Validate against smart trade rules
-    is_valid, error_message = validate_against_smart_trade_rules(
-        order_data, position_result, broker
-    )
-
-    if not is_valid:
-        return _build_error_response(original_data, error_message or "Validation failed")
-
-    # If in analyze mode, route to sandbox for virtual trading
+    # If in analyze mode, route to sandbox for sandbox trading
     if get_analyze_mode():
         from services.sandbox_service import sandbox_place_smart_order
 
-        api_key = original_data.get("apikey")
         if not api_key:
             return (
                 False,
@@ -305,104 +202,65 @@ def place_smart_order_with_auth(
                 400,
             )
 
-        # Route to sandbox smart order
         success, response_data, status_code = sandbox_place_smart_order(
             order_data, api_key, original_data
         )
 
-        # Store complete request data without apikey
         analyzer_request = order_request_data.copy()
         analyzer_request["api_type"] = "placesmartorder"
 
-        # Log to analyzer database with complete request and response
-        executor.submit(async_log_analyzer, analyzer_request, response_data, "placesmartorder")
-
-        # Emit socket event for toast notification asynchronously (non-blocking)
-        socketio.start_background_task(
-            socketio.emit,
-            "analyzer_update",
-            {"request": analyzer_request, "response": response_data},
+        # Check if this is a no-action case
+        no_action = (
+            response_data.get("status") == "success"
+            and "No action" in response_data.get("message", "")
+            or "Already Matched" in response_data.get("message", "")
         )
 
-        # Send Telegram alert in background task (non-blocking)
-        socketio.start_background_task(
-            telegram_alert_service.send_order_alert,
-            "placesmartorder",
-            order_data,
-            response_data,
-            order_data.get("apikey"),
-        )
+        if no_action:
+            bus.publish(SmartOrderNoActionEvent(
+                mode="analyze", api_type="placesmartorder",
+                symbol=order_data.get("symbol", ""),
+                exchange=order_data.get("exchange", ""),
+                message=response_data.get("message", ""),
+                request_data=analyzer_request, response_data=response_data,
+                api_key=api_key,
+            ))
+        else:
+            bus.publish(OrderPlacedEvent(
+                mode="analyze", api_type="placesmartorder",
+                strategy=order_data.get("strategy", ""),
+                symbol=order_data.get("symbol", ""),
+                exchange=order_data.get("exchange", ""),
+                action=order_data.get("action", ""),
+                quantity=int(order_data.get("quantity", 0)),
+                pricetype=order_data.get("pricetype", ""),
+                product=order_data.get("product", ""),
+                orderid=response_data.get("orderid", ""),
+                request_data=analyzer_request, response_data=response_data,
+                api_key=api_key,
+            ))
+
         return success, response_data, status_code
 
     # Live Mode - Proceed with actual order placement
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}
-        executor.submit(async_log_order, "placesmartorder", original_data, error_response)
+        bus.publish(OrderFailedEvent(
+            mode="live", api_type="placesmartorder",
+            request_data=order_request_data, response_data=error_response,
+            api_key=api_key, error_message="Broker-specific module not found",
+        ))
         return False, error_response, 404
 
-    # Price Discovery: If pricetype is LIMIT and price is 0, fetch latest quote
-    pricetype = order_data.get("pricetype", "MARKET")
-    price = order_data.get("price", 0)
-    if pricetype == "LIMIT" and price == 0:
-        action = order_data.get("action", "BUY").upper()
-        logger.info(
-            f"Price discovery triggered for {order_data.get('symbol')} "
-            f"on {order_data.get('exchange')}"
-        )
+    _discover_limit_price(order_data, original_data)
 
-        symbol = order_data.get("symbol")
-        exchange = order_data.get("exchange")
-        symbol_success, symbol_response, _ = get_symbol_info_with_auth(
-            symbol, exchange, auth_token, broker
-        )
-
-        tick_size = 0.05
-        instrument_type = None
-        if symbol_success:
-            symbol_data = symbol_response.get("data", {})
-            tick_size = symbol_data.get("tick_size", 0.05)
-            instrument_type = symbol_data.get("instrumenttype")
-
-        api_key = original_data.get("apikey")
-        success, quote_response, _ = get_quotes(
-            symbol=symbol,
-            exchange=exchange,
-            api_key=api_key,
-        )
-
-        if success:
-            quote_data = quote_response.get("data", {})
-            quote_ltp = quote_data.get("ltp", 0)
-            quote_bid = quote_data.get("bid", 0)
-            quote_ask = quote_data.get("ask", 0)
-
-            # BUY: Use ask + buffer%, SELL: Use bid - buffer%, fallback to LTP
-            execution_buffer = get_execution_buffer(instrument_type)
-            if action == "BUY" and quote_ask > 0:
-                discovered_price = quote_ask * (1 + execution_buffer)
-            elif action == "SELL" and quote_bid > 0:
-                discovered_price = quote_bid * (1 - execution_buffer)
-            else:
-                discovered_price = quote_ltp
-
-            if discovered_price and discovered_price > 0:
-                order_data["price"] = round_price_to_tick_size(discovered_price, tick_size)
-                buffer_pct = round(execution_buffer * 100, 1)
-                logger.info(
-                    f"Price discovered for {symbol}: "
-                    f"{order_data['price']} ({action}, buffer={buffer_pct}%)"
-                )
-            else:
-                logger.warning(f"Invalid price from quote for {symbol}: {discovered_price}")
-        else:
-            logger.warning(
-                f"Price discovery failed for {symbol}: "
-                f"{quote_response.get('message', 'Unknown error')}"
-            )
-
+    unanswered: list[str] = []
     try:
-        res, response_data, order_id = broker_module.place_smartorder_api(order_data, auth_token)
+        with watch_for_unanswered_writes() as unanswered:
+            res, response_data, order_id = broker_module.place_smartorder_api(
+                order_data, auth_token
+            )
 
         # Handle case where position size matches current position
         if (
@@ -410,87 +268,89 @@ def place_smart_order_with_auth(
             and response_data.get("status") == "success"
             and "No action needed" in response_data.get("message", "")
         ):
-            # Log the no-action-needed case
             order_response_data = {
                 "status": "success",
                 "message": "Positions Already Matched. No Action needed.",
             }
-            executor.submit(
-                async_log_order, "placesmartorder", order_request_data, order_response_data
-            )
-
-            # Emit notification for matched positions asynchronously (non-blocking)
-            socketio.start_background_task(
-                socketio.emit,
-                "order_notification",
-                {
-                    "symbol": order_data.get("symbol"),
-                    "status": "info",
-                    "message": " Positions Already Matched. No Action needed.",
-                },
-            )
-            # Send Telegram alert in background task (non-blocking)
-            socketio.start_background_task(
-                telegram_alert_service.send_order_alert,
-                "placesmartorder",
-                order_data,
-                order_response_data,
-                original_data.get("apikey"),
-            )
+            bus.publish(SmartOrderNoActionEvent(
+                mode="live", api_type="placesmartorder",
+                symbol=order_data.get("symbol", ""),
+                exchange=order_data.get("exchange", ""),
+                message=" Positions Already Matched. No Action needed.",
+                request_data=order_request_data, response_data=order_response_data,
+                api_key=api_key,
+            ))
             return True, order_response_data, 200
 
         # Log successful order immediately after placement
         if res and res.status == 200:
             order_response_data = {"status": "success", "orderid": order_id}
-            executor.submit(
-                async_log_order, "placesmartorder", order_request_data, order_response_data
-            )
-            # Send Telegram alert in background task (non-blocking)
-            socketio.start_background_task(
-                telegram_alert_service.send_order_alert,
-                "placesmartorder",
-                order_data,
-                order_response_data,
-                original_data.get("apikey"),
-            )
-            # Emit SocketIO event asynchronously (non-blocking)
-            socketio.start_background_task(
-                socketio.emit,
-                "order_event",
-                {
-                    "symbol": order_data.get("symbol"),
-                    "action": order_data.get("action"),
-                    "orderid": order_id,
-                    "mode": "live",
-                },
-            )
-            # Apply rate-limiting delay before returning
-            try:
-                time.sleep(float(smart_order_delay))
-            except Exception:
-                logger.error(f"Invalid SMART_ORDER_DELAY value: {smart_order_delay}")
-                traceback.print_exc()
-            return True, order_response_data, 200
+            bus.publish(OrderPlacedEvent(
+                mode="live", api_type="placesmartorder",
+                strategy=order_data.get("strategy", ""),
+                symbol=order_data.get("symbol", ""),
+                exchange=order_data.get("exchange", ""),
+                action=order_data.get("action", ""),
+                quantity=int(order_data.get("quantity", 0)),
+                pricetype=order_data.get("pricetype", ""),
+                product=order_data.get("product", ""),
+                orderid=str(order_id),
+                request_data=order_request_data, response_data=order_response_data,
+                api_key=api_key,
+            ))
 
+    except BrokerBusyError as e:
+        # Refused before it was sent: the broker's request queue was longer
+        # than a caller may wait under the gthread worker. Never raised under
+        # eventlet or the development server.
+        logger.warning(f"Smart order not sent, broker busy: {e}")
+        error_response = {"status": "error", "message": str(e)}
+        bus.publish(
+            OrderFailedEvent(
+                mode="live",
+                api_type="placesmartorder",
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=api_key,
+                error_message=str(e),
+            )
+        )
+        return False, error_response, 429
     except Exception as e:
-        logger.error(f"Error in broker_module.place_smartorder_api: {e}")
-        traceback.print_exc()
+        logger.exception(f"Error in broker_module.place_smartorder_api: {e}")
         error_response = {
             "status": "error",
-            "message": "Failed to place smart order due to internal error",
+            "message": UNANSWERED_ORDER_MESSAGE
+            if unanswered
+            else "Failed to place smart order due to internal error",
         }
-        executor.submit(async_log_order, "placesmartorder", original_data, error_response)
-        return False, error_response, 500
+        bus.publish(OrderFailedEvent(
+            mode="live", api_type="placesmartorder",
+            request_data=order_request_data, response_data=error_response,
+            api_key=api_key, error_message=str(e),
+        ))
+        return False, error_response, 502 if unanswered else 500
 
-    message = (
-        response_data.get("message", "Failed to place smart order")
-        if isinstance(response_data, dict)
-        else "Failed to place smart order"
-    )
-    error_response = {"status": "error", "message": message}
-    executor.submit(async_log_order, "placesmartorder", original_data, error_response)
-    status_code = res.status if res and hasattr(res, "status") else 500
-    return False, error_response, status_code
+    if res and res.status == 200:
+        return True, order_response_data, 200
+    else:
+        message = (
+            response_data.get("message", "Failed to place smart order")
+            if isinstance(response_data, dict)
+            else "Failed to place smart order"
+        )
+        if unanswered:
+            message = UNANSWERED_ORDER_MESSAGE
+        error_response = {"status": "error", "message": message}
+        bus.publish(OrderFailedEvent(
+            mode="live", api_type="placesmartorder",
+            request_data=order_request_data, response_data=error_response,
+            api_key=api_key, error_message=message,
+        ))
+        status_code = res.status if res and hasattr(res, "status") else 500
+        if unanswered:
+            status_code = 502
+        return False, error_response, status_code
 
 
 def place_smart_order(
@@ -498,7 +358,6 @@ def place_smart_order(
     api_key: str | None = None,
     auth_token: str | None = None,
     broker: str | None = None,
-    smart_order_delay: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Place a smart order.
@@ -509,7 +368,6 @@ def place_smart_order(
         api_key: OpenAlgo API key (for API-based calls)
         auth_token: Direct broker authentication token (for internal calls)
         broker: Direct broker name (for internal calls)
-        smart_order_delay: Delay in seconds between order placement and response
 
     Returns:
         Tuple containing:
@@ -520,10 +378,6 @@ def place_smart_order(
     original_data = copy.deepcopy(order_data)
     if api_key:
         original_data["apikey"] = api_key
-
-    # Use default delay if not provided
-    if smart_order_delay is None:
-        smart_order_delay = SMART_ORDER_DELAY
 
     # Add API key to order data if provided (needed for validation)
     if api_key:
@@ -544,13 +398,13 @@ def place_smart_order(
             return False, error_response, 403
 
         return place_smart_order_with_auth(
-            order_data, AUTH_TOKEN, broker_name, original_data, smart_order_delay
+            order_data, AUTH_TOKEN, broker_name, original_data
         )
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
         return place_smart_order_with_auth(
-            order_data, auth_token, broker, original_data, smart_order_delay
+            order_data, auth_token, broker, original_data
         )
 
     # Case 3: Invalid parameters

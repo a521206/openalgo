@@ -6,7 +6,6 @@ Based on official Fyers library analysis
 
 import base64
 import json
-import logging
 import ssl
 import struct
 import threading
@@ -16,6 +15,9 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import websocket
+
+from database.auth_db import get_auth_token
+from utils.logging import get_logger
 
 
 class FyersHSMWebSocket:
@@ -121,23 +123,40 @@ class FyersHSMWebSocket:
     HEALTH_CHECK_INTERVAL = 30  # Check every 30 seconds
     DATA_TIMEOUT = 90  # Consider stalled if no data for 90 seconds
 
-    def __init__(self, access_token: str, log_path: str = ""):
+    def __init__(self, access_token: str, log_path: str = "", user_id: str | None = None):
         """
         Initialize HSM WebSocket client
 
         Args:
             access_token: Fyers access token in format "appid:token"
             log_path: Path for logging (optional)
+            user_id: OpenAlgo user id, used to re-read a fresh access token from
+                the database on reconnect (tokens roll over daily at ~3 AM IST)
         """
         self.access_token = access_token
-        self.logger = logging.getLogger("fyers_hsm_websocket")
+        self.user_id = user_id
+        self.logger = get_logger("fyers_hsm_websocket")
 
-        # Extract HSM key from token
+        # Initialize health-check stop event BEFORE the HSM key extraction so
+        # cleanup paths can reference it even when __init__ raises (the
+        # extraction call below). Without this the disconnect logged after a
+        # failed init crashes with "no attribute '_health_check_stop_event'".
+        self._health_check_stop_event = threading.Event()
+
+        # Extract HSM key from token. _extract_hsm_key returns None either when
+        # the JWT exp claim is in the past (logged as "Access token has
+        # expired") or when decoding fails. The most common cause in
+        # production is the daily token expiry, so the raised message includes
+        # auth keywords so the websocket_proxy ConnectionPool recovery (issue
+        # #1419) can detect it and rebuild the adapter with a fresh token.
         self.hsm_key = self._extract_hsm_key(access_token)
         if not self.hsm_key:
-            raise ValueError("Failed to extract HSM key from access token")
+            raise ValueError(
+                "Failed to extract HSM key from access token — "
+                "access token has expired or is invalid"
+            )
 
-        self.logger.debug(f"HSM key extracted: {self.hsm_key[:20]}...")
+        self.logger.debug("HSM key extracted from access token")
 
         # WebSocket connection
         self.ws = None
@@ -150,10 +169,10 @@ class FyersHSMWebSocket:
         self.reconnect_enabled = True
         self.reconnect_attempts = 0
 
-        # Health check state
+        # Health check state. _health_check_stop_event is already initialized
+        # at the top of __init__ so cleanup-after-failed-init paths can use it.
         self._last_message_time = None
         self._health_check_thread = None
-        self._health_check_stop_event = threading.Event()  # Signal to stop health check thread
 
         # Data structures
         self.subscriptions = {}  # topic_id -> topic_name mapping
@@ -317,6 +336,24 @@ class FyersHSMWebSocket:
 
         return buffer_msg
 
+    @staticmethod
+    def _auth_response_ok(data: bytearray) -> bool:
+        """Return True if a request-type-1 frame reports authentication accepted.
+
+        Layout after the 2-byte length, 1-byte request type and 1-byte field
+        count: ``[field id][u16 field length][value]``. The first field carries
+        the status string, which is ``"K"`` when the hsm_key was accepted. A
+        frame too short to hold the field is treated as a failure rather than
+        silently passing.
+        """
+        try:
+            if len(data) < 8:
+                return False
+            field_length = struct.unpack("!H", data[5:7])[0]
+            return data[7 : 7 + field_length].decode("utf-8", errors="replace") == "K"
+        except (struct.error, IndexError):
+            return False
+
     def _parse_binary_message(self, data: bytearray):
         """
         Parse incoming binary message from HSM WebSocket
@@ -332,7 +369,23 @@ class FyersHSMWebSocket:
             msg_type = data[2]
 
             if msg_type == 1:
-                # Authentication response
+                # Authentication response. The verdict is a status field, not the
+                # mere arrival of the frame: byte 4 is the field ID, bytes 5-6 the
+                # field length, and the value is "K" for accepted. Treating any
+                # type-1 frame as success would report a rejected token as a
+                # healthy connection that then never delivers a tick.
+                if not self._auth_response_ok(data):
+                    self.authenticated = False
+                    self.logger.error(
+                        "HSM authentication rejected by Fyers - the access token's "
+                        "hsm_key was not accepted (re-authenticate the broker)"
+                    )
+                    if self.on_error_callback:
+                        self.on_error_callback(
+                            ConnectionError("Fyers HSM authentication failed - invalid token")
+                        )
+                    return
+
                 self.authenticated = True
                 self.logger.info("HSM authentication successful")
 
@@ -688,78 +741,46 @@ class FyersHSMWebSocket:
             field_count = struct.unpack("B", data[offset : offset + 1])[0]
             offset += 1
 
-            # Determine data type based on topic ID
-            if topic_id in self.subscriptions:
-                topic_name = self.subscriptions[topic_id]
-
-                if topic_name.startswith("sf|") and topic_id in self.scrips_data:
-                    # Update scrip data
-                    for index in range(field_count):
-                        if offset + 4 > len(data):
-                            break
-
-                        value = struct.unpack(">i", data[offset : offset + 4])[0]
-                        offset += 4
-
-                        if value != -2147483648 and index < len(self.DATA_FIELDS):
-                            old_value = self.scrips_data[topic_id].get(self.DATA_FIELDS[index])
-                            if old_value != value:
-                                self.scrips_data[topic_id][self.DATA_FIELDS[index]] = value
-
-                                # Send update to callback
-                                if self.on_message_callback:
-                                    update_data = self.scrips_data[topic_id].copy()
-                                    update_data["update_type"] = "live"
-                                    self.logger.debug(
-                                        f"Sending live update: {update_data.get('symbol', 'Unknown')} LTP={update_data.get('ltp', 'N/A')}"
-                                    )
-                                    self.on_message_callback(update_data)
-
-                elif topic_name.startswith("if|") and topic_id in self.index_data:
-                    # Update index data
-                    for index in range(field_count):
-                        if offset + 4 > len(data):
-                            break
-
-                        value = struct.unpack(">i", data[offset : offset + 4])[0]
-                        offset += 4
-
-                        if value != -2147483648 and index < len(self.INDEX_FIELDS):
-                            old_value = self.index_data[topic_id].get(self.INDEX_FIELDS[index])
-                            if old_value != value:
-                                self.index_data[topic_id][self.INDEX_FIELDS[index]] = value
-
-                                # Send update to callback
-                                if self.on_message_callback:
-                                    update_data = self.index_data[topic_id].copy()
-                                    update_data["update_type"] = "live"
-                                    self.on_message_callback(update_data)
-
-                elif topic_name.startswith("dp|") and topic_id in self.depth_data:
-                    # Update depth data
-                    for index in range(field_count):
-                        if offset + 4 > len(data):
-                            break
-
-                        value = struct.unpack(">i", data[offset : offset + 4])[0]
-                        offset += 4
-
-                        if value != -2147483648 and index < len(self.DEPTH_FIELDS):
-                            old_value = self.depth_data[topic_id].get(self.DEPTH_FIELDS[index])
-                            if old_value != value:
-                                self.depth_data[topic_id][self.DEPTH_FIELDS[index]] = value
-
-                                # Send update to callback
-                                if self.on_message_callback:
-                                    update_data = self.depth_data[topic_id].copy()
-                                    update_data["update_type"] = "live"
-                                    self.logger.debug(
-                                        f"Sending live depth update: {update_data.get('symbol', 'Unknown')}"
-                                    )
-                                    self.on_message_callback(update_data)
+            # Pick the stored state this topic updates
+            topic_name = self.subscriptions.get(topic_id, "")
+            if topic_name.startswith("sf|"):
+                store, fields = self.scrips_data, self.DATA_FIELDS
+            elif topic_name.startswith("if|"):
+                store, fields = self.index_data, self.INDEX_FIELDS
+            elif topic_name.startswith("dp|"):
+                store, fields = self.depth_data, self.DEPTH_FIELDS
             else:
-                # Skip unknown data
-                offset += field_count * 4
+                store, fields = None, ()
+
+            state = store.get(topic_id) if store is not None else None
+            if state is None:
+                # Unknown topic, or no snapshot yet: skip its fields
+                return offset + field_count * 4
+
+            # An update frame is one incremental change to the scrip. Apply
+            # every field first and send the merged state once, as the
+            # official SDK does. Sending after each field published the new
+            # LTP with the previous tick's volume, bid and ask (issue #2318).
+            changed = False
+            for index in range(field_count):
+                if offset + 4 > len(data):
+                    break
+
+                value = struct.unpack(">i", data[offset : offset + 4])[0]
+                offset += 4
+
+                if value != -2147483648 and index < len(fields):
+                    if state.get(fields[index]) != value:
+                        state[fields[index]] = value
+                        changed = True
+
+            if changed and self.on_message_callback:
+                update_data = state.copy()
+                update_data["update_type"] = "live"
+                self.logger.debug(
+                    f"Sending live update: {update_data.get('symbol', 'Unknown')} LTP={update_data.get('ltp', 'N/A')}"
+                )
+                self.on_message_callback(update_data)
 
         except Exception as e:
             self.logger.error(f"Error parsing update data: {e}")
@@ -798,6 +819,24 @@ class FyersHSMWebSocket:
             self._parse_binary_message(bytearray(message))
         else:
             self.logger.warning(f"Received unexpected text message: {message}")
+
+    def _on_ws_pong(self, ws, message):
+        """Treat a WebSocket pong as proof the connection is alive.
+
+        The HSM feed sends no application-level heartbeat, so during a quiet or
+        closed market ``_last_message_time`` would otherwise freeze and the
+        data-stall watchdog would force a needless reconnect every
+        ``DATA_TIMEOUT`` seconds. The protocol ping/pong (enabled via
+        ``ping_interval`` on ``run_forever``) keeps the socket alive regardless
+        of market activity, so we feed the liveness clock from it — making the
+        watchdog fire only when the socket is genuinely dead (no data AND no
+        pong).
+        """
+        self._last_message_time = time.time()
+
+    def _on_ws_ping(self, ws, message):
+        """A server-initiated ping also proves the socket is alive."""
+        self._last_message_time = time.time()
 
     def _on_ws_error(self, ws, error):
         """Handle WebSocket error event"""
@@ -857,11 +896,32 @@ class FyersHSMWebSocket:
                     on_message=self._on_ws_message,
                     on_error=self._on_ws_error,
                     on_close=self._on_ws_close,
-                    header={"Authorization": self.access_token, "User-Agent": f"{self.source}/1.0"},
+                    on_ping=self._on_ws_ping,
+                    on_pong=self._on_ws_pong,
+                    # NO Authorization header. The HSM feed authenticates purely
+                    # in-band, via the binary request-type-1 frame carrying the
+                    # JWT's hsm_key (see _create_auth_message). Fyers' gateway now
+                    # *silently drops* any handshake that carries an Authorization
+                    # header: the WebSocket upgrade still succeeds, but the auth
+                    # frame is never answered and the socket sits mute until our
+                    # 15s timeout. Verified against the live endpoint — a bare
+                    # JWT, an "<appId>:<token>" pair, and even "Authorization: x"
+                    # all produce silence, while no header (or any other header,
+                    # e.g. User-Agent) returns the type-1 auth response. The
+                    # official fyers-apiv3 SDK's data_ws.py likewise passes no
+                    # headers here. The <appId>:<token> Authorization header is
+                    # still required by the *order* socket (wss://socket.fyers.in/
+                    # trade/v3) and the *TBT* socket — this applies to HSM only.
+                    header={"User-Agent": f"{self.source}/1.0"},
                 )
 
-                # Run until disconnection
-                self.ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+                # Run until disconnection. Enable protocol ping/pong keepalive so
+                # the socket stays alive through idle/quiet periods and the pong
+                # feeds the data-stall watchdog's liveness clock (matches
+                # Dhan/Upstox). Without this the HSM feed had no keepalive at all.
+                self.ws.run_forever(
+                    sslopt={"cert_reqs": ssl.CERT_NONE}, ping_interval=30, ping_timeout=10
+                )
 
             except Exception as e:
                 self.logger.error(f"HSM WebSocket run error: {e}")
@@ -874,10 +934,50 @@ class FyersHSMWebSocket:
                 if not self._handle_reconnect():
                     self.logger.error("Reconnection failed - stopping HSM WebSocket")
                     break
+                # Re-read a fresh access token from the database before the loop
+                # rebuilds the WebSocketApp with the Authorization header. Without
+                # this, a reconnect after the ~3 AM IST daily token rollover would
+                # reuse the dead construction-time token and the feed would stay
+                # dead until a process restart.
+                self._refresh_access_token()
             else:
                 break
 
         self.logger.debug("HSM WebSocket run loop exited")
+
+    def _refresh_access_token(self):
+        """Re-read a fresh access token from the database before a reconnect.
+
+        Indian broker tokens roll over daily at ~3 AM IST. On reconnect we must
+        re-read the current token from the database (bypassing the auth cache,
+        which can hold a stale token after rollover). For Fyers HSM the token is
+        used both in the Authorization header (self.access_token) and to derive
+        the HSM auth key (self.hsm_key), so both are refreshed. If no fresh token
+        is available or the new HSM key cannot be extracted, keep the existing
+        values rather than crashing.
+        """
+        if not self.user_id:
+            return
+        try:
+            fresh_token = get_auth_token(self.user_id, bypass_cache=True)
+            if not fresh_token:
+                self.logger.warning(
+                    "No fresh auth token found on reconnect - keeping existing token"
+                )
+                return
+            new_hsm_key = self._extract_hsm_key(fresh_token)
+            if not new_hsm_key:
+                self.logger.warning(
+                    "Could not extract HSM key from fresh token on reconnect - "
+                    "keeping existing token"
+                )
+                return
+            with self.lock:
+                self.access_token = fresh_token
+                self.hsm_key = new_hsm_key
+            self.logger.info("Refreshed Fyers access token from database for reconnect")
+        except Exception as e:
+            self.logger.error(f"Error refreshing access token on reconnect: {e}")
 
     def _handle_reconnect(self) -> bool:
         """
@@ -1093,7 +1193,7 @@ class FyersHSMWebSocket:
         sub_msg = self._create_subscription_message(hsm_symbols, channel=11)
         self.ws.send(sub_msg, opcode=websocket.ABNF.OPCODE_BINARY)
 
-        # self.logger.info(f"\n✅ Sent subscription request for {len(hsm_symbols)} HSM symbols")
+        # self.logger.info(f"\nSent subscription request for {len(hsm_symbols)} HSM symbols")
         for i, symbol in enumerate(hsm_symbols, 1):
             mapped_symbol = symbol_mappings.get(symbol, "Unknown") if symbol_mappings else "N/A"
             # self.logger.info(f"  {i}. {symbol} => {mapped_symbol}")
@@ -1113,9 +1213,7 @@ class FyersHSMWebSocket:
             self.disconnect()
         except Exception as e:
             # Fallback logging if self.logger is not available
-            import logging
-
-            logger = logging.getLogger("fyers_hsm_websocket")
+            logger = get_logger("fyers_hsm_websocket")
             logger.error(f"Error in HSM WebSocket destructor: {e}")
 
     def force_cleanup(self):
@@ -1147,7 +1245,7 @@ class FyersHSMWebSocket:
             if hasattr(self, "ws") and self.ws:
                 try:
                     self.ws.close()
-                except:
+                except Exception:
                     pass
                 self.ws = None
 
@@ -1167,5 +1265,5 @@ class FyersHSMWebSocket:
             if hasattr(self, "reconnect_attempts"):
                 self.reconnect_attempts = 0
 
-        except:
+        except Exception:
             pass  # Suppress all errors in force cleanup

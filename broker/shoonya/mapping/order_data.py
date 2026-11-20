@@ -6,6 +6,42 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+# Shoonya (Noren) order statuses arrive with underscores ("TRIGGER_PENDING") and
+# inconsistent casing ("Open" / "OPEN", "REJECT" / "REJECTED"), so normalize the
+# separator and case before matching.
+_COMPLETE_STATUSES = {"COMPLETE"}
+_REJECTED_STATUSES = {"REJECTED", "REJECT"}
+_CANCELLED_STATUSES = {"CANCELED", "CANCELLED"}
+# Still working at the exchange, i.e. modifiable/cancellable. A stop-loss order
+# waiting for its trigger sits in TRIGGER_PENDING and must surface as "open" so
+# the order book offers Modify/Cancel.
+_OPEN_STATUSES = {
+    "OPEN",
+    "PENDING",
+    "TRIGGER PENDING",
+    "NEW",
+    "REPLACED",
+    "OPEN PENDING",
+    "MODIFY PENDING",
+    "CANCEL PENDING",
+    "AFTER MARKET ORDER REQ RECEIVED",
+}
+
+
+def normalize_order_status(raw_status):
+    """Map a Shoonya status to an OpenAlgo status (open/complete/cancelled/rejected)."""
+    status = str(raw_status or "").strip().upper().replace("_", " ")
+    if status in _COMPLETE_STATUSES:
+        return "complete"
+    if status in _OPEN_STATUSES:
+        return "open"
+    if status in _REJECTED_STATUSES:
+        return "rejected"
+    if status in _CANCELLED_STATUSES:
+        return "cancelled"
+    return status.lower()
+
+
 def map_order_data(order_data):
     """
     Processes and modifies a list of order dictionaries based on specific conditions.
@@ -40,28 +76,32 @@ def map_order_data(order_data):
             # Check if a symbol was found; if so, update the trading_symbol in the current order
             if symbol_from_db:
                 order["tsym"] = symbol_from_db
-                if (order["exch"] == "NSE" or order["exch"] == "BSE") and order["prd"] == "C":
-                    order["prd"] = "CNC"
-
-                elif order["prd"] == "I":
-                    order["prd"] = "MIS"
-
-                elif order["exch"] in ["NFO", "MCX", "BFO", "CDS"] and order["prd"] == "M":
-                    order["prd"] = "NRML"
-
-                if order["prctyp"] == "MKT":
-                    order["prctyp"] = "MARKET"
-                elif order["prctyp"] == "LMT":
-                    order["prctyp"] = "LIMIT"
-                elif order["prctyp"] == "SL-MKT":
-                    order["prctyp"] = "SL-M"
-                elif order["prctyp"] == "SL-LMT":
-                    order["prctyp"] = "SL"
-
             else:
                 logger.info(
                     f"Symbol not found for token {symboltoken} and exchange {exchange}. Keeping original trading symbol."
                 )
+
+            # Product and price type are independent of the symbol lookup, so map them
+            # unconditionally - otherwise a lookup miss leaves raw Shoonya values
+            # (e.g. "SL-LMT") that the order book's Modify dialog cannot match.
+            if (order["exch"] == "NSE" or order["exch"] == "BSE") and order["prd"] == "C":
+                order["prd"] = "CNC"
+
+            elif order["prd"] == "I":
+                order["prd"] = "MIS"
+
+            elif order["exch"] in ["NFO", "MCX", "BFO", "CDS"] and order["prd"] == "M":
+                order["prd"] = "NRML"
+
+            price_type = str(order.get("prctyp") or "").upper()
+            if price_type == "MKT":
+                order["prctyp"] = "MARKET"
+            elif price_type == "LMT":
+                order["prctyp"] = "LIMIT"
+            elif price_type in ("SL-MKT", "SLMKT"):
+                order["prctyp"] = "SL-M"
+            elif price_type in ("SL-LMT", "SLLMT"):
+                order["prctyp"] = "SL"
 
     return order_data
 
@@ -92,11 +132,12 @@ def calculate_order_statistics(order_data):
                 total_sell_orders += 1
 
             # Count orders based on their status
-            if order["status"] == "COMPLETE":
+            status = normalize_order_status(order.get("status"))
+            if status == "complete":
                 total_completed_orders += 1
-            elif order["status"] == "OPEN":
+            elif status == "open":
                 total_open_orders += 1
-            elif order["status"] == "REJECTED":
+            elif status == "rejected":
                 total_rejected_orders += 1
 
     # Compile and return the statistics
@@ -120,6 +161,9 @@ def transform_order_data(orders):
             )
             continue
 
+        # Map Shoonya status to OpenAlgo status
+        mapped_status = normalize_order_status(order.get("status"))
+
         transformed_order = {
             "symbol": order.get("tsym", ""),
             "exchange": order.get("exch", ""),
@@ -130,7 +174,7 @@ def transform_order_data(orders):
             "pricetype": order.get("prctyp", ""),
             "product": order.get("prd", ""),
             "orderid": order.get("norenordno", ""),
-            "order_status": order.get("status", "").lower(),
+            "order_status": mapped_status,
             "timestamp": order.get("norentm", ""),
         }
 
@@ -267,19 +311,29 @@ def transform_positions_data(positions_data):
         netqty = float(position.get("netqty", 0))
         netavgprc = float(position.get("netavgprc", 0.0))
         lp = float(position.get("lp", 0.0))  # Last Price from Shoonya
+        rpnl = float(position.get("rpnl", 0.0))  # Realized P&L
+        urmtom = float(position.get("urmtom", 0.0))  # Unrealized MTM
 
-        # Calculate PnL only if there's an open position
+        # For closed positions, Shoonya zeroes out netavgprc
+        # Use daybuyavgprc or totbuyavgprc as fallback for average price
+        if netavgprc == 0 and netqty == 0:
+            netavgprc = float(position.get("daybuyavgprc", 0.0)) or float(
+                position.get("totbuyavgprc", 0.0)
+            )
+
+        # Calculate PnL
         if netqty != 0 and lp > 0:
-            if netqty > 0:
-                # Long position
-                pnl = (lp - netavgprc) * netqty
+            # Open position: use unrealized MTM if available, else calculate
+            if urmtom != 0:
+                pnl = urmtom + rpnl
             else:
-                # Short position
-                pnl = (netavgprc - lp) * abs(netqty)
+                if netqty > 0:
+                    pnl = (lp - netavgprc) * netqty + rpnl
+                else:
+                    pnl = (netavgprc - lp) * abs(netqty) + rpnl
         else:
-            # No position or no LTP available
-            pnl = 0.0
-            lp = 0.0 if netqty == 0 else lp  # Set LTP to 0 if position is closed
+            # Closed position: use realized P&L
+            pnl = rpnl
 
         transformed_position = {
             "symbol": position.get("tsym", ""),

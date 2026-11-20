@@ -1,345 +1,119 @@
 # 06 - Broker Connection
 
-## Introduction
+## Overview
 
-OpenAlgo supports 29 Indian brokers through a unified interface. This guide covers connecting your broker account and understanding the authentication process.
+OpenAlgo loads broker adapters from `broker/<name>/`. The current repository contains 38 plugin directories: 37 securities integrations and Delta Exchange for crypto derivatives. One OpenAlgo instance is logged in to one broker at a time; the keys of several can be saved.
 
-## Supported Brokers
+The installed plugin directories are the authoritative inventory:
 
-### Full List of Supported Brokers
-
-| Broker | Auth Type | Auto Login |
-|--------|-----------|------------|
-| Zerodha (Kite) | OAuth2 | No |
-| Angel One | API Key | Yes* |
-| Dhan | API Key | Yes |
-| Fyers | OAuth2 | No |
-| Upstox | OAuth2 | No |
-| 5paisa | OAuth2 | No |
-| 5paisa XTS | API Key | Yes |
-| Kotak Neo | OAuth2 | No |
-| Flattrade | API Key | Yes |
-| Shoonya (Finvasia) | API Key | Yes |
-| AliceBlue | API Key | Yes |
-| Firstock | API Key | Yes |
-| IIFL | API Key | Yes |
-| Motilal Oswal | OAuth2 | No |
-| Samco | API Key | Yes |
-| Groww | OAuth2 | No |
-| Paytm Money | OAuth2 | No |
-| Pocketful | API Key | Yes |
-| Tradejini | API Key | Yes |
-| Zebu | API Key | Yes |
-| Mstock | API Key | Yes |
-| Wisdom Capital | API Key | Yes |
-| JainamXTS | API Key | Yes |
-| Compositedge | API Key | Yes |
-| Definedge | API Key | Yes |
-| Indmoney | API Key | Yes |
-
-*Auto Login requires TOTP key configuration
-
-## Getting Broker API Credentials
-
-### Zerodha (Kite Connect)
-
-1. Go to [kite.trade](https://kite.trade)
-2. Login with your Zerodha credentials
-3. Create a new app under "Apps"
-4. Note down:
-   - **API Key**
-   - **API Secret**
-5. Set redirect URL to: `http://127.0.0.1:5000/callback/zerodha`
-
-**Cost**: ₹2,000/month for Kite Connect
-
-### Angel One (Smart API)
-
-1. Go to [smartapi.angelbroking.com](https://smartapi.angelbroking.com)
-2. Login and generate API credentials
-3. Note down:
-   - **API Key**
-   - **Client Code** (your trading ID)
-4. You'll also need your:
-   - **Password**
-   - **TOTP Secret** (for auto-login)
-
-**Cost**: Free
-
-### Dhan
-
-1. Go to [api.dhan.co](https://api.dhan.co)
-2. Login with Dhan credentials
-3. Generate access token
-4. Note down:
-   - **Client ID**
-   - **Access Token**
-
-**Cost**: Free
-
-### Fyers
-
-1. Go to [myapi.fyers.in](https://myapi.fyers.in)
-2. Create developer account
-3. Create an app
-4. Note down:
-   - **App ID**
-   - **Secret ID**
-
-**Cost**: Free
-
-### Upstox
-
-1. Go to [developer.upstox.com](https://developer.upstox.com)
-2. Create developer account
-3. Create an app
-4. Note down:
-   - **API Key**
-   - **API Secret**
-
-**Cost**: Free
-
-## Configuring Broker in OpenAlgo
-
-### Method 1: Via .env File
-
-Edit your `.env` file:
-
-```ini
-# Select your broker
-BROKER=zerodha
-
-# Zerodha specific
-BROKER_API_KEY=your_api_key_here
-BROKER_API_SECRET=your_api_secret_here
+```text
+aliceblue, angel, arrow, compositedge, definedge, deltaexchange,
+dhan, dhan_sandbox, firstock, fivepaisa, fivepaisaxts, flattrade,
+fyers, groww, hdfcsecurities, hdfcsky, ibulls, iifl, iiflcapital,
+indmoney, jainamxts, kotak, motilal, mstock, nubra, paytm,
+pocketful, rmoney, rupeezy, sahi, samco, shoonya, tradejini, tradesmart,
+upstox, wisdom, zebu, zerodha
 ```
 
-For Angel One:
-```ini
-BROKER=angel
-BROKER_API_KEY=your_api_key
-BROKER_CLIENT_CODE=your_client_code
-BROKER_PASSWORD=your_password
-BROKER_TOTP_KEY=your_totp_secret
-```
+Each `plugin.json` declares the adapter's supported exchanges, broker type, and whether leverage configuration is available. The application caches these capabilities at startup and exposes the active broker's values to the frontend.
 
-### Method 2: Via Web Interface
+## Where the Broker Keys Come From
 
-1. Login to OpenAlgo
-2. Go to **Profile** → **Broker Configuration**
-3. Select your broker from dropdown
-4. Enter credentials in the form
-5. Click **Save**
+The broker pages are the same as in OpenAlgo Desktop: **Select Broker** after you sign in, and **Broker Configuration** for the keys. OpenAlgo reads broker keys from two places, and the `.env` file always comes first:
 
-## Logging into Your Broker
+1. **The `.env` file.** When `REDIRECT_URL` names a broker and `BROKER_API_KEY` is set, that broker always logs in with the `.env` keys. This is how every install worked before, and it still works unchanged.
+2. **Keys saved in OpenAlgo.** Open **Broker Configuration**: the button at the top of Select Broker, **Configure** or **Edit keys** on a broker's card, or the button in **Profile > Broker**. It opens before any broker login, so a new install adds its first broker there. Choose the broker, enter its keys and press **Save**. Each broker asks for its keys by the names it uses itself (for example Zerodha's API Key, Fyers' App ID), with a hint for each and a sentence on how its login works. The keys are encrypted in the database, each bound to its broker and field, and never shown again: the page shows the first characters of an API key and only whether a secret is saved. They apply at once, with no restart, and serve every broker the `.env` file does not set, and all brokers when `.env` sets none. **Forget this broker** removes them.
 
-### OAuth2 Brokers (Zerodha, Fyers, etc.)
+Saving keys for the `.env` broker on Broker Configuration writes them to `.env`, and it cannot be forgotten there: remove its lines from `.env` instead.
 
-1. In OpenAlgo, click **Login to Broker**
-2. You're redirected to broker's login page
-3. Enter your broker credentials
-4. Approve the connection
-5. Automatically redirected back to OpenAlgo
+| Variable in `.env` | On Broker Configuration | Purpose |
+|---|---|---|
+| `BROKER_API_KEY` | The broker's API key field (named as the broker names it) | Broker-specific API key or combined identifier |
+| `BROKER_API_SECRET` | The broker's secret field | Broker-specific API secret or token |
+| `BROKER_API_KEY_MARKET` | Market Data App Key (XTS brokers) | Optional market-data key |
+| `BROKER_API_SECRET_MARKET` | Market Data Secret Key (XTS brokers) | Optional market-data secret |
+| `REDIRECT_URL` | Redirect URL (brokers that send you back) | Automatic (your Host Server URL plus `/<broker>/callback`) or your own |
+| `VALID_BROKERS` | (not on the page) | Comma-separated adapters this install allows; the pages list only these |
 
-```
-OpenAlgo → Broker Login Page → Enter Credentials → Approve → Back to OpenAlgo
-```
+Credential formats differ by adapter. Use the hints on the page and the current instructions from your broker's developer portal; 5paisa, Flattrade and Dhan keys are checked for their `:::` layout when you save. For a broker that sends you back to OpenAlgo, register the Redirect URL Broker Configuration shows for it, exactly, in that broker's developer console.
 
-### API Key Brokers (Dhan, Angel, etc.)
+Settings some brokers need beyond these (for example HDFC Sky's `BROKER_CLIENT_ID` or Motilal's `BROKER_VENDOR_CODE`) are still read from `.env`.
 
-1. Credentials already in .env or profile
-2. Click **Login to Broker**
-3. OpenAlgo uses stored credentials
-4. Connection established automatically
+### A new install without a broker in `.env`
 
-## Understanding Authentication
+The installers, and a first `uv run app.py` with no `.env`, leave `REDIRECT_URL`, `BROKER_API_KEY` and `BROKER_API_SECRET` empty. OpenAlgo starts and prints that no broker is set in `.env`. After you sign in, Select Broker lists every broker; **Configure** on its card opens Broker Configuration.
 
-### Daily Login Requirement
+### Moving an existing install off `.env`
 
-Most brokers require you to login every trading day:
+1. Keep a copy of the broker's keys from `.env`.
+2. Empty `REDIRECT_URL`, `BROKER_API_KEY` and `BROKER_API_SECRET` in `.env` and restart.
+3. Sign in, open **Broker Configuration**, choose the broker, enter its keys and save. From now on they are saved in OpenAlgo.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Typical Trading Day                          │
-│                                                                  │
-│  8:30 AM  - Login to OpenAlgo                                   │
-│  8:35 AM  - Login to Broker                                     │
-│  9:15 AM  - Market Opens (you're ready to trade)                │
-│  3:30 PM  - Market Closes                                       │
-│  ~6:00 PM - Broker session expires                              │
-│                                                                  │
-│  Next Day - Login again                                         │
-└─────────────────────────────────────────────────────────────────┘
-```
+## Connect the Broker Session
 
-### Auto-Login (TOTP Based)
+1. Sign in to OpenAlgo.
+2. On **Select Broker**, find your broker (**Search brokers** narrows the list) and press **Login with <broker>** on its card. A broker without keys shows **Configure** instead.
+3. Complete the broker's login: its own login page, a short form in OpenAlgo, or one click with the saved keys. Broker Configuration says which, for each broker.
+4. Confirm the dashboard loads account data before starting a strategy.
 
-Some brokers support automatic login using TOTP:
+OpenAlgo starts every broker login on the server. The page sends only the broker you chose; the server checks it can be used and opens the broker's own sign-in page or OpenAlgo's login form. Your API secret never reaches the browser; the broker's sign-in address carries only the public API key it needs, and a one-time state for the brokers that return it (Fyers, Zerodha, Upstox, Paytm Money, Pocketful, CompositEdge, RMoney and IIFL Capital). The broker's answer, and OpenAlgo's own login form, are accepted only for a login started this way, within 10 minutes, and only once: from the same browser, or, for a broker that returns the state, with that state. A broker answer that no login of yours started is refused, so a link someone else sends you does not complete a login. If it is refused, the broker's card says "This broker login was not started from OpenAlgo, or it took longer than 10 minutes": start the login again.
 
-**Requirements**:
-- Broker TOTP secret key
-- Configure in `.env` or profile
+While a login runs, the broker you are logged in to keeps trading with its own keys: the new broker's keys are used only by that login, and become OpenAlgo's only once it completes. A request that read a broker's session uses that broker's keys to the end, even while a switch is being stored.
 
-**Supported Brokers for Auto-Login**:
-- Angel One
-- Flattrade
-- Shoonya
-- AliceBlue
+Where the broker reports which account a login is for, OpenAlgo checks it. Dhan reports it, and a Dhan login is refused when it is for an account other than the client ID saved for Dhan, or when Dhan does not say which account it is. RMoney reports the account of its session, and an RMoney or CompositEdge login is refused when that account is not the one the market data keys belong to. That comparison needs the market data login to succeed: when it fails, the login completes without it, as it did before. Other brokers do not report an account at login, so OpenAlgo cannot check it for them.
 
-**How to get TOTP Secret**:
-1. During broker 2FA setup
-2. Choose "Enter code manually" instead of scanning QR
-3. Copy the secret key shown
-4. Store in `BROKER_TOTP_KEY`
+A logout, a password change or a password reset that happens while a broker login is completing wins: the login is not stored. So does a change to that broker's keys.
 
-### Token Storage
+OpenAlgo imports the selected adapter's authentication module only when it is needed. The broker's current authentication policy determines when another login is required.
 
-OpenAlgo stores broker tokens:
-- Encrypted in database
-- Never stored in plain text
-- Auto-deleted on logout
+## Sign-in and Session Rules
 
-## Connection Status
+- The OpenAlgo application session and broker session are separate. If the broker token expires while the application session is still valid, the dashboard sends you back to the broker login page to reconnect rather than discarding the OpenAlgo login.
+- **Logging out ends your sign-in on every device.** So does changing or resetting your password. A browser that was signed in before that moment has to sign in again, even if it still holds its cookie. A broker login started before then does not complete: start it again after signing in.
+- Signing out from the broker login page, before any broker is connected, ends every sign-in that has not connected a broker yet, including a copy of that browser's cookie. Devices already on the broker session stay signed in.
+- A sign-in that never connected a broker ends at the daily session expiry (`SESSION_EXPIRY_TIME`, 03:00 IST by default), like a connected one.
+- Profile opens before any broker login, so a new install can add its first broker there.
 
-### Checking Connection
+## Verify the Connection
 
-In OpenAlgo dashboard, you'll see:
+After login, verify at least one read-only account call before placing an order:
 
-| Status | Meaning |
-|--------|---------|
-| 🟢 Connected | Broker session active |
-| 🔴 Disconnected | Need to login |
-| 🟡 Connecting | Login in progress |
+- Funds loads without an authentication error.
+- Order book and position book return current broker data.
+- The active broker's supported exchanges match `/api/broker/capabilities`.
+- WebSocket market data connects if the adapter and account support it.
 
-### What "Connected" Means
+Use Analyzer Mode for the first order workflow. It isolates order execution from the live broker while preserving the OpenAlgo API shape.
 
-When connected, you can:
-- Place orders
-- View positions
-- Check holdings
-- Get market data
+## Switch or Run Multiple Brokers
 
-### What Happens When Disconnected
+OpenAlgo is logged in to one broker at a time, as OpenAlgo Desktop is. Its card shows **Active** and **Open Dashboard** (which also joins a session opened on another device). To switch, press **Login with** on another broker's card. OpenAlgo asks first, and the old broker's session ends only when the new login completes, on every device; a login that fails or is abandoned leaves the old broker connected. You stay signed in, and the other devices sign in again. Open positions and orders stay with the old broker. No restart is needed.
 
-- Orders will fail
-- Real-time data stops
-- Need to re-login
+A switch is refused while the logged-in broker still has running Live strategies, Live OpenScript runs, running Python strategies or positions under scalping protection, because they would otherwise trade through the new broker or lose their stop. Logging out does not stop them, so after a logout the broker you were logged in to last counts: logging back in to it is always allowed, and another broker waits until they are stopped. Stop them first, then switch.
 
-## Handling Multiple Brokers
+New keys for the logged-in broker, or forgetting it, end its session; Broker Configuration asks you to confirm first. To remove a single saved key (for example a pasted access token), use **Forget this broker** and save the keys you still need again, as in OpenAlgo Desktop.
 
-### Switching Brokers
+To use multiple brokers concurrently, run separate OpenAlgo instances with separate `.env` files, ports, databases, and process supervision.
 
-1. Update `BROKER=` in `.env` to new broker
-2. Update corresponding credentials
-3. Restart OpenAlgo
-4. Login to new broker
+## Troubleshooting
 
-**Note**: Only one broker active at a time per instance
+| Symptom | Check |
+|---|---|
+| Callback rejected | The redirect URL (in `.env`, or on Broker Configuration) exactly matches the broker app and ends in the broker's name |
+| "This broker login was not started from OpenAlgo" | Start the login again from the broker login page, in the same browser, and finish it within 10 minutes. Open OpenAlgo at the same address as the redirect URL: `127.0.0.1` and `localhost` are different sites to a browser, and the broker returns to the redirect URL |
+| "No API key is saved for ..." | Add the broker's keys on Broker Configuration, or set them in `.env` |
+| "... still has 1 running Live strategy ..." | Stop the strategies and the scalping protection on the logged-in broker, then switch |
+| "A login to ... is under way" | A login to that broker is completing, perhaps on another device; wait a moment and try again |
+| "... a different account than the client ID saved ..." | Log in with the account whose client ID (Dhan) or market data keys (RMoney, CompositEdge) are saved, or correct them on Broker Configuration |
+| "The broker did not confirm which account this login is for" | The broker answered without naming the account; log in again. If it repeats, check the broker's service status |
+| "Your OpenAlgo sign-in ended while this broker login was in progress" | A logout or password change happened during the login; sign in and start the broker login again |
+| Saved keys seem to be ignored | `.env` sets keys for the same broker and comes first; empty the broker lines in `.env` and restart |
+| Invalid credentials | Required key format, whitespace, expiry, and broker-side app status |
+| Repeated login prompt | Broker token expiry or daily reauthentication policy |
+| Account calls fail after login | Broker session state and server logs; reconnect from `/broker` |
+| Market data unavailable | Adapter exchange capabilities, account entitlement, and WebSocket configuration |
 
-### Running Multiple Instances
-
-To use multiple brokers simultaneously:
-
-1. Install OpenAlgo in separate folders
-2. Configure each with different broker
-3. Run on different ports
-
-```bash
-# Instance 1 (Zerodha on port 5000)
-FLASK_PORT=5000 uv run app.py
-
-# Instance 2 (Angel on port 5001)
-FLASK_PORT=5001 uv run app.py
-```
-
-## Connection Troubleshooting
-
-### Issue: "Invalid API credentials"
-
-**Causes**:
-- Typo in API key/secret
-- Extra spaces in credentials
-- Expired credentials
-
-**Solutions**:
-- Double-check credentials
-- Remove any spaces
-- Regenerate from broker
-
-### Issue: "Broker not responding"
-
-**Causes**:
-- Broker server down
-- Network issues
-- Market closed
-
-**Solutions**:
-- Check broker status page
-- Try broker's website
-- Wait and retry
-
-### Issue: "TOTP verification failed"
-
-**Causes**:
-- Wrong TOTP secret
-- Time sync issue
-- Clock drift
-
-**Solutions**:
-- Verify TOTP secret
-- Sync device time
-- Regenerate TOTP
-
-### Issue: "Session expired"
-
-**Normal behavior** - sessions expire daily.
-
-**Solution**: Login again when markets open.
-
-## Best Practices
-
-### Security
-
-1. **Never share** broker credentials
-2. **Use strong passwords** for broker accounts
-3. **Enable 2FA** on broker account
-4. **Restrict IP** if broker supports it
-
-### Reliability
-
-1. **Login early** - Before market opens (8:30-9:00 AM)
-2. **Check status** - Verify connection before trading
-3. **Have backup** - Know broker's web/mobile as fallback
-4. **Monitor** - Watch for disconnections
-
-### For VPS Users
-
-1. Use static IP if possible
-2. Some brokers restrict new IPs
-3. Whitelist VPS IP with broker
-4. Consider VPN if required
-
-## Broker-Specific Notes
-
-### Zerodha
-- Kite Connect costs ₹2,000/month
-- Order rate limit: 10/second
-- Historical data available
-
-### Angel One
-- Free API access
-- TOTP required for trading
-- Good for beginners
-
-### Dhan
-- Free API access
-- Simple token-based auth
-- Has sandbox mode
-
-### Fyers
-- Free API access
-- Good historical data
-- Web-based OAuth
+Broker pricing, static-IP requirements, callback rules, and session lifetimes are external policies. Verify them with the broker instead of relying on a fixed value in OpenAlgo documentation.
 
 ---
 

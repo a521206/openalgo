@@ -1,3 +1,15 @@
+# OpenAlgo Audit Reports
+
+- [Documentation gap audit, 2026-11-06](2026-11-06-documentation-gap-audit.md):
+  current source comparisons, fixes and validation boundaries.
+
+The security review below and the reports linked from it are historical audit
+evidence. Their ratings and dependency findings are not a new security
+assessment of the current checkout. Use the current
+[security architecture](../design/05-security-architecture/README.md) and
+[security settings guide](../userguide/27-security-settings/README.md) for
+operating guidance.
+
 # OpenAlgo Security Audit Report
 
 ## Executive Summary
@@ -224,6 +236,7 @@ If using ngrok temporarily for webhooks:
 | [dependencies.md](./dependencies.md) | Third-party package security |
 | [recommendations.md](./recommendations.md) | Remaining improvements |
 | [ci-cd-audit.md](./ci-cd-audit.md) | CI/CD pipeline and code quality audit |
+| [websocket-keepalive-audit.md](./websocket-keepalive-audit.md) | Per-broker WebSocket ping/heartbeat/reconnect audit (32 brokers) |
 
 ## Bottom Line
 

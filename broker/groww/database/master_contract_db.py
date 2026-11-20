@@ -6,10 +6,11 @@ from io import StringIO
 import httpx
 import numpy as np
 import pandas as pd
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from database.engine_factory import create_db_engine
 from extensions import socketio  # Import SocketIO
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
@@ -19,7 +20,7 @@ logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
 
-engine = create_engine(DATABASE_URL)
+engine = create_db_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -66,32 +67,19 @@ def copy_from_dataframe(df):
     # Filter out data_dict entries with tokens that already exist
     filtered_data_dict = [row for row in data_dict if row["token"] not in existing_tokens]
 
-    # Insert in bulk the filtered records
+    # Insert in batches to avoid memory spikes and SQLite locking
+    BATCH_SIZE = 10000
     try:
-        if filtered_data_dict:  # Proceed only if there's anything to insert
-            logger.info(f"Inserting {len(filtered_data_dict)} new records into the database")
-            # Create a list of SymToken objects from the filtered data
-            symtoken_objects = []
-            for item in filtered_data_dict:
-                symtoken = SymToken(
-                    symbol=item.get("symbol", ""),
-                    brsymbol=item.get("brsymbol", ""),
-                    name=item.get("name", ""),
-                    exchange=item.get("exchange", ""),
-                    brexchange=item.get("brexchange", ""),
-                    token=item.get("token", ""),
-                    expiry=item.get("expiry", ""),
-                    strike=float(item.get("strike", 0)) if item.get("strike") else 0,
-                    lotsize=int(item.get("lotsize", 0)) if item.get("lotsize") else 0,
-                    instrumenttype=item.get("instrumenttype", ""),
-                    tick_size=float(item.get("tick_size", 0)) if item.get("tick_size") else 0,
-                )
-                symtoken_objects.append(symtoken)
-
-            # Add all objects and commit in one transaction
-            db_session.add_all(symtoken_objects)
+        if filtered_data_dict:
+            total = len(filtered_data_dict)
+            logger.info(f"Inserting {total} new records into the database in batches of {BATCH_SIZE}")
+            for i in range(0, total, BATCH_SIZE):
+                batch = filtered_data_dict[i : i + BATCH_SIZE]
+                db_session.bulk_insert_mappings(SymToken, batch)
+                db_session.flush()
+                logger.info(f"Inserted batch {i // BATCH_SIZE + 1} ({min(i + BATCH_SIZE, total)}/{total} records)")
             db_session.commit()
-            logger.info(f"Successfully inserted {len(symtoken_objects)} records into the database")
+            logger.info(f"Bulk insert completed successfully with {total} new records.")
         else:
             logger.info("No new records to insert")
     except Exception as e:
@@ -203,9 +191,9 @@ def format_openalgo_to_groww_symbol(symbol, exchange):
                         # Reconstruct date string
                         date_str = f"{day}{month}{year}"
 
-                        # Extract strike - look for numbers after the date
+                        # Extract strike - look for numbers (incl. decimals) after the date
                         date_end_pos = remaining.find(month) + len(month) + len(year)
-                        strike_match = re.search(r"\d+", remaining[date_end_pos:])
+                        strike_match = re.search(r"\d+(?:\.\d+)?", remaining[date_end_pos:])
                         if strike_match:
                             strike_str = strike_match.group(0)
 
@@ -397,46 +385,6 @@ def find_token_by_symbol(symbol, exchange):
 
     return None
 
-    # Insert in bulk the filtered records
-    try:
-        if filtered_data_dict:  # Proceed only if there's anything to insert
-            # Pre-validate records before insertion
-            invalid_records = []
-            valid_records = []
-
-            for record in filtered_data_dict:
-                # Allow indices ("I") even if symbol is missing
-                if record.get("instrumenttype") == "I":
-                    valid_records.append(record)
-                else:
-                    # Check if symbol exists and is not empty/null
-                    symbol = record.get("symbol")
-                    if not symbol or pd.isna(symbol) or str(symbol).strip() == "":
-                        invalid_records.append(record)
-                        logger.error(f"Schema validation failed for record: {record}")
-                        logger.info("Symbol is missing, empty, or null")
-                    else:
-                        valid_records.append(record)
-
-            if valid_records:
-                db_session.bulk_insert_mappings(SymToken, valid_records)
-                db_session.commit()
-                logger.info(
-                    f"Bulk insert completed successfully with {len(valid_records)} new records."
-                )
-
-            if invalid_records:
-                logger.error(
-                    f"Warning: {len(invalid_records)} records failed schema validation and were skipped."
-                )
-        else:
-            logger.info("No new records to insert.")
-    except Exception as e:
-        logger.error(f"Error during bulk insert: {e}")
-        if hasattr(e, "__cause__"):
-            logger.info(f"Caused by: {e.__cause__}")
-        db_session.rollback()
-
 
 def download_groww_instrument_data(output_path):
     """
@@ -453,9 +401,25 @@ def download_groww_instrument_data(output_path):
     file_path = os.path.join(output_path, "master.csv")
     csv_url = "https://growwapi-assets.groww.in/instruments/instrument.csv"
 
-    # Expected headers - Updated to match actual CSV structure
-    headers_csv = "exchange,exchange_token,trading_symbol,groww_symbol,name,instrument_type,segment,series,isin,underlying_symbol,underlying_exchange_token,expiry_date,strike_price,lot_size,tick_size,freeze_quantity,is_reserved,buy_allowed,sell_allowed,internal_trading_symbol,is_intraday"
-    expected_headers = headers_csv.split(",")
+    # Columns that process_groww_data() reads BY NAME. We validate these are
+    # present rather than relabelling the file by position — Groww's CSV already
+    # ships a correct header, so keeping it makes us resilient to Groww adding or
+    # reordering columns (the old code hard-required an exact 21-column count and
+    # overwrote the header, which would silently mislabel or fail on any change).
+    required_columns = {
+        "exchange",
+        "exchange_token",
+        "trading_symbol",
+        "groww_symbol",
+        "name",
+        "instrument_type",
+        "segment",
+        "underlying_symbol",
+        "expiry_date",
+        "strike_price",
+        "lot_size",
+        "tick_size",
+    }
 
     try:
         # Get the shared httpx client with connection pooling
@@ -466,22 +430,24 @@ def download_groww_instrument_data(output_path):
         response.raise_for_status()
 
         content = response.text
-        if "," in content and len(content.splitlines()) > 1:
-            # Read CSV using pandas
-            df = pd.read_csv(StringIO(content))
-
-            # Replace headers if column count matches
-            if len(df.columns) == len(expected_headers):
-                df.columns = expected_headers
-            else:
-                raise ValueError("Downloaded CSV column count does not match expected headers.")
-
-            # Save with new headers
-            df.to_csv(file_path, index=False)
-            logger.info(f"Successfully saved instruments CSV to: {file_path}")
-            return [file_path]
-        else:
+        lines = content.split("\n", 1)
+        if len(lines) < 2 or "," not in content:
             raise ValueError("Downloaded content does not appear to be a valid CSV.")
+
+        # Validate the documented columns are present (by name), then keep
+        # Groww's own header as-is.
+        original_headers = [h.strip() for h in lines[0].strip().split(",")]
+        missing = required_columns - set(original_headers)
+        if missing:
+            raise ValueError(
+                f"Groww instrument CSV is missing expected columns: {sorted(missing)}"
+            )
+
+        # Write directly to file, preserving Groww's header
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        logger.info(f"Successfully saved instruments CSV to: {file_path}")
+        return [file_path]
     except Exception as e:
         logger.error(f"Failed to download or process Groww instrument data: {e}")
         raise
@@ -511,9 +477,10 @@ def reformat_symbol(row):
     elif instrument_type in ["CE", "PE"]:
         import re
 
-        # Match format like: NSE-AARTIIND-26Jun25-435-CE
+        # Match format like: NSE-AARTIIND-26Jun25-435-CE (strike may be decimal e.g. 287.5)
         match = re.match(
-            r"NSE-([A-Z0-9]+)-(\d{2})([A-Za-z]{3})(\d{2})-(\d+)-([CP]E)", row["groww_symbol"]
+            r"NSE-([A-Z0-9]+)-(\d{2})([A-Za-z]{3})(\d{2})-(\d+(?:\.\d+)?)-([CP]E)",
+            row["groww_symbol"],
         )
         if match:
             symbol, day, month, year, strike_price, opt_type = match.groups()
@@ -594,7 +561,7 @@ def process_groww_data(path):
             "exchange_token": "token",  # Token ID
             "trading_symbol": "brsymbol",  # Broker-specific symbol
             "groww_symbol": "groww_symbol",  # Groww-specific symbol (keep for reference)
-            "name": "groww_symbol",  # Instrument name
+            "name": "name",  # Instrument name (company / index name for CASH rows)
             "instrument_type": "instrument_type",  # Instrument type from Groww
             "segment": "segment",  # Segment (CASH, FNO)
             "series": "series",  # Series (EQ, etc.)
@@ -660,23 +627,18 @@ def process_groww_data(path):
         df_mapped.drop("temp_strike", axis=1, inplace=True)
         df_mapped["tick_size"] = pd.to_numeric(df_mapped["tick_size"], errors="coerce").fillna(0.05)
 
-        # Convert expiry from yyyy-mm-dd to DD-MMM-YY format (to match Zerodha/other brokers)
-        def convert_expiry_format(expiry_val):
-            if pd.isna(expiry_val) or expiry_val == "":
-                return ""
-            try:
-                expiry_date = pd.to_datetime(expiry_val)
-                return expiry_date.strftime("%d-%b-%y").upper()
-            except Exception:
-                return expiry_val
-
-        df_mapped["expiry"] = df_mapped["expiry"].apply(convert_expiry_format)
+        # Convert expiry from yyyy-mm-dd to DD-MMM-YY format (vectorized)
+        expiry_parsed = pd.to_datetime(df_mapped["expiry"], errors="coerce")
+        valid_expiry = expiry_parsed.notna()
+        if valid_expiry.any():
+            df_mapped.loc[valid_expiry, "expiry"] = expiry_parsed[valid_expiry].dt.strftime("%d-%b-%y").str.upper()
+        df_mapped["expiry"] = df_mapped["expiry"].fillna("")
 
         # Map instrument types directly from Groww's data
         # We want CE, PE, FUT values to be preserved as is
         instrument_type_map = {
             "EQ": "EQ",  # Equity
-            "IDX": "INDEX",  # Index
+            "IDX": "EQ",  # Index (identified by the *_INDEX exchange, not the type)
             "FUT": "FUT",  # Futures
             "CE": "CE",  # Call Options (keep original value)
             "PE": "PE",  # Put Options (keep original value)
@@ -737,63 +699,105 @@ def process_groww_data(path):
         df_mapped.loc[idx_bse_mask, "exchange"] = "BSE_INDEX"
 
         # Special handling for indices
-        # Make sure indices have instrumenttype=INDEX
+        # OpenAlgo has no INDEX instrumenttype: an index is an EQ row on
+        # NSE_INDEX/BSE_INDEX (same as Zerodha). The streaming code already
+        # detects indices from the exchange.
         index_mask = (df["instrument_type"] == "IDX") | (df["segment"] == "IDX")
-        df_mapped.loc[index_mask, "instrumenttype"] = "INDEX"
+        df_mapped.loc[index_mask, "instrumenttype"] = "EQ"
 
-        # Format the symbol for F&O (NFO) instruments to match OpenAlgo format
-        def format_fo_symbol(row):
-            # Skip non-FNO instruments or those with missing expiry
-            if row["brexchange"] != "NSE" or pd.isna(row["expiry"]) or row["expiry"] == "":
-                return row["symbol"]
+        # Format F&O symbols using vectorized operations (much faster than apply)
+        # Identify FNO rows with valid expiry
+        # Groww's trading_symbol is not OpenAlgo format on BSE F&O
+        # (SENSEX26O2274900CE, SENSEX26OCTFUT) or NSE commodities (GOLD26NOVFUT),
+        # so those are rebuilt here too. MCX trading symbols already carry the
+        # full DDMMMYY expiry and are left as shipped.
+        fno_data_mask = (
+            (
+                ((df_mapped["brexchange"] == "NSE") & (df["segment"] == "FNO"))
+                | ((df_mapped["brexchange"] == "BSE") & (df["segment"] == "FNO"))
+                | ((df_mapped["brexchange"] == "NSE") & (df["segment"] == "COMMODITY"))
+            )
+            & df_mapped["expiry"].notna()
+            & (df_mapped["expiry"] != "")
+        )
 
-            # For segment='FNO', format according to OpenAlgo standard
-            if "segment" in df.columns and df.loc[row.name, "segment"] == "FNO":
-                try:
-                    # Format expiry date (assuming yyyy-mm-dd format in input)
-                    expiry_date = pd.to_datetime(row["expiry"])
-                    expiry_str = expiry_date.strftime("%d%b%y").upper()
+        if fno_data_mask.any():
+            # Parse expiry dates for FNO rows and format as DDMMMYY
+            fno_expiry = pd.to_datetime(df_mapped.loc[fno_data_mask, "expiry"], format="%d-%b-%y", errors="coerce")
+            expiry_str = fno_expiry.dt.strftime("%d%b%y").str.upper()
 
-                    # Get underlying symbol
-                    symbol = (
-                        row["underlying"]
-                        if "underlying" in row and not pd.isna(row["underlying"])
-                        else row["symbol"].split("-")[0]
-                        if "-" in row["symbol"]
-                        else row["symbol"]
-                    )
+            # Use underlying symbol where available, else trading_symbol
+            underlying = df_mapped.loc[fno_data_mask, "underlying"]
+            base_symbol = underlying.where(underlying.notna() & (underlying != ""), df_mapped.loc[fno_data_mask, "symbol"])
 
-                    # For futures
-                    if row["instrumenttype"] == "FUT":
-                        return f"{symbol}{expiry_str}FUT"
+            # Strike as string: preserve decimals (e.g. 287.5 for 2.5-rupee
+            # interval stocks like BANKBARODA, ADANIPOWER); collapse only
+            # whole numbers to int form (190.0 -> "190", not "190.0").
+            def _format_strike(v):
+                f = float(v)
+                return str(int(f)) if f == int(f) else str(f)
+            strike_str = df_mapped.loc[fno_data_mask, "strike"].fillna(0).apply(_format_strike)
 
-                    # For options
-                    elif row["instrumenttype"] == "PE" or "CE":
-                        # Determine strike price
-                        strike = str(int(row["strike"])) if not pd.isna(row["strike"]) else "0"
+            # Get instrument type from original df
+            orig_inst_type = df.loc[fno_data_mask.values, "instrument_type"]
 
-                        # Determine option type (CE/PE)
-                        option_type = ""
-                        if "instrument_type" in df.columns:
-                            instrument_type = df.loc[row.name, "instrument_type"]
-                            option_type = (
-                                "CE"
-                                if instrument_type == "CE"
-                                else "PE"
-                                if instrument_type == "PE"
-                                else ""
-                            )
+            # Build symbols for futures
+            fut_mask = fno_data_mask & (df_mapped["instrumenttype"] == "FUT")
+            if fut_mask.any():
+                df_mapped.loc[fut_mask, "symbol"] = (
+                    base_symbol[fut_mask] + expiry_str[fut_mask] + "FUT"
+                )
 
-                        if option_type:
-                            return f"{symbol}{expiry_str}{strike}{option_type}"
-                except Exception as e:
-                    logger.error(f"Error formatting F&O symbol: {e}")
+            # Build symbols for CE options
+            ce_mask = fno_data_mask & (orig_inst_type.reindex(df_mapped.index, fill_value="") == "CE")
+            if ce_mask.any():
+                df_mapped.loc[ce_mask, "symbol"] = (
+                    base_symbol[ce_mask] + expiry_str[ce_mask] + strike_str[ce_mask] + "CE"
+                )
 
-            # Return original symbol if formatting fails
-            return row["symbol"]
+            # Build symbols for PE options
+            pe_mask = fno_data_mask & (orig_inst_type.reindex(df_mapped.index, fill_value="") == "PE")
+            if pe_mask.any():
+                df_mapped.loc[pe_mask, "symbol"] = (
+                    base_symbol[pe_mask] + expiry_str[pe_mask] + strike_str[pe_mask] + "PE"
+                )
 
-        # Apply F&O symbol formatting
-        df_mapped["symbol"] = df_mapped.apply(format_fo_symbol, axis=1)
+        # Derivatives carry their underlying in `name`. The shared post-download
+        # pass derives it from the symbol, but only on F&O exchanges, so the NSE
+        # commodity rows (which stay on NSE) would otherwise be left blank.
+        deriv_mask = (
+            df_mapped["instrumenttype"].isin(["FUT", "CE", "PE"])
+            & df_mapped["underlying"].notna()
+            & (df_mapped["underlying"] != "")
+        )
+        df_mapped.loc[deriv_mask, "name"] = df_mapped.loc[deriv_mask, "underlying"]
+
+        # Disambiguate CASH rows that share a trading_symbol on the same exchange.
+        # Groww drops the series from trading_symbol, so NSE bonds listed under one
+        # symbol with several series (e.g. IMC1 N1/N2/N3) collapse into duplicate
+        # (symbol, exchange) pairs and lookups pick one arbitrarily. Give only those
+        # rows the SYMBOL-SERIES form (Groww's internal_trading_symbol, e.g. IMC1-N2).
+        cash_rows = df["segment"] == "CASH"
+        dup_mask = cash_rows & df_mapped[cash_rows].duplicated(
+            subset=["symbol", "exchange"], keep=False
+        ).reindex(df_mapped.index, fill_value=False)
+        if dup_mask.any():
+            # SYMBOL-SERIES only where Groww gave a series; without one the
+            # symbol stays as it is rather than becoming "SYMBOL-"
+            series = df["series"].fillna("").astype(str).str.strip()
+            series_symbol = df_mapped["symbol"].where(
+                series == "", df_mapped["symbol"] + "-" + series
+            )
+            if "internal_trading_symbol" in df.columns:
+                series_symbol = df["internal_trading_symbol"].where(
+                    df["internal_trading_symbol"].notna() & (df["internal_trading_symbol"] != ""),
+                    series_symbol,
+                )
+            df_mapped.loc[dup_mask, "symbol"] = series_symbol[dup_mask]
+            logger.info(
+                f"Disambiguated {int(dup_mask.sum())} CASH rows sharing a trading_symbol: "
+                f"{sorted(df_mapped.loc[dup_mask, 'symbol'].tolist())}"
+            )
 
         logger.info(f"Processed {len(df_mapped)} instruments")
         return df_mapped
@@ -801,115 +805,6 @@ def process_groww_data(path):
     except Exception as e:
         logger.error(f"Error processing Groww instrument data: {e}")
         return pd.DataFrame()
-
-    # Map instrument types to OpenAlgo standard types
-    instrument_type_map = {
-        "EQUITY": "EQ",
-        "INDEX": "INDEX",
-        "FUTURE": "FUT",
-        "CALL": "OPT",
-        "PUT": "OPT",
-        "ETF": "EQ",
-        "CURRENCY": "CUR",
-        "COMMODITY": "COM",
-    }
-
-    # Apply instrument type mapping
-    all_instruments["instrumenttype"] = (
-        all_instruments["instrument_type"].map(instrument_type_map).fillna("EQ")
-    )
-
-    # Map exchanges to OpenAlgo standard exchanges
-    exchange_map = {"NSE": "NSE", "BSE": "BSE", "NFO": "NFO", "MCX": "MCX", "CDS": "CDS"}
-
-    # Apply exchange mapping
-    all_instruments["exchange"] = (
-        all_instruments["brexchange"].map(exchange_map).fillna(all_instruments["brexchange"])
-    )
-
-    # Special handling for indices
-    # Mark indices based on name patterns or specific flags in the data
-    index_patterns = ["NIFTY", "SENSEX", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
-
-    for pattern in index_patterns:
-        index_mask = all_instruments["symbol"].str.contains(pattern, case=False, na=False)
-        all_instruments.loc[index_mask, "instrumenttype"] = "INDEX"
-        all_instruments.loc[index_mask, "exchange"] = "NSE_INDEX"
-
-    # Format specific fields
-    all_instruments["expiry"] = all_instruments["expiry"].fillna("")
-    all_instruments["strike"] = pd.to_numeric(all_instruments["strike"].fillna(0), errors="coerce")
-    all_instruments["lotsize"] = pd.to_numeric(
-        all_instruments["lotsize"].fillna(1), errors="coerce"
-    ).astype(int)
-    all_instruments["tick_size"] = pd.to_numeric(
-        all_instruments["tick_size"].fillna(0.05), errors="coerce"
-    )
-
-    # Ensure brsymbol is not empty - use symbol if needed
-    all_instruments.loc[
-        all_instruments["brsymbol"].isna() | (all_instruments["brsymbol"] == ""), "brsymbol"
-    ] = all_instruments.loc[
-        all_instruments["brsymbol"].isna() | (all_instruments["brsymbol"] == ""), "symbol"
-    ]
-
-    # For F&O instruments, format the symbol in OpenAlgo format
-    fo_mask = all_instruments["exchange"] == "NFO"
-    if fo_mask.any():
-        # Format F&O symbols according to OpenAlgo standard
-        def format_fo_symbol(row):
-            if pd.isna(row["expiry"]) or row["expiry"] == "":
-                return row["symbol"]
-
-            # Format expiry date to standard format (e.g., 25MAY23)
-            try:
-                from datetime import datetime
-
-                expiry_date = pd.to_datetime(row["expiry"])
-                expiry_str = expiry_date.strftime("%d%b%y").upper()
-            except:
-                expiry_str = row["expiry"]
-
-            # For futures
-            if row["instrumenttype"] == "FUT":
-                return f"{row['symbol']}{expiry_str}FUT"
-
-            # For options
-            elif row["instrumenttype"] == "OPT":
-                strike = str(int(row["strike"])) if not pd.isna(row["strike"]) else "0"
-                option_type = (
-                    "CE" if "option_type" in row and row["option_type"].upper() == "CE" else "PE"
-                )
-                return f"{row['symbol']}{expiry_str}{strike}{option_type}"
-
-            return row["symbol"]
-
-        all_instruments.loc[fo_mask, "symbol"] = all_instruments[fo_mask].apply(
-            format_fo_symbol, axis=1
-        )
-
-    # Create final DataFrame with required columns
-    token_df = pd.DataFrame(
-        {
-            "symbol": all_instruments["symbol"],
-            "brsymbol": all_instruments["brsymbol"],
-            "name": all_instruments["name"],
-            "exchange": all_instruments["exchange"],
-            "brexchange": all_instruments["brexchange"],
-            "token": all_instruments["token"],
-            "expiry": all_instruments["expiry"],
-            "strike": all_instruments["strike"],
-            "lotsize": all_instruments["lotsize"],
-            "instrumenttype": all_instruments["instrumenttype"],
-            "tick_size": all_instruments["tick_size"],
-        }
-    )
-
-    # Remove duplicates
-    token_df = token_df.drop_duplicates(subset=["symbol", "exchange"], keep="first")
-
-    logger.info(f"Processed {len(token_df)} Groww instruments")
-    return token_df
 
 
 def delete_groww_temp_data(output_path):
@@ -982,16 +877,35 @@ def master_contract_download():
         )
         token_df["tick_size"] = pd.to_numeric(token_df["tick_size"], errors="coerce").fillna(0.05)
 
-        # Step 5: Add OpenAlgo symbols where needed (converting Groww format to OpenAlgo format)
-        # Identify rows that need conversion (NFO options and futures)
-        nfo_options = token_df[
-            (token_df["exchange"] == "NFO") & (token_df["instrumenttype"].isin(["CE", "PE"]))
-        ]
+        # Step 5: Add OpenAlgo symbols where needed (vectorized - remove spaces from brsymbol)
+        # For NFO options with spaces in brsymbol, the OpenAlgo format is just the symbol without spaces
+        nfo_space_mask = (
+            (token_df["exchange"] == "NFO")
+            & (token_df["instrumenttype"].isin(["CE", "PE"]))
+            & (token_df["brsymbol"].str.contains(" ", na=False))
+        )
+        if nfo_space_mask.any():
+            token_df.loc[nfo_space_mask, "symbol"] = token_df.loc[nfo_space_mask, "brsymbol"].str.replace(" ", "", regex=False)
 
-        for idx, row in nfo_options.iterrows():
-            # Convert the broker symbol to OpenAlgo format if spaces are detected
-            if " " in row["brsymbol"]:
-                token_df.at[idx, "symbol"] = format_groww_to_openalgo_symbol(row["brsymbol"], "NFO")
+        # Step 5b: Enforce the NOT NULL symbol/brsymbol invariant before insert.
+        # Groww's CSV occasionally ships a row with a blank trading_symbol (e.g.
+        # a stray BSE index entry), which feeds both `symbol` and `brsymbol`.
+        # pandas leaves it as NaN and the bulk insert then fails with
+        # "NOT NULL constraint failed: symtoken.symbol", which rolls back the
+        # WHOLE download and leaves the master contract empty. Normalise NaN to
+        # "", fall back brsymbol -> symbol when only brsymbol is missing, and
+        # drop any row that still has no usable symbol.
+        before = len(token_df)
+        token_df["symbol"] = token_df["symbol"].fillna("").astype(str).str.strip()
+        token_df["brsymbol"] = token_df["brsymbol"].fillna("").astype(str).str.strip()
+        br_missing = (token_df["brsymbol"] == "") & (token_df["symbol"] != "")
+        token_df.loc[br_missing, "brsymbol"] = token_df.loc[br_missing, "symbol"]
+        token_df = token_df[token_df["symbol"] != ""].copy()
+        dropped = before - len(token_df)
+        if dropped:
+            logger.warning(
+                f"Dropped {dropped} Groww instrument row(s) with empty symbol before insert"
+            )
 
         # Step 6: Insert into database
         logger.info(f"Inserting {len(token_df)} records into database")
@@ -1013,10 +927,7 @@ def master_contract_download():
         )
 
     except Exception as e:
-        import traceback
-
-        logger.error(f"Error in master_contract_download: {e}")
-        logger.info(f"{traceback.format_exc()}")
+        logger.exception(f"Error in master_contract_download: {e}")
         return socketio.emit("master_contract_download", {"status": "error", "message": str(e)})
 
 

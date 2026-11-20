@@ -6,7 +6,6 @@ WebSocket proxy infrastructure to provide standardized market data streaming.
 """
 
 import json
-import logging
 import os
 import sys
 import threading
@@ -17,7 +16,8 @@ from typing import Any, Dict, List, Optional
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../"))
 
 from broker.motilal.api.motilal_websocket import MotilalWebSocket
-from database.auth_db import get_auth_token
+from database.auth_db import get_auth_token, get_user_id
+from utils.logging import get_logger
 from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
 from websocket_proxy.mapping import SymbolMapper
 
@@ -29,7 +29,7 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def __init__(self):
         super().__init__()
-        self.logger = logging.getLogger("motilal_websocket")
+        self.logger = get_logger("motilal_websocket")
         self.ws_client = None
         self.user_id = None
         self.broker_name = "motilal"
@@ -41,6 +41,9 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.lock = threading.Lock()
         self._data_poll_thread = None
         self._stop_poll = threading.Event()
+        # Adapter-level connect-with-retry thread; tracked so disconnect() can
+        # join it instead of leaving an orphan in-flight retry loop.
+        self._connect_thread = None
 
     def initialize(
         self, broker_name: str, user_id: str, auth_data: dict[str, str] | None = None
@@ -62,17 +65,18 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Get tokens from database if not provided
         if not auth_data:
             # Fetch authentication tokens from database
-            auth_token = get_auth_token(user_id)
-            # Get API key from environment variable (BROKER_API_SECRET)
-            api_key = os.getenv("BROKER_API_SECRET")
+            auth_token = get_auth_token(user_id, bypass_cache=True)
+            # App API key from the environment (BROKER_API_KEY), matching the
+            # standard OpenAlgo naming used by every other broker.
+            api_key = os.getenv("BROKER_API_KEY")
 
             if not auth_token:
                 self.logger.error(f"No authentication token found for user {user_id}")
                 raise ValueError(f"No authentication token found for user {user_id}")
 
             if not api_key:
-                self.logger.error("BROKER_API_SECRET environment variable not set")
-                raise ValueError("BROKER_API_SECRET environment variable not set")
+                self.logger.error("BROKER_API_KEY environment variable not set")
+                raise ValueError("BROKER_API_KEY environment variable not set")
         else:
             # Use provided tokens
             auth_token = auth_data.get("auth_token")
@@ -82,16 +86,49 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.logger.error("Missing required authentication data")
                 raise ValueError("Missing required authentication data")
 
-        # Create MotilalWebSocket instance
+        # Create MotilalWebSocket instance. Pass a token_provider so the client
+        # re-reads a fresh auth token from the database before each reconnect
+        # attempt; Indian broker tokens roll over daily (~3 AM IST) and the
+        # construction-time token is dead after rollover.
+        # The feed authenticates with the Motilal client code, not the OpenAlgo
+        # username. brlogin persists it as the auth record's user_id at login.
+        client_code = get_user_id(user_id) or user_id
+        if client_code != user_id:
+            self.logger.debug(f"Using Motilal client code {client_code} for the feed")
+        else:
+            self.logger.warning(
+                "No stored Motilal client code for %s; falling back to the OpenAlgo "
+                "username for the feed handshake. Re-login to store it.",
+                user_id,
+            )
+
         self.ws_client = MotilalWebSocket(
-            client_id=user_id,
+            client_id=client_code,
             auth_token=auth_token,
             api_key=api_key,
             use_uat=False,  # Use production environment
+            token_provider=self._get_fresh_auth_token,
         )
 
         self.running = True
         self.logger.debug(f"Motilal WebSocket adapter initialized for user {user_id}")
+
+    def _get_fresh_auth_token(self) -> str | None:
+        """
+        Re-read a fresh auth token from the database for the current user.
+
+        Used as the token_provider for MotilalWebSocket so reconnects after the
+        daily token rollover (~3 AM IST) pick up a live token instead of the dead
+        construction-time one. Returns None on failure so the client keeps its
+        existing token.
+        """
+        if not self.user_id:
+            return None
+        try:
+            return get_auth_token(self.user_id, bypass_cache=True)
+        except Exception as e:
+            self.logger.warning(f"Failed to re-read fresh Motilal auth token: {e}")
+            return None
 
     def connect(self) -> None:
         """Establish connection to Motilal WebSocket"""
@@ -99,7 +136,15 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.logger.error("WebSocket client not initialized. Call initialize() first.")
             return
 
-        threading.Thread(target=self._connect_with_retry, daemon=True).start()
+        if self._connect_thread and self._connect_thread.is_alive():
+            self.logger.debug("Motilal adapter connect thread already running")
+            return
+
+        # Clear _stop_poll so a fresh connect after a previous disconnect()
+        # doesn't short-circuit immediately on its first wait().
+        self._stop_poll.clear()
+        self._connect_thread = threading.Thread(target=self._connect_with_retry, daemon=True)
+        self._connect_thread.start()
 
     def _connect_with_retry(self) -> None:
         """Connect to Motilal WebSocket with retry logic"""
@@ -110,8 +155,10 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 )
                 self.ws_client.connect()
 
-                # Wait a bit for connection to establish
-                time.sleep(2)
+                # Wait a bit for connection to establish, but bail out
+                # immediately if disconnect() fires _stop_poll.
+                if self._stop_poll.wait(timeout=2):
+                    return
 
                 if self.ws_client.is_websocket_connected():
                     self.connected = True
@@ -133,7 +180,9 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self.reconnect_delay * (2**self.reconnect_attempts), self.max_reconnect_delay
                 )
                 self.logger.error(f"Connection failed: {e}. Retrying in {delay} seconds...")
-                time.sleep(delay)
+                # Backoff sleep that exits early on shutdown.
+                if self._stop_poll.wait(timeout=delay):
+                    return
 
         if self.reconnect_attempts >= self.max_reconnect_attempts:
             self.logger.error("Max reconnection attempts reached. Giving up.")
@@ -146,6 +195,22 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Stop data polling thread
         if self._data_poll_thread and self._data_poll_thread.is_alive():
             self._data_poll_thread.join(timeout=2)
+        self._data_poll_thread = None
+
+        # Join the adapter-level connect-with-retry thread. _stop_poll is set
+        # above, so any in-flight backoff exits immediately. Skip if we are
+        # being called from within that thread to avoid a self-join deadlock.
+        if (
+            self._connect_thread
+            and self._connect_thread.is_alive()
+            and self._connect_thread is not threading.current_thread()
+        ):
+            self._connect_thread.join(timeout=5)
+            if self._connect_thread.is_alive():
+                self.logger.warning(
+                    "Motilal adapter connect thread did not exit within 5s"
+                )
+        self._connect_thread = None
 
         if hasattr(self, "ws_client") and self.ws_client:
             self.ws_client.disconnect()
@@ -355,7 +420,21 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.logger.error(f"Error resubscribing to {sub['symbol']}.{sub['exchange']}: {e}")
 
     def _start_data_polling(self) -> None:
-        """Start thread to poll market data from Motilal WebSocket client"""
+        """Start the market-data polling thread. At most one per adapter.
+
+        connect() is called on a LIVE adapter by several proxy recovery paths
+        (websocket_proxy/connection_manager.py:495,550 and server.py:982,1031).
+        Its guard only covers the connect thread, which has normally already
+        exited by then - it breaks out of the retry loop on success - so each of
+        those calls used to reach here and start ANOTHER poller. The old one
+        never stopped: it loops on _stop_poll/running, which a reconnect does
+        not touch. Three connects meant three threads republishing every
+        subscription to ZMQ every 500ms.
+        """
+        if self._data_poll_thread and self._data_poll_thread.is_alive():
+            self.logger.debug("Market data polling thread already running")
+            return
+
         self._stop_poll.clear()
         self._data_poll_thread = threading.Thread(target=self._poll_market_data, daemon=True)
         self._data_poll_thread.start()
@@ -367,6 +446,13 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         Since Motilal stores data in internal dictionaries (last_quotes, last_depth, last_oi),
         we need to periodically poll and publish this data.
+
+        KNOWN DESIGN GAP (deliberately not changed here): this is a 500ms poll,
+        so every subscription is republished each cycle whether or not the tick
+        changed, and a tick can sit up to 500ms before it is published. Angel's
+        adapter instead publishes per tick straight from its data callback.
+        Converting Motilal to that push model means threading a callback through
+        MotilalWebSocket's binary parsers and is too invasive for this pass.
         """
         self.logger.debug("Market data polling started")
 
@@ -402,8 +488,17 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
                             depth = self.ws_client.get_market_depth(motilal_exchange, token)
                             oi = self.ws_client.get_open_interest(motilal_exchange, token)
 
-                            if quote:
+                            # Require an actual book before publishing. Gating on
+                            # `quote` alone published a five-level all-zero book
+                            # every 500ms from the moment an LTP tick arrived
+                            # until the first depth packet did, which downstream
+                            # cannot tell apart from a real empty book.
+                            if quote and depth and (depth.get("bids") or depth.get("asks")):
                                 market_data = self._normalize_depth_data(quote, depth, oi)
+                            else:
+                                self.logger.debug(
+                                    f"No depth data yet for {symbol}.{exchange}; not publishing"
+                                )
 
                         # Publish data if available
                         if market_data:
@@ -429,12 +524,16 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     except Exception as e:
                         self.logger.error(f"Error polling data for {correlation_id}: {e}")
 
-                # Sleep between polls (adjust based on performance needs)
-                time.sleep(0.5)  # Poll every 500ms
+                # Sleep between polls. Use _stop_poll.wait() so disconnect()
+                # interrupts the sleep immediately instead of dragging out the
+                # join by up to 500ms (or 1s in the error path).
+                if self._stop_poll.wait(timeout=0.5):
+                    break
 
             except Exception as e:
                 self.logger.error(f"Error in polling loop: {e}", exc_info=True)
-                time.sleep(1)
+                if self._stop_poll.wait(timeout=1):
+                    break
 
         self.logger.debug("Market data polling stopped")
 
@@ -459,15 +558,23 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         Returns:
             Dict: Normalized Quote data
+
+        Note on "average_price": every other broker adapter in this repo emits
+        that key (55 occurrences vs 3 for "avg_price"), so consumers read
+        "average_price"; emitting "avg_price" meant Motilal's average price was
+        invisible downstream. The value comes from LTP_AvgTradePrice, which
+        _parse_ltp_packet now actually parses -- previously "avg_trade_price"
+        was only ever written by a dead JSON code path, so it was always 0.
         """
         return {
             "ltp": quote.get("ltp", 0),
+            "ltq": quote.get("ltq", 0),
             "volume": quote.get("volume", 0),
             "open": quote.get("open", 0),
             "high": quote.get("high", 0),
             "low": quote.get("low", 0),
             "close": quote.get("prev_close", 0),
-            "avg_price": quote.get("avg_trade_price", 0),
+            "average_price": quote.get("avg_trade_price", 0),
         }
 
     def _normalize_depth_data(
@@ -476,12 +583,23 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
         """
         Normalize Depth data from Motilal format to common format
 
-        Note: Motilal only provides depth level 1 (best bid/ask).
-        Levels 2-5 are padded with zeros to maintain standard 5-level depth format.
+        Note on depth levels: Motilal's broadcast feed sends one packet per
+        level -- msgtypes 'B'..'F' map to levels 1..5 -- and
+        MotilalWebSocket._parse_depth_level_packet stores all five. So this is a
+        genuine 5-level book, not a level-1 book padded out. (The previous
+        docstring here claimed level 1 only, contradicting the parser it
+        consumes.) doc 33-websocket-broadcast.md shows a 'Level' field in the
+        MarketDepth structure but never states the maximum, so how many levels
+        actually arrive is per-scrip and per-exchange: any level that has not
+        arrived yet is padded with zeros to keep the standard 5-level shape.
+
+        Callers must not invoke this before any depth packet has arrived --
+        _poll_market_data() gates on depth being non-None precisely so that a
+        wholly zero-filled book is never published.
 
         Args:
             quote: Quote data from Motilal WebSocket
-            depth: Market depth data (can be None)
+            depth: Market depth data (levels that have arrived so far)
             oi: Open interest data (can be None)
 
         Returns:
@@ -509,7 +627,8 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
         sell_depth = []
 
         if depth:
-            # Get existing bids and asks (Motilal typically provides only level 1)
+            # Levels that have arrived so far (get_market_depth() already drops
+            # the levels the feed has not sent yet).
             bids = depth.get("bids", [])
             asks = depth.get("asks", [])
 
@@ -524,7 +643,7 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
                         }
                     )
                 else:
-                    # Pad with zeros for levels 2-5
+                    # Pad any level the feed has not sent yet
                     buy_depth.append({"price": 0, "quantity": 0, "orders": 0})
 
             # Ensure exactly 5 levels for sell depth
@@ -538,11 +657,12 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
                         }
                     )
                 else:
-                    # Pad with zeros for levels 2-5
+                    # Pad any level the feed has not sent yet
                     sell_depth.append({"price": 0, "quantity": 0, "orders": 0})
         else:
-            # No depth data available - return 5 levels of zeros
-            for i in range(5):
+            # Defensive only: _poll_market_data() does not call this with
+            # depth=None, so an all-zero book is never published.
+            for _ in range(5):
                 buy_depth.append({"price": 0, "quantity": 0, "orders": 0})
                 sell_depth.append({"price": 0, "quantity": 0, "orders": 0})
 

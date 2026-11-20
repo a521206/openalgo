@@ -8,13 +8,13 @@ from flask import Blueprint, Response, jsonify, redirect, render_template, reque
 from database.auth_db import get_api_key_for_tradingview, get_auth_token
 from database.settings_db import get_analyze_mode
 from limiter import limiter
-from services.close_position_service import close_position
 from services.holdings_service import get_holdings
 from services.orderbook_service import get_orderbook
 from services.place_smart_order_service import place_smart_order
 from services.positionbook_service import get_positionbook
-from services.telegram_alert_service import telegram_alert_service
 from services.tradebook_service import get_tradebook
+from utils import runtime
+from utils.latency_monitor import track_latency
 from utils.logging import get_logger
 from utils.session import check_session_validity
 
@@ -504,6 +504,7 @@ def export_positions():
 @orders_bp.route("/close_position", methods=["POST"])
 @check_session_validity
 @limiter.limit(API_RATE_LIMIT)
+@track_latency("CLOSE")
 def close_position():
     """Close a specific position - uses broker API in live mode, placesmartorder service in analyze mode"""
     try:
@@ -605,18 +606,27 @@ def close_position():
             }
             status_code = 200
 
-            # Send Telegram alert for individual position close
+            # Publish event for logging, socketio, and telegram (fixes missing API log)
             api_key = get_api_key_for_tradingview(login_username)
             if api_key:
-                from extensions import socketio
+                from events import PositionClosedEvent
+                from utils.event_bus import bus
 
-                socketio.start_background_task(
-                    telegram_alert_service.send_order_alert,
-                    "closeposition",
-                    order_data,
-                    response_data,
-                    api_key,
-                )
+                log_request = order_data.copy()
+                log_request["api_type"] = "closeposition"
+
+                bus.publish(PositionClosedEvent(
+                    mode="live",
+                    api_type="closeposition",
+                    symbol=symbol,
+                    exchange=exchange,
+                    product=product,
+                    orderid=str(orderid),
+                    message="Position close order placed successfully.",
+                    request_data=log_request,
+                    response_data=response_data,
+                    api_key=api_key,
+                ))
         else:
             # No orderid, definite error
             response_data = {
@@ -640,6 +650,7 @@ def close_position():
 @orders_bp.route("/close_all_positions", methods=["POST"])
 @check_session_validity
 @limiter.limit(API_RATE_LIMIT)
+@track_latency("CLOSE")
 def close_all_positions():
     """Close all open positions using the broker API"""
     try:
@@ -781,6 +792,101 @@ def cancel_order_ui():
         return jsonify({"status": "error", "message": f"An error occurred: {str(e)}"}), 500
 
 
+@orders_bp.route("/modify_gtt_order", methods=["POST"])
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def modify_gtt_order_ui():
+    """Modify an active GTT trigger from the UI (session-auth).
+
+    Accepts the flat replacement body — same shape as PlaceGTTOrder plus
+    ``trigger_id``. ``last_price`` is fetched server-side by the broker.
+    """
+    try:
+        login_username = session["user"]
+        auth_token = get_auth_token(login_username)
+        broker_name = session.get("broker")
+
+        if not auth_token or not broker_name:
+            return jsonify({"status": "error", "message": "Authentication error"}), 401
+
+        data = request.get_json() or {}
+        trigger_id = data.get("trigger_id")
+        if not trigger_id:
+            return jsonify({"status": "error", "message": "trigger_id is required"}), 400
+
+        from services.modify_gtt_order_service import modify_gtt_order
+
+        api_key = None
+        if get_analyze_mode():
+            api_key = get_api_key_for_tradingview(login_username)
+
+        order_data = {
+            "trigger_id": str(trigger_id),
+            "strategy": data.get("strategy", "GTT Modify"),
+            "symbol": data.get("symbol"),
+            "exchange": data.get("exchange"),
+            "trigger_type": data.get("trigger_type"),
+            "action": data.get("action"),
+            "product": data.get("product"),
+            "quantity": data.get("quantity"),
+            "pricetype": data.get("pricetype", "LIMIT"),
+            "price": data.get("price"),
+            "triggerprice_sl": data.get("triggerprice_sl"),
+            "triggerprice_tg": data.get("triggerprice_tg"),
+            "stoploss": data.get("stoploss"),
+            "target": data.get("target"),
+        }
+
+        success, response_data, status_code = modify_gtt_order(
+            order_data=order_data,
+            api_key=api_key,
+            auth_token=auth_token,
+            broker=broker_name,
+        )
+        return jsonify(response_data), status_code
+
+    except Exception as e:
+        logger.exception(f"Error in modify_gtt_order_ui endpoint: {str(e)}")
+        return jsonify({"status": "error", "message": f"An error occurred: {str(e)}"}), 500
+
+
+@orders_bp.route("/cancel_gtt_order", methods=["POST"])
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def cancel_gtt_order_ui():
+    """Cancel a GTT trigger using the broker API from UI (session-auth)."""
+    try:
+        login_username = session["user"]
+        auth_token = get_auth_token(login_username)
+        broker_name = session.get("broker")
+
+        if not auth_token or not broker_name:
+            return jsonify({"status": "error", "message": "Authentication error"}), 401
+
+        data = request.get_json() or {}
+        trigger_id = data.get("trigger_id")
+        if not trigger_id:
+            return jsonify({"status": "error", "message": "trigger_id is required"}), 400
+
+        from services.cancel_gtt_order_service import cancel_gtt_order
+
+        api_key = None
+        if get_analyze_mode():
+            api_key = get_api_key_for_tradingview(login_username)
+
+        success, response_data, status_code = cancel_gtt_order(
+            trigger_id=str(trigger_id),
+            api_key=api_key,
+            auth_token=auth_token,
+            broker=broker_name,
+        )
+        return jsonify(response_data), status_code
+
+    except Exception as e:
+        logger.exception(f"Error in cancel_gtt_order_ui endpoint: {str(e)}")
+        return jsonify({"status": "error", "message": f"An error occurred: {str(e)}"}), 500
+
+
 @orders_bp.route("/modify_order", methods=["POST"])
 @check_session_validity
 @limiter.limit(API_RATE_LIMIT)
@@ -886,6 +992,32 @@ def action_center():
     )
 
 
+#: What the operator reads when another screen approved or rejected the order
+#: first. Approval is compare-and-set, so the second request is refused. Under
+#: the gthread worker only: eventlet and the development server answer as they
+#: always have ("Failed to approve order", 400), because gthread is opt-in and an
+#: install that has not chosen it sees no change.
+ACTION_CENTER_ALREADY_HANDLED_MESSAGE = (
+    "This order was already approved or rejected. Check the Action Center."
+)
+
+
+def _pending_order_already_handled(order_id, login_username):
+    """True when the order exists for this user and is no longer pending.
+
+    Tells a lost approval (another request approved or rejected it first)
+    apart from a failure to approve, so the operator is told which happened.
+    """
+    from database.action_center_db import get_pending_order_by_id
+
+    try:
+        order = get_pending_order_by_id(order_id)
+    except Exception:
+        logger.exception(f"Could not re-read pending order {order_id}")
+        return False
+    return bool(order is not None and order.user_id == login_username and order.status != "pending")
+
+
 @orders_bp.route("/action-center/approve/<int:order_id>", methods=["POST"])
 @check_session_validity
 @limiter.limit(API_RATE_LIMIT)
@@ -895,14 +1027,45 @@ def approve_pending_order_route(order_id):
 
     from database.action_center_db import approve_pending_order
     from extensions import socketio
-    from services.pending_order_execution_service import execute_approved_order
+    from services.pending_order_execution_service import (
+        ALREADY_SUBMITTING_STATUS,
+        RETURNED_TO_PENDING,
+        execute_approved_order,
+    )
 
     # Approve the order
     success = approve_pending_order(order_id, login_username, login_username)
 
+    if (
+        not success
+        and runtime.gthread_active()
+        and _pending_order_already_handled(order_id, login_username)
+    ):
+        # Another request approved or rejected it first. Nothing was sent by
+        # this one, and nothing must be: the winner owns the order.
+        return jsonify({"status": "error", "message": ACTION_CENTER_ALREADY_HANDLED_MESSAGE}), 409
+
     if success:
         # Execute the order
         exec_success, response_data, status_code = execute_approved_order(order_id)
+
+        if not exec_success and status_code == ALREADY_SUBMITTING_STATUS:
+            # The order is already on its way to the broker from another
+            # request, which has announced it. Not an execution failure.
+            return jsonify(
+                {"status": "error", "message": response_data.get("message")}
+            ), ALREADY_SUBMITTING_STATUS
+
+        if not exec_success and response_data.get(RETURNED_TO_PENDING):
+            # Never sent, and back in the pending list to approve again. Not
+            # "approved but failed": the page refreshes and shows it pending.
+            socketio.emit(
+                "pending_order_updated",
+                {"action": "returned", "order_id": order_id, "user_id": login_username},
+            )
+            return jsonify(
+                {"status": "error", "message": response_data.get("message")}
+            ), status_code
 
         # Emit socket event to notify about order approval
         socketio.emit(
@@ -915,7 +1078,9 @@ def approve_pending_order_route(order_id):
                 {
                     "status": "success",
                     "message": "Order approved and executed successfully",
-                    "broker_order_id": response_data.get("orderid"),
+                    "broker_order_id": response_data.get("broker_order_id")
+                    or response_data.get("orderid")
+                    or response_data.get("trigger_id"),
                 }
             )
         else:
@@ -1002,7 +1167,14 @@ def approve_all_pending_orders():
 
     from database.action_center_db import approve_pending_order, get_pending_orders
     from extensions import socketio
-    from services.pending_order_execution_service import execute_approved_order
+    from services.pending_order_execution_service import (
+        ALREADY_SUBMITTING_STATUS,
+        execute_approved_order,
+    )
+
+    # The already-handled reporting below is gthread only. Eventlet and the
+    # development server answer exactly as they always have.
+    gthread = runtime.gthread_active()
 
     # Get all pending orders for this user
     pending_orders = get_pending_orders(login_username, status="pending")
@@ -1014,24 +1186,33 @@ def approve_all_pending_orders():
     approved_count = 0
     executed_count = 0
     failed_executions = []
+    # Orders another screen approved, rejected or sent first. Not failures:
+    # nothing was sent for them by this request, which is what must happen.
+    already_handled = []
 
     # Approve and execute each order
     for order in pending_orders:
         # Approve the order
         success = approve_pending_order(order.id, login_username, login_username)
 
-        if success:
-            approved_count += 1
+        if not success:
+            if gthread and _pending_order_already_handled(order.id, login_username):
+                already_handled.append(order.id)
+            continue
 
-            # Execute the order
-            exec_success, response_data, status_code = execute_approved_order(order.id)
+        approved_count += 1
 
-            if exec_success:
-                executed_count += 1
-            else:
-                failed_executions.append(
-                    {"order_id": order.id, "error": response_data.get("message", "Unknown error")}
-                )
+        # Execute the order
+        exec_success, response_data, status_code = execute_approved_order(order.id)
+
+        if exec_success:
+            executed_count += 1
+        elif gthread and status_code == ALREADY_SUBMITTING_STATUS:
+            already_handled.append(order.id)
+        else:
+            failed_executions.append(
+                {"order_id": order.id, "error": response_data.get("message", "Unknown error")}
+            )
 
     # Emit socket event to notify about batch approval
     socketio.emit(
@@ -1040,8 +1221,17 @@ def approve_all_pending_orders():
     )
 
     # Prepare response message
-    if approved_count == executed_count:
+    if gthread and approved_count == 0 and already_handled:
+        message = (
+            "These orders were already approved or rejected from another screen, so "
+            "none were sent again. Check the Action Center."
+        )
+        status = "warning"
+    elif approved_count == executed_count:
         message = f"Successfully approved and executed all {approved_count} orders"
+        status = "success"
+    elif gthread and not failed_executions:
+        message = f"Approved {approved_count} orders. {executed_count} executed successfully"
         status = "success"
     elif executed_count > 0:
         message = f"Approved {approved_count} orders. {executed_count} executed successfully, {len(failed_executions)} failed"
@@ -1050,15 +1240,23 @@ def approve_all_pending_orders():
         message = f"Approved {approved_count} orders but all executions failed"
         status = "error"
 
-    return jsonify(
-        {
-            "status": status,
-            "message": message,
-            "approved_count": approved_count,
-            "executed_count": executed_count,
-            "failed_executions": failed_executions,
-        }
-    ), 200
+    if gthread and already_handled and approved_count:
+        count = len(already_handled)
+        message += (
+            f". {count} {'order was' if count == 1 else 'orders were'} already handled "
+            "from another screen and not sent again"
+        )
+
+    result = {
+        "status": status,
+        "message": message,
+        "approved_count": approved_count,
+        "executed_count": executed_count,
+        "failed_executions": failed_executions,
+    }
+    if gthread:
+        result["already_handled"] = already_handled
+    return jsonify(result), 200
 
 
 @orders_bp.route("/action-center/api/data")

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { tradingApi, type QuotesData } from '@/api/trading'
+import { type QuotesData, tradingApi } from '@/api/trading'
 import { useMarketData } from '@/hooks/useMarketData'
 import { useMarketStatus } from '@/hooks/useMarketStatus'
 import { usePageVisibility } from '@/hooks/usePageVisibility'
@@ -16,8 +16,8 @@ export interface PriceableItem {
   pnlpercent?: number
   quantity?: number
   average_price?: number
-  today_realized_pnl?: number  // Sandbox: today's realized P&L from closed partial trades
-  lot_size?: number             // Contract multiplier (e.g. 0.01 for Delta Exchange ETHUSD.P)
+  today_realized_pnl?: number // Sandbox: today's realized P&L from closed partial trades
+  lot_size?: number // Contract multiplier (e.g. 0.01 for Delta Exchange ETHUSD.P)
 }
 
 /**
@@ -110,7 +110,12 @@ export function useLivePrice<T extends PriceableItem>(
   )
 
   // WebSocket market data - connect when enabled, with visibility awareness
-  const { data: marketData, isConnected: wsConnected, isPaused: wsPaused, isFallbackMode } = useMarketData({
+  const {
+    data: marketData,
+    isConnected: wsConnected,
+    isPaused: wsPaused,
+    isFallbackMode,
+  } = useMarketData({
     symbols,
     mode: 'LTP',
     enabled: enabled && items.length > 0,
@@ -167,7 +172,15 @@ export function useLivePrice<T extends PriceableItem>(
     }, multiQuotesRefreshInterval)
 
     return () => clearInterval(interval)
-  }, [enabled, items.length, useMultiQuotesFallback, fetchMultiQuotes, multiQuotesRefreshInterval, pauseWhenHidden, isVisible])
+  }, [
+    enabled,
+    items.length,
+    useMultiQuotesFallback,
+    fetchMultiQuotes,
+    multiQuotesRefreshInterval,
+    pauseWhenHidden,
+    isVisible,
+  ])
 
   // Refresh MultiQuotes immediately when tab becomes visible after being hidden
   useEffect(() => {
@@ -178,7 +191,15 @@ export function useLivePrice<T extends PriceableItem>(
       fetchMultiQuotes()
       lastFetchRef.current = Date.now()
     }
-  }, [wasHidden, isVisible, timeSinceHidden, multiQuotesRefreshInterval, useMultiQuotesFallback, enabled, fetchMultiQuotes])
+  }, [
+    wasHidden,
+    isVisible,
+    timeSinceHidden,
+    multiQuotesRefreshInterval,
+    useMultiQuotesFallback,
+    enabled,
+    fetchMultiQuotes,
+  ])
 
   /**
    * Enhance items with real-time LTP and recalculated P&L
@@ -226,7 +247,12 @@ export function useLivePrice<T extends PriceableItem>(
 
       // For closed positions (qty=0), preserve ALL REST API values including LTP
       // This ensures P&L% calculation remains stable (realized values don't change)
-      if (qty === 0) {
+      //
+      // Gated on the field being PRESENT, not just falsy. `quantity` is optional
+      // on PriceableItem, and an item that never carried one is not a position
+      // at all -- a watchlist row, say. Those must still take live prices, and
+      // `item.quantity || 0` reads the same 0 for both cases.
+      if (item.quantity !== undefined && qty === 0) {
         return {
           ...item,
           // Keep item.ltp from REST API - don't update with live data

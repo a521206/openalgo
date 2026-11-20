@@ -1,15 +1,18 @@
 import {
   Activity,
   ArrowRight,
+  Bot,
   Calendar,
   Clock,
+  Gauge,
+  Globe,
   Settings,
   Shield,
   Snowflake,
   Zap,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { adminApi } from '@/api/admin'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -24,7 +27,7 @@ export default function AdminIndex() {
       try {
         const data = await adminApi.getStats()
         setStats(data)
-      } catch (error) {
+      } catch (_error) {
       } finally {
         setIsLoading(false)
       }
@@ -93,6 +96,30 @@ export default function AdminIndex() {
       href: '/logs/latency',
       countLabel: 'monitoring',
       color: 'bg-orange-500',
+    },
+    {
+      title: 'Diagnostics',
+      description: 'System info, errors, latency probes, and downloadable report for support',
+      icon: Gauge,
+      href: '/admin/diagnostics',
+      countLabel: 'troubleshoot',
+      color: 'bg-indigo-500',
+    },
+    {
+      title: 'Agent Config',
+      description: 'LLM providers and models, API keys, trading switch, and web search',
+      icon: Bot,
+      href: '/agent/config',
+      countLabel: 'models and keys',
+      color: 'bg-violet-500',
+    },
+    {
+      title: 'Remote MCP',
+      description: 'Approve OAuth clients, browse tool-call audit log, kill switch',
+      icon: Globe,
+      href: '/admin/remote-mcp',
+      countLabel: 'AI clients',
+      color: 'bg-teal-500',
     },
   ]
 

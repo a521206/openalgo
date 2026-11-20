@@ -25,6 +25,23 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/placeorder
 }
 ```
 
+## Sample cURL Request
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/v1/placeorder \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "apikey": "<your_app_apikey>",
+  "strategy": "Python",
+  "symbol": "NHPC",
+  "action": "BUY",
+  "exchange": "NSE",
+  "pricetype": "MARKET",
+  "product": "MIS",
+  "quantity": "1"
+}'
+```
+
 ## Sample API Response
 
 ```json
@@ -84,12 +101,12 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/placeorder
 |-----------|-------------|-------------------|---------------|
 | apikey | Your OpenAlgo API key | Mandatory | - |
 | strategy | Strategy identifier for tracking | Mandatory | - |
-| symbol | Trading symbol (e.g., RELIANCE, NIFTY30JAN25FUT) | Mandatory | - |
+| symbol | Trading symbol (e.g., RELIANCE, NIFTY25AUG26FUT) | Mandatory | - |
 | action | Order action: BUY or SELL | Mandatory | - |
-| exchange | Exchange code: NSE, BSE, NFO, BFO, CDS, BCD, MCX | Mandatory | - |
-| pricetype | Price type: MARKET, LIMIT, SL, SL-M | Mandatory | - |
-| product | Product type: MIS, CNC, NRML | Mandatory | - |
-| quantity | Order quantity | Mandatory | - |
+| exchange | Exchange code accepted by the shared validation constants | Mandatory | - |
+| pricetype | Price type: MARKET, LIMIT, SL, SL-M | Optional | MARKET |
+| product | Product type: MIS, CNC, NRML | Optional | MIS |
+| quantity | Positive numeric order quantity | Mandatory | - |
 | price | Order price (required for LIMIT and SL orders) | Optional | 0 |
 | trigger_price | Trigger price (required for SL and SL-M orders) | Optional | 0 |
 | disclosed_quantity | Disclosed quantity for iceberg orders | Optional | 0 |
@@ -99,9 +116,16 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/placeorder
 | Field | Type | Description |
 |-------|------|-------------|
 | status | string | "success" or "error" |
-| orderid | string | Unique order ID from broker (on success) |
-| message | string | Error message (on error) |
-| mode | string | "live" or "analyze" (when analyzer mode is enabled) |
+| orderid | string | Broker/sandbox order ID on a direct successful placement; absent when queued |
+| pending_order_id | integer | Approval record ID when queued in Semi-Auto; not a broker order ID |
+| message | string | Queue acknowledgement or error explanation |
+| mode | string | `analyze` for sandbox or `semi_auto` for an approval queue; direct live responses may omit it |
+
+## Ambiguous outcomes
+
+A directly executed placement returns `orderid` on success; execution still needs order-status/trade-book confirmation. Semi-Auto also returns `200`, with `mode: "semi_auto"` and `pending_order_id` instead of a broker order ID: it acknowledges an approval record before any broker submission. If the shared transport detects that a write may have reached the broker but its reply was lost, this endpoint returns `502` with `status: "error"` and a message explaining that the order may have been placed. Check the broker order book before sending it again. The endpoint does not provide a universal idempotency key.
+
+A gthread broker-queue refusal returns `429` before sending. See [response and retry conventions](../README.md#order-outcomes-and-retries).
 
 ## Notes
 
@@ -111,9 +135,10 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/placeorder
 - For **SL-M** (Stop-Loss Market) orders, only trigger_price is required
 - The **symbol** must be in OpenAlgo standard format:
   - Equity: `RELIANCE`
-  - Futures: `NIFTY30JAN25FUT`
-  - Options: `NIFTY30JAN2525000CE`
+  - Futures: `NIFTY25AUG26FUT`
+  - Options: `NIFTY25AUG2625000CE`
 - Use **MIS** for intraday, **CNC** for equity delivery, **NRML** for F&O overnight positions
+- Fractional quantities are accepted only when `exchange` is `CRYPTO`. Other exchanges reject fractional values during schema validation.
 
 ---
 

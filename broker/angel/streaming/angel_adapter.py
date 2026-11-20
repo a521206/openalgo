@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from broker.angel.streaming.smartWebSocketV2 import SmartWebSocketV2
 from database.auth_db import get_auth_token, get_feed_token
 from database.token_db import get_token
+from utils.logging import get_logger
 
 # Add parent directory to path to allow imports
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../"))
@@ -32,7 +33,7 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def __init__(self):
         super().__init__()
-        self.logger = logging.getLogger("angel_websocket")
+        self.logger = get_logger("angel_websocket")
         self.ws_client = None
         self.user_id = None
         self.broker_name = "angel"
@@ -47,6 +48,23 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self._connect_thread = None
         self._reconnect_timer = None
         self._reconnecting = False
+
+        # Subscribe coalescing (issue #1352) — mirrors zerodha_adapter's
+        # subscription_queue + batch_timer pattern. Per-symbol subscribe()
+        # calls append to the queue and arm a 500ms timer; the timer drains
+        # the queue, groups by (mode, exchangeType), and emits one
+        # ws_client.subscribe() call per group. 1000 rapid subscribes
+        # collapse into a handful of broker-side messages.
+        self.subscription_queue: list[dict] = []
+        self.batch_timer: threading.Timer | None = None
+        self.batch_delay = 0.5  # seconds — matches zerodha/dhan/flattrade fleet pattern
+
+        # O(1) reverse index for the hot tick path: (token, exchange_type) -> sub.
+        # _on_data fires once per tick; without this it linear-scanned all
+        # subscriptions under the lock for every tick (O(N) per tick, painful
+        # once the /tools ladder streams 100+ symbols). Kept in lock-step with
+        # self.subscriptions wherever that dict is mutated.
+        self._token_index: dict[tuple, dict] = {}
 
     def initialize(
         self, broker_name: str, user_id: str, auth_data: dict[str, str] | None = None
@@ -68,7 +86,7 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Get tokens from database if not provided
         if not auth_data:
             # Fetch authentication tokens from database
-            auth_token = get_auth_token(user_id)
+            auth_token = get_auth_token(user_id, bypass_cache=True)
             feed_token = get_feed_token(user_id)
 
             if not auth_token or not feed_token:
@@ -140,7 +158,8 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 except Exception as e:
                     self.reconnect_attempts += 1
                     delay = min(
-                        self.reconnect_delay * (2**self.reconnect_attempts), self.max_reconnect_delay
+                        self.reconnect_delay * (2**self.reconnect_attempts),
+                        self.max_reconnect_delay,
                     )
                     self.logger.error(f"Connection failed: {e}. Retrying in {delay} seconds...")
                     time.sleep(delay)
@@ -227,7 +246,7 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
         """Recreate the WebSocket client with current credentials"""
         try:
             # Get tokens from database
-            auth_token = get_auth_token(self.user_id)
+            auth_token = get_auth_token(self.user_id, bypass_cache=True)
             feed_token = get_feed_token(self.user_id)
 
             if not auth_token or not feed_token:
@@ -236,7 +255,7 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 return
 
             # Get API key (should be stored from initialization)
-            api_key = getattr(self, '_api_key', 'api_key')
+            api_key = getattr(self, "_api_key", "api_key")
 
             # Create new SmartWebSocketV2 instance
             self.ws_client = SmartWebSocketV2(
@@ -275,6 +294,13 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self._reconnect_timer = None
                 self.logger.debug("Cancelled pending reconnection timer")
 
+            # Cancel any pending subscribe-batch flush so the timer thread
+            # cannot fire after the WebSocket has been closed.
+            if self.batch_timer:
+                self.batch_timer.cancel()
+                self.batch_timer = None
+            self.subscription_queue.clear()
+
         try:
             if hasattr(self, "ws_client") and self.ws_client:
                 try:
@@ -295,6 +321,7 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # Clear subscription tracking
             with self.lock:
                 self.subscriptions.clear()
+                self._token_index.clear()
                 self.connected = False
                 self.reconnect_attempts = 0
 
@@ -374,8 +401,9 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
             correlation_id = f"{correlation_id}_{depth_level}"
 
         # Store subscription for reconnection
+        exch_type = AngelExchangeMapper.get_exchange_type(brexchange)
         with self.lock:
-            self.subscriptions[correlation_id] = {
+            sub_entry = {
                 "symbol": symbol,
                 "exchange": exchange,
                 "brexchange": brexchange,
@@ -386,13 +414,33 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 "token_list": token_list,
                 "is_fallback": is_fallback,
             }
+            self.subscriptions[correlation_id] = sub_entry
+            # Maintain the O(1) tick-path index. (token, exch_type) uniquely
+            # identifies an instrument; symbol/exchange are identical across the
+            # modes of the same token, so one entry per key is sufficient for
+            # _on_data to resolve symbol/exchange.
+            self._token_index[(str(token), exch_type)] = sub_entry
 
-        # Subscribe if connected
+        # Queue for batched subscribe (issue #1352). The actual
+        # ws_client.subscribe() call is emitted by _process_batch_subscriptions
+        # after a brief coalescing window so bursty per-symbol startups
+        # collapse into one broker-side message per (mode, exchangeType).
         if self.connected and self.ws_client:
             try:
-                self.ws_client.subscribe(correlation_id, mode, token_list)
+                with self.lock:
+                    self.subscription_queue.append(
+                        {
+                            "token": token,
+                            "mode": mode,
+                            "exchange_type": AngelExchangeMapper.get_exchange_type(brexchange),
+                            "symbol": symbol,
+                            "exchange": exchange,
+                        }
+                    )
+                    if len(self.subscription_queue) == 1:
+                        self._start_batch_timer()
             except Exception as e:
-                self.logger.error(f"Error subscribing to {symbol}.{exchange}: {e}")
+                self.logger.error(f"Error queuing subscription for {symbol}.{exchange}: {e}")
                 return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
 
         # Return success with capability info
@@ -437,11 +485,29 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         # Generate correlation ID
         correlation_id = f"{symbol}_{exchange}_{mode}"
+        exch_type = AngelExchangeMapper.get_exchange_type(brexchange)
 
         # Remove from subscriptions
         with self.lock:
             if correlation_id in self.subscriptions:
                 del self.subscriptions[correlation_id]
+            # Keep the tick-path index consistent: only drop the (token,
+            # exch_type) entry once NO remaining subscription (any mode) holds
+            # it, otherwise repoint it at a surviving sub.
+            key = (str(token), exch_type)
+            remaining = next(
+                (
+                    s
+                    for s in self.subscriptions.values()
+                    if str(s.get("token")) == str(token)
+                    and AngelExchangeMapper.get_exchange_type(s.get("brexchange")) == exch_type
+                ),
+                None,
+            )
+            if remaining is not None:
+                self._token_index[key] = remaining
+            else:
+                self._token_index.pop(key, None)
 
         # Unsubscribe if connected
         if self.connected and self.ws_client:
@@ -455,21 +521,105 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
             f"Unsubscribed from {symbol}.{exchange}", symbol=symbol, exchange=exchange, mode=mode
         )
 
+    def _start_batch_timer(self) -> None:
+        """Arm the coalescing timer that drains subscription_queue.
+
+        Called from within the lock when a fresh subscription enters
+        an empty queue. Subsequent enqueues during the window join the
+        same flush.
+        """
+        if self.batch_timer:
+            self.batch_timer.cancel()
+        self.batch_timer = threading.Timer(self.batch_delay, self._process_batch_subscriptions)
+        self.batch_timer.daemon = True
+        self.batch_timer.start()
+
+    def _process_batch_subscriptions(self) -> None:
+        """Drain the queue and emit one ws_client.subscribe() per
+        (mode, exchangeType) group. Collapses N per-symbol subscribes
+        into ceil(modes × exchange_types) broker-side messages.
+        """
+        with self.lock:
+            if not self.subscription_queue:
+                self.batch_timer = None
+                return
+            pending = list(self.subscription_queue)
+            self.subscription_queue.clear()
+            self.batch_timer = None
+
+        if not self.connected or not self.ws_client:
+            self.logger.warning(f"Dropping batch of {len(pending)} subscriptions — not connected")
+            return
+
+        # Group by mode (broker requires separate subscribe per mode), then by
+        # exchangeType (the SmartConnect token_list shape allows multiple
+        # exchange-type groups per call but tokens within a group share an
+        # exchange).
+        by_mode: dict[int, dict[int, list]] = {}
+        for sub in pending:
+            mode = sub["mode"]
+            exch_type = sub["exchange_type"]
+            by_mode.setdefault(mode, {}).setdefault(exch_type, []).append(sub["token"])
+
+        for mode, exch_groups in by_mode.items():
+            token_list = [
+                {"exchangeType": exch_type, "tokens": tokens}
+                for exch_type, tokens in exch_groups.items()
+            ]
+            total_tokens = sum(len(tokens) for tokens in exch_groups.values())
+            # Synthetic batch correlation_id — broker just echoes it back; we
+            # keep per-symbol correlation_ids in self.subscriptions for the
+            # resubscribe-on-open path elsewhere.
+            correlation_id = f"batch_{int(time.time() * 1000)}_{mode}"
+            try:
+                self.ws_client.subscribe(correlation_id, mode, token_list)
+                self.logger.info(
+                    f"Batch subscribed {total_tokens} tokens in mode {mode} "
+                    f"across {len(exch_groups)} exchange-type group(s)"
+                )
+            except Exception as e:
+                self.logger.error(f"Batch subscription failed for mode {mode}: {e}")
+
     def _on_open(self, wsapp) -> None:
         """Callback when connection is established"""
         self.logger.info("Connected to Angel WebSocket")
         self.connected = True
 
-        # Resubscribe to existing subscriptions if reconnecting
+        # Resubscribe to existing subscriptions if reconnecting.
+        # Group by (mode, exchangeType) so a 1000-symbol resubscribe storm
+        # also collapses into a small number of broker messages instead of
+        # 1000 sequential ones.
         with self.lock:
-            for correlation_id, sub in self.subscriptions.items():
-                try:
-                    self.ws_client.subscribe(correlation_id, sub["mode"], sub["token_list"])
-                    self.logger.info(f"Resubscribed to {sub['symbol']}.{sub['exchange']}")
-                except Exception as e:
-                    self.logger.error(
-                        f"Error resubscribing to {sub['symbol']}.{sub['exchange']}: {e}"
-                    )
+            if not self.subscriptions:
+                return
+            by_mode: dict[int, dict[int, list]] = {}
+            for sub in self.subscriptions.values():
+                mode = sub["mode"]
+                # token_list[0] always has exchangeType + tokens=[token] today
+                first = sub["token_list"][0] if sub.get("token_list") else None
+                if not first:
+                    continue
+                exch_type = first.get("exchangeType")
+                token = sub.get("token")
+                if exch_type is None or token is None:
+                    continue
+                by_mode.setdefault(mode, {}).setdefault(exch_type, []).append(token)
+
+        for mode, exch_groups in by_mode.items():
+            token_list = [
+                {"exchangeType": exch_type, "tokens": tokens}
+                for exch_type, tokens in exch_groups.items()
+            ]
+            total_tokens = sum(len(tokens) for tokens in exch_groups.values())
+            correlation_id = f"resub_{int(time.time() * 1000)}_{mode}"
+            try:
+                self.ws_client.subscribe(correlation_id, mode, token_list)
+                self.logger.info(
+                    f"Resubscribed {total_tokens} tokens in mode {mode} "
+                    f"across {len(exch_groups)} exchange-type group(s)"
+                )
+            except Exception as e:
+                self.logger.error(f"Error during batched resubscribe in mode {mode}: {e}")
 
     def _on_error(self, error_type, error_msg=None) -> None:
         """
@@ -510,13 +660,19 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def _on_data(self, wsapp, message) -> None:
         """Callback for market data from the WebSocket"""
+        # This runs once per tick on the hot path. Avoid building debug strings
+        # unless DEBUG is actually enabled — an f-string is evaluated eagerly
+        # before logger.debug() can drop it, so an unguarded f-string repr of
+        # every tick is pure wasted CPU at high tick rates.
+        debug_on = self.logger.isEnabledFor(logging.DEBUG)
         try:
-            # Debug log the raw message data to see what we're actually receiving
-            self.logger.debug(f"RAW ANGEL DATA: Type: {type(message)}, Data: {message}")
+            if debug_on:
+                self.logger.debug(f"RAW ANGEL DATA: Type: {type(message)}, Data: {message}")
 
             # Check if we're getting binary data as per Angel's documentation
             if isinstance(message, bytes) or isinstance(message, bytearray):
-                self.logger.debug(f"Received binary data of length: {len(message)}")
+                if debug_on:
+                    self.logger.debug(f"Received binary data of length: {len(message)}")
                 # We need to parse the binary data according to Angel's format
                 # For now, we'll log what we have and exit early
                 return
@@ -530,21 +686,25 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
             token = message.get("token")
             exchange_type = message.get("exchange_type")
 
-            self.logger.debug(
-                f"Processing message with token: {token}, exchange_type: {exchange_type}"
-            )
+            if debug_on:
+                self.logger.debug(
+                    f"Processing message with token: {token}, exchange_type: {exchange_type}"
+                )
 
-            # Find the subscription that matches this token
-            subscription = None
+            # O(1) reverse lookup of the subscription for this tick. Falls back
+            # to a linear scan only if the index somehow misses (defensive).
+            key = (str(token), exchange_type)
             with self.lock:
-                for sub in self.subscriptions.values():
-                    if (
-                        sub["token"] == token
-                        and AngelExchangeMapper.get_exchange_type(sub["brexchange"])
-                        == exchange_type
-                    ):
-                        subscription = sub
-                        break
+                subscription = self._token_index.get(key)
+                if subscription is None:
+                    for sub in self.subscriptions.values():
+                        if (
+                            str(sub["token"]) == str(token)
+                            and AngelExchangeMapper.get_exchange_type(sub["brexchange"])
+                            == exchange_type
+                        ):
+                            subscription = sub
+                            break
 
             if not subscription:
                 self.logger.warning(f"Received data for unsubscribed token: {token}")
@@ -564,7 +724,7 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
             topic = f"{exchange}_{symbol}_{mode_str}"
 
             # Normalize the data based on the actual message mode, not subscription mode
-            market_data = self._normalize_market_data(message, actual_msg_mode)
+            market_data = self._normalize_market_data(message, actual_msg_mode, exchange)
 
             # Add metadata
             market_data.update(
@@ -575,8 +735,9 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     "timestamp": int(time.time() * 1000),  # Current timestamp in ms
                 }
             )
-            # Log the market data we're sendingAdd commentMore actions
-            self.logger.debug(f"Publishing market data: {market_data}")
+            # Log the market data we're sending (guarded — hot path)
+            if debug_on:
+                self.logger.debug(f"Publishing market data: {market_data}")
 
             # Publish to ZeroMQ
             self.publish_market_data(topic, market_data)
@@ -584,90 +745,92 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
         except Exception as e:
             self.logger.error(f"Error processing market data: {e}", exc_info=True)
 
-    def _normalize_market_data(self, message, mode) -> dict[str, Any]:
+    # Angel exchange type 13 is cde_fo (currency derivatives). The SmartAPI
+    # WebSocket 2.0 spec: "For currencies, the int 32 price values should be
+    # divided by 10000000.0 to obtain four decimal places. For everything else,
+    # the price values should be divided by 100."
+    CURRENCY_EXCHANGES = frozenset({"CDS", "BCD"})
+    CURRENCY_EXCHANGE_TYPES = frozenset({13})
+
+    @classmethod
+    def _price_divisor(cls, exchange_type=None, exchange=None) -> float:
+        """Return the divisor that turns Angel's integer prices into rupees."""
+        if exchange in cls.CURRENCY_EXCHANGES or exchange_type in cls.CURRENCY_EXCHANGE_TYPES:
+            return 10000000.0
+        return 100.0
+
+    def _normalize_market_data(self, message, mode, exchange=None) -> dict[str, Any]:
         """
         Normalize broker-specific data format to a common format
 
         Args:
-            message: The raw message from the broker
+            message: The raw message from the broker (parsed by SmartWebSocketV2)
             mode: Subscription mode
+            exchange: OpenAlgo exchange of the subscription, used for the price divisor
 
         Returns:
             Dict: Normalized market data
         """
-        # Based on the logs, the Angel WebSocket sends a message with this format:
-        # {'subscription_mode': 1, 'exchange_type': 1, 'token': '2885',
-        #  'sequence_number': 10100759, 'exchange_timestamp': 1746171226000,
-        #  'last_traded_price': 141840, 'subscription_mode_val': 'LTP'}
-        #
-        # Prices are in paise (1/100 of a rupee) so we need to divide by 100
+        div = self._price_divisor(message.get("exchange_type"), exchange)
+
+        def price(key):
+            return message.get(key, 0) / div
 
         if mode == 1:  # LTP mode
             return {
-                "ltp": message.get("last_traded_price", 0) / 100,  # Divide by 100 for correct price
+                "ltp": price("last_traded_price"),
                 "ltt": message.get("exchange_timestamp", 0),
             }
-        elif mode == 2:  # Quote mode
-            # Extract additional fields based on what's available in the message
+        elif mode in (2, 3):
+            # Quote and Snap Quote share bytes 51-123 (SmartWebSocketV2._parse_binary_data);
+            # closed_price is the previous day's close.
+            last_qty = message.get("last_traded_quantity", 0)
             result = {
-                "ltp": message.get("last_traded_price", 0) / 100,  # Divide by 100 for correct price
+                "ltp": price("last_traded_price"),
                 "ltt": message.get("exchange_timestamp", 0),
                 "volume": message.get("volume_trade_for_the_day", 0),
-                "open": message.get("open_price_of_the_day", 0)
-                / 100,  # Divide by 100 for correct price
-                "high": message.get("high_price_of_the_day", 0)
-                / 100,  # Divide by 100 for correct price
-                "low": message.get("low_price_of_the_day", 0)
-                / 100,  # Divide by 100 for correct price
-                "close": message.get("closed_price", 0) / 100,  # Divide by 100 for correct price
-                "last_trade_quantity": message.get("last_traded_quantity", 0),
-                "average_price": message.get("average_traded_price", 0)
-                / 100,  # Divide by 100 for correct price
+                "open": price("open_price_of_the_day"),
+                "high": price("high_price_of_the_day"),
+                "low": price("low_price_of_the_day"),
+                "close": price("closed_price"),
+                "last_trade_quantity": last_qty,
+                "last_quantity": last_qty,
+                "average_price": price("average_traded_price"),
                 "total_buy_quantity": message.get("total_buy_quantity", 0),
                 "total_sell_quantity": message.get("total_sell_quantity", 0),
             }
-            return result
-        elif mode == 3:  # Snap Quote mode (includes depth data)
-            # For snap quote mode, extract the depth data if available
-            # Note: OI is intentionally excluded for depth mode as per requirement
-            # Note: OI is intentionally excluded for depth mode as per requirement
-            result = {
-                "ltp": message.get("last_traded_price", 0) / 100,  # Divide by 100 for correct price
-                "ltt": message.get("exchange_timestamp", 0),
-                "volume": message.get("volume_trade_for_the_day", 0),
-                "open": message.get("open_price", 0) / 100,
-                "high": message.get("high_price", 0) / 100,
-                "low": message.get("low_price", 0) / 100,
-                "close": message.get("close_price", 0) / 100,
-                "last_quantity": message.get("last_traded_quantity", 0),
-                "oi": message.get("open_interest", 0),
-                "upper_circuit": message.get("upper_circuit_limit", 0) / 100,
-                "lower_circuit": message.get("lower_circuit_limit", 0) / 100,
-            }
+            if mode == 2:
+                return result
 
-            # Add depth data if available
-            if "best_5_buy_data" in message and "best_5_sell_data" in message:
-                result["depth"] = {
-                    "buy": self._extract_depth_data(message, is_buy=True),
-                    "sell": self._extract_depth_data(message, is_buy=False),
+            # Snap Quote mode (includes depth data)
+            result.update(
+                {
+                    "oi": message.get("open_interest", 0),
+                    "upper_circuit": price("upper_circuit_limit"),
+                    "lower_circuit": price("lower_circuit_limit"),
                 }
-            elif "depth_20_buy_data" in message and "depth_20_sell_data" in message:
+            )
+            if ("best_5_buy_data" in message and "best_5_sell_data" in message) or (
+                "depth_20_buy_data" in message and "depth_20_sell_data" in message
+            ):
                 result["depth"] = {
-                    "buy": self._extract_depth_data(message, is_buy=True),
-                    "sell": self._extract_depth_data(message, is_buy=False),
+                    "buy": self._extract_depth_data(message, is_buy=True, divisor=div),
+                    "sell": self._extract_depth_data(message, is_buy=False, divisor=div),
                 }
-
             return result
         else:
             return {}
 
-    def _extract_depth_data(self, message, is_buy: bool) -> list[dict[str, Any]]:
+    def _extract_depth_data(
+        self, message, is_buy: bool, divisor: float = 100.0
+    ) -> list[dict[str, Any]]:
         """
         Extract depth data from Angel's message format
 
         Args:
             message: The raw message containing depth data
             is_buy: Whether to extract buy or sell side
+            divisor: Price divisor for the instrument's exchange (see _price_divisor)
 
         Returns:
             List: List of depth levels with price, quantity, and orders
@@ -675,95 +838,36 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
         depth = []
         side_label = "Buy" if is_buy else "Sell"
 
-        # Log the raw message structure to help debug
-        self.logger.debug(f"Extracting {side_label} depth data from message: {message.keys()}")
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(f"Extracting {side_label} depth data from message: {message.keys()}")
 
-        # Check for different possible depth data formats that Angel might send
-        # Angel can send depth data in different formats depending on the request:
-        # - depth_20_buy_data and depth_20_sell_data for 20 level depth
-        # - best_5_buy_data and best_5_sell_data for 5 level depth
-        # - For MCX, the format might be slightly different
-
-        # First check for best_5 data (most common for MCX)
+        # best_5_* for snap quote (5 levels), depth_20_* for 20-level depth.
         best_5_key = "best_5_buy_data" if is_buy else "best_5_sell_data"
-        if best_5_key in message and isinstance(message[best_5_key], list):
-            depth_data = message.get(best_5_key, [])
-            self.logger.debug(
-                f"Found {side_label} depth data using {best_5_key}: {len(depth_data)} levels"
-            )
+        depth_20_key = "depth_20_buy_data" if is_buy else "depth_20_sell_data"
+        if isinstance(message.get(best_5_key), list):
+            depth_data = message[best_5_key]
+        elif isinstance(message.get(depth_20_key), list):
+            depth_data = message[depth_20_key]
+        else:
+            depth_data = []
 
-            for level in depth_data:
-                if isinstance(level, dict):
-                    price = level.get("price", 0)
-                    # Ensure price is properly scaled (divide by 100)
-                    if price > 0:
-                        price = price / 100
-
-                    depth.append(
-                        {
-                            "price": price,
-                            "quantity": level.get("quantity", 0),
-                            "orders": level.get("no of orders", 0),
-                        }
-                    )
-
-        # Then check for depth_20 data
-        elif "depth_20_buy_data" in message and is_buy:
-            depth_data = message.get("depth_20_buy_data", [])
-            self.logger.debug(
-                f"Found {side_label} depth data using depth_20_buy_data: {len(depth_data)} levels"
-            )
-
-            for level in depth_data:
-                if isinstance(level, dict):
-                    price = level.get("price", 0)
-                    # Ensure price is properly scaled (divide by 100)
-                    if price > 0:
-                        price = price / 100
-
-                    depth.append(
-                        {
-                            "price": price,
-                            "quantity": level.get("quantity", 0),
-                            "orders": level.get("no of orders", 0),
-                        }
-                    )
-
-        elif "depth_20_sell_data" in message and not is_buy:
-            depth_data = message.get("depth_20_sell_data", [])
-            self.logger.debug(
-                f"Found {side_label} depth data using depth_20_sell_data: {len(depth_data)} levels"
-            )
-
-            for level in depth_data:
-                if isinstance(level, dict):
-                    price = level.get("price", 0)
-                    # Ensure price is properly scaled (divide by 100)
-                    if price > 0:
-                        price = price / 100
-
-                    depth.append(
-                        {
-                            "price": price,
-                            "quantity": level.get("quantity", 0),
-                            "orders": level.get("no of orders", 0),
-                        }
-                    )
+        for level in depth_data:
+            if isinstance(level, dict):
+                depth.append(
+                    {
+                        "price": level.get("price", 0) / divisor,
+                        "quantity": level.get("quantity", 0),
+                        "orders": level.get("no of orders", 0),
+                    }
+                )
 
         # If no depth data found, return empty levels as fallback
         if not depth:
             self.logger.debug(
                 f"No {side_label} depth data in message (expected for indices). Keys: {message.keys()}"
             )
-            for i in range(5):  # Default to 5 empty levels
+            for _ in range(5):  # Default to 5 empty levels
                 depth.append({"price": 0.0, "quantity": 0, "orders": 0})
-        else:
-            # Log the depth data being returned for debugging
-            self.logger.debug(f"{side_label} depth data found: {len(depth)} levels")
-            if depth and depth[0]["price"] > 0:
-                self.logger.debug(
-                    f"{side_label} depth first level: Price={depth[0]['price']}, Qty={depth[0]['quantity']}"
-                )
 
         return depth
 
@@ -801,6 +905,7 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self._reconnecting = False
                 self.reconnect_attempts = 0
                 self.subscriptions.clear()
+                self._token_index.clear()
 
             # Clean up ZMQ resources
             self.cleanup_zmq()

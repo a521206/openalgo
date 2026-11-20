@@ -3,14 +3,15 @@
 // Uses WebSocket for real-time data with REST API fallback (like Holdings/Positions)
 
 import { useCallback, useEffect, useState } from 'react'
+import { tradingApi } from '@/api/trading'
+import { Button } from '@/components/ui/button'
 import {
   Dialog,
   DialogContent,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogFooter,
 } from '@/components/ui/dialog'
-import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -20,21 +21,20 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { useAuthStore } from '@/stores/authStore'
 import { useLiveQuote } from '@/hooks/useLiveQuote'
-import { tradingApi } from '@/api/trading'
-import { showToast } from '@/utils/toast'
 import { cn } from '@/lib/utils'
-import { QuoteHeader } from './QuoteHeader'
+import { useAuthStore } from '@/stores/authStore'
+import { showToast } from '@/utils/toast'
 import { MarketDepthPanel } from './MarketDepthPanel'
+import { QuoteHeader } from './QuoteHeader'
 
 // Price types for order dialog
 // Backend API accepts: MARKET, LIMIT, SL (Stop Loss Limit), SL-M (Stop Loss Market)
 const PRICE_TYPES = [
   { value: 'MARKET', label: 'Market' },
   { value: 'LIMIT', label: 'Limit' },
-  { value: 'SL-M', label: 'SL-M' },      // Stop Loss Market (trigger only)
-  { value: 'SL', label: 'SL-L' },         // Stop Loss Limit (trigger + price)
+  { value: 'SL-M', label: 'SL-M' }, // Stop Loss Market (trigger only)
+  { value: 'SL', label: 'SL-L' }, // Stop Loss Limit (trigger + price)
 ] as const
 
 // Product types based on exchange
@@ -59,9 +59,53 @@ export interface PlaceOrderDialogProps {
   tickSize?: number
   product?: 'MIS' | 'NRML' | 'CNC'
   priceType?: 'MARKET' | 'LIMIT' | 'SL' | 'SL-M'
+  /**
+   * Starting limit and trigger prices, for a caller that already has one: a
+   * chart row clicked at a price. Left out, a LIMIT or SL ticket fills its
+   * price from the live LTP as before.
+   */
+  price?: number
+  triggerPrice?: number
   strategy?: string
+  /**
+   * Where to send the confirmed order. Left out, it posts through
+   * tradingApi.placeOrder as it always has. The chart supplies one so its
+   * ticket goes through the terminal's trade feed, which asserts the page's
+   * mode against the server before anything is sent; a ticket must not be
+   * the one order route that decides on the server's global switch.
+   */
+  place?: (order: TicketOrder) => Promise<{ orderId: string }>
+  /**
+   * The element the dialog is portalled into, for a caller that is the
+   * fullscreen element: nothing outside it paints, so a dialog on body would
+   * open unseen and take focus. Null or absent means body, as before.
+   */
+  container?: HTMLElement | null
   onSuccess?: (orderId: string) => void
   onError?: (error: string) => void
+}
+
+/** The confirmed order, in the shape the placeorder endpoint takes. */
+export interface TicketOrder {
+  symbol: string
+  exchange: string
+  action: 'BUY' | 'SELL'
+  quantity: number
+  pricetype: 'MARKET' | 'LIMIT' | 'SL' | 'SL-M'
+  product: 'MIS' | 'NRML' | 'CNC'
+  price?: number
+  trigger_price?: number
+}
+
+/**
+ * The lot count a starting quantity stands for. The box shows lots on a
+ * derivative segment while the order carries units, so the two are derived
+ * from one figure here rather than seeded separately: a 150-unit ticket on a
+ * 75-lot contract reads 2, not 1.
+ */
+export function lotsFor(quantity: number | undefined, lotSize: number): number {
+  if (quantity === undefined || lotSize <= 0) return 1
+  return Math.max(1, Math.round(quantity / lotSize))
 }
 
 // Tick size validation helpers
@@ -81,9 +125,10 @@ function adjustPrice(price: number, tickSize: number, direction: 'up' | 'down'):
 
 // Check if exchange is F&O/Commodity/Currency (uses NRML/MIS)
 // NSE, BSE = Equity → CNC/MIS
-// NFO, BFO, CDS, BCD, MCX, NCDEX = F&O/Currency/Commodity → NRML/MIS
+// NFO, BFO, CDS, BCD, MCX, NCDEX, NCO = F&O/Currency/Commodity → NRML/MIS
+// CRYPTO = crypto derivatives (utils/constants.py): NRML/MIS in lots, no CNC
 function isFnOExchange(exchange: string): boolean {
-  return ['NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCDEX'].includes(exchange)
+  return ['NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCDEX', 'NCO', 'CRYPTO'].includes(exchange)
 }
 
 export function PlaceOrderDialog({
@@ -97,7 +142,11 @@ export function PlaceOrderDialog({
   tickSize = 0.05,
   product: initialProduct = 'NRML',
   priceType: initialPriceType = 'MARKET',
+  price: initialPrice,
+  triggerPrice: initialTriggerPrice,
   strategy = 'OptionChain',
+  place,
+  container,
   onSuccess,
   onError,
 }: PlaceOrderDialogProps) {
@@ -115,12 +164,26 @@ export function PlaceOrderDialog({
   const [quantityMode, setQuantityMode] = useState<'lots' | 'shares'>('lots')
   const [lotMultiplier, setLotMultiplier] = useState(1)
 
+  // Equity trades on either cash exchange. The caller supplies the starting
+  // exchange; for NSE/BSE the user may switch, since the same scrip is listed
+  // on both. Everything else is contract-specific and stays fixed.
+  const [formExchange, setFormExchange] = useState(exchange)
+  const exchange_ = formExchange || exchange
+  const isEquityExchange = exchange_ === 'NSE' || exchange_ === 'BSE'
+
   // Get available product types based on exchange
-  const productTypes = isFnOExchange(exchange) ? FNO_PRODUCT_TYPES : EQUITY_PRODUCT_TYPES
+  const productTypes = isFnOExchange(exchange_) ? FNO_PRODUCT_TYPES : EQUITY_PRODUCT_TYPES
+
+  // Lots are a derivatives concept. Cash equity has no lot size worth showing.
+  const usesLots = isFnOExchange(exchange_) && lotSize > 1
 
   // Centralized live quote + depth with REST fallback (like useLivePrice for Holdings/Positions)
-  const { data: liveData, isLoading: isLoadingQuotes, isConnected } = useLiveQuote(symbol, exchange, {
-    enabled: open && !!symbol && !!exchange,
+  const {
+    data: liveData,
+    isLoading: isLoadingQuotes,
+    isConnected,
+  } = useLiveQuote(symbol, exchange_, {
+    enabled: open && !!symbol && !!exchange_,
     mode: 'Depth',
     useQuotesFallback: true,
     useDepthFallback: true,
@@ -137,17 +200,36 @@ export function PlaceOrderDialog({
       const defaultProduct = isFnO ? 'NRML' : 'CNC'
       // Validate product: CNC not valid for F&O, NRML not valid for equity
       const validProducts = isFnO ? ['NRML', 'MIS'] : ['CNC', 'MIS']
-      const productToUse = initialProduct && validProducts.includes(initialProduct)
-        ? initialProduct
-        : defaultProduct
+      const productToUse =
+        initialProduct && validProducts.includes(initialProduct) ? initialProduct : defaultProduct
       setFormProduct(productToUse)
-      setFormPrice(0)
-      setFormTriggerPrice(0)
+      // A supplied price survives the LTP fill below, which only writes over 0.
+      setFormPrice(initialPrice ?? 0)
+      setFormTriggerPrice(initialTriggerPrice ?? 0)
       setIsDepthExpanded(false)
-      setQuantityMode('lots')
-      setLotMultiplier(1)
+      // Cash equity has no lots, so the quantity box must show the real share
+      // count. Defaulting to 'lots' here displayed lotMultiplier (1) while
+      // formQuantity held the actual size -- opening Exit on a 70-share holding
+      // showed "1" in the box and would have placed 70.
+      setQuantityMode(isFnOExchange(exchange) && lotSize > 1 ? 'lots' : 'shares')
+      // Derived from the same figure as formQuantity above, so the Lots box
+      // and the order it places agree: the chart's ticket arrives in units
+      // for however many lots its pane asked for, and a box reading 1 over
+      // an order of 150 is the mistake the ticket exists to prevent.
+      setLotMultiplier(lotsFor(initialQuantity, lotSize))
+      setFormExchange(exchange)
     }
-  }, [open, initialAction, initialQuantity, lotSize, initialPriceType, initialProduct, exchange])
+  }, [
+    open,
+    initialAction,
+    initialQuantity,
+    lotSize,
+    initialPriceType,
+    initialProduct,
+    initialPrice,
+    initialTriggerPrice,
+    exchange,
+  ])
 
   // Use data from centralized hook
   const mergedData = {
@@ -180,13 +262,25 @@ export function PlaceOrderDialog({
   const needsTrigger = formPriceType === 'SL-M' || formPriceType === 'SL'
 
   const isValid = useCallback(() => {
-    if (!symbol || !exchange) return false
-    if (!apiKey) return false
+    if (!symbol || !exchange_) return false
+    // A caller's own route (the chart's trade feed) carries its own key, so
+    // only the bare API post needs the one in the auth store.
+    if (!place && !apiKey) return false
     if (formQuantity <= 0) return false
     if (needsPrice && formPrice <= 0) return false
     if (needsTrigger && formTriggerPrice <= 0) return false
     return true
-  }, [symbol, exchange, apiKey, formQuantity, needsPrice, formPrice, needsTrigger, formTriggerPrice])
+  }, [
+    symbol,
+    exchange_,
+    place,
+    apiKey,
+    formQuantity,
+    needsPrice,
+    formPrice,
+    needsTrigger,
+    formTriggerPrice,
+  ])
 
   // Submit order
   const handleSubmit = async () => {
@@ -195,7 +289,7 @@ export function PlaceOrderDialog({
       return
     }
 
-    if (!apiKey) {
+    if (!place && !apiKey) {
       showToast.error('API key not found. Please set up your API key.')
       onError?.('API key not found')
       return
@@ -207,10 +301,8 @@ export function PlaceOrderDialog({
       // Backend accepts: MARKET, LIMIT, SL (Stop Loss Limit), SL-M (Stop Loss Market)
       const apiPriceType = formPriceType as 'MARKET' | 'LIMIT' | 'SL' | 'SL-M'
 
-      const orderRequest = {
-        apikey: apiKey,
-        strategy,
-        exchange,
+      const order: TicketOrder = {
+        exchange: exchange_,
         symbol,
         action: formAction,
         quantity: formQuantity,
@@ -220,7 +312,17 @@ export function PlaceOrderDialog({
         ...(needsTrigger && { trigger_price: formTriggerPrice }),
       }
 
-      const response = await tradingApi.placeOrder(orderRequest)
+      // A caller's own route (the chart's trade feed, which checks the mode
+      // before it posts) takes the order whole and reports by throwing.
+      if (place) {
+        const placed = await place(order)
+        onSuccess?.(placed.orderId)
+        onOpenChange(false)
+        return
+      }
+
+      if (!apiKey) throw new Error('API key not found. Please set up your API key.')
+      const response = await tradingApi.placeOrder({ apikey: apiKey, strategy, ...order })
 
       // Response structure: { status: "success", orderid: "..." } or { status: "error", message: "..." }
       // Note: orderid is at root level, not in data field
@@ -254,7 +356,7 @@ export function PlaceOrderDialog({
 
   // Quantity change handler
   const handleQuantityChange = (value: string) => {
-    const num = parseInt(value) || 0
+    const num = parseInt(value, 10) || 0
     if (quantityMode === 'lots') {
       // In lots mode, multiply by lot size
       setFormQuantity(num * lotSize)
@@ -275,23 +377,25 @@ export function PlaceOrderDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[420px]" aria-describedby={undefined}>
+      <DialogContent
+        className="sm:max-w-[420px]"
+        aria-describedby={undefined}
+        container={container}
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <span>Place Order -</span>
             <span className={formAction === 'BUY' ? 'text-green-500' : 'text-red-500'}>
               {formAction}
             </span>
-            <span className="text-muted-foreground font-normal text-sm truncate">
-              {symbol}
-            </span>
+            <span className="text-muted-foreground font-normal text-sm truncate">{symbol}</span>
           </DialogTitle>
         </DialogHeader>
 
         <div className="space-y-4 py-2">
           {/* Quote Header - merged WebSocket + REST data */}
           <QuoteHeader
-            exchange={exchange}
+            exchange={exchange_}
             ltp={mergedData.ltp}
             prevClose={mergedData.close}
             change={displayChange}
@@ -318,10 +422,7 @@ export function PlaceOrderDialog({
               <Button
                 type="button"
                 variant={formAction === 'BUY' ? 'default' : 'outline'}
-                className={cn(
-                  'flex-1',
-                  formAction === 'BUY' && 'bg-green-600 hover:bg-green-700'
-                )}
+                className={cn('flex-1', formAction === 'BUY' && 'bg-green-600 hover:bg-green-700')}
                 onClick={() => setFormAction('BUY')}
               >
                 BUY
@@ -329,10 +430,7 @@ export function PlaceOrderDialog({
               <Button
                 type="button"
                 variant={formAction === 'SELL' ? 'default' : 'outline'}
-                className={cn(
-                  'flex-1',
-                  formAction === 'SELL' && 'bg-red-600 hover:bg-red-700'
-                )}
+                className={cn('flex-1', formAction === 'SELL' && 'bg-red-600 hover:bg-red-700')}
                 onClick={() => setFormAction('SELL')}
               >
                 SELL
@@ -344,32 +442,37 @@ export function PlaceOrderDialog({
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <Label className="text-xs">Quantity</Label>
-              <div className="flex gap-1">
-                <button
-                  type="button"
-                  onClick={() => setQuantityMode('lots')}
-                  className={cn(
-                    'px-2 py-0.5 text-[10px] rounded',
-                    quantityMode === 'lots'
-                      ? 'bg-primary text-primary-foreground'
-                      : 'bg-muted text-muted-foreground hover:bg-muted/80'
-                  )}
-                >
-                  Lots
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setQuantityMode('shares')}
-                  className={cn(
-                    'px-2 py-0.5 text-[10px] rounded',
-                    quantityMode === 'shares'
-                      ? 'bg-primary text-primary-foreground'
-                      : 'bg-muted text-muted-foreground hover:bg-muted/80'
-                  )}
-                >
-                  Shares
-                </button>
-              </div>
+              {/* Cash equity trades in shares - there is no lot. Showing a
+                  Lots/Shares toggle and "Lot size: 1" on NSE/BSE is noise that
+                  implies a concept the segment does not have. */}
+              {usesLots && (
+                <div className="flex gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setQuantityMode('lots')}
+                    className={cn(
+                      'px-2 py-0.5 text-[10px] rounded',
+                      quantityMode === 'lots'
+                        ? 'bg-primary text-primary-foreground'
+                        : 'bg-muted text-muted-foreground hover:bg-muted/80'
+                    )}
+                  >
+                    Lots
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setQuantityMode('shares')}
+                    className={cn(
+                      'px-2 py-0.5 text-[10px] rounded',
+                      quantityMode === 'shares'
+                        ? 'bg-primary text-primary-foreground'
+                        : 'bg-muted text-muted-foreground hover:bg-muted/80'
+                    )}
+                  >
+                    Shares
+                  </button>
+                </div>
+              )}
             </div>
             <Input
               type="number"
@@ -377,17 +480,40 @@ export function PlaceOrderDialog({
               onChange={(e) => handleQuantityChange(e.target.value)}
               min={1}
             />
-            <div className="flex justify-between text-[10px] text-muted-foreground">
-              <span>Lot size: {lotSize}</span>
-              <span>Total qty: {formQuantity}</span>
-            </div>
+            {usesLots && (
+              <div className="flex justify-between text-[10px] text-muted-foreground">
+                <span>Lot size: {lotSize}</span>
+                <span>Total qty: {formQuantity}</span>
+              </div>
+            )}
           </div>
+
+          {/* Exchange, for cash equity only. The same scrip is listed on both
+              NSE and BSE, so the user picks where to route. Derivatives are
+              contract-specific and stay on the exchange they came from. */}
+          {isEquityExchange && (
+            <div className="space-y-2">
+              <Label className="text-xs">Exchange</Label>
+              <Select value={exchange_} onValueChange={setFormExchange}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="NSE">NSE</SelectItem>
+                  <SelectItem value="BSE">BSE</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          )}
 
           {/* Price Type and Product in row */}
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-2">
               <Label className="text-xs">Price Type</Label>
-              <Select value={formPriceType} onValueChange={(v) => setFormPriceType(v as typeof formPriceType)}>
+              <Select
+                value={formPriceType}
+                onValueChange={(v) => setFormPriceType(v as typeof formPriceType)}
+              >
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
@@ -402,7 +528,10 @@ export function PlaceOrderDialog({
             </div>
             <div className="space-y-2">
               <Label className="text-xs">Product</Label>
-              <Select value={formProduct} onValueChange={(v) => setFormProduct(v as typeof formProduct)}>
+              <Select
+                value={formProduct}
+                onValueChange={(v) => setFormProduct(v as typeof formProduct)}
+              >
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
@@ -464,7 +593,9 @@ export function PlaceOrderDialog({
                   variant="outline"
                   size="sm"
                   className="px-2"
-                  onClick={() => setFormTriggerPrice(adjustPrice(formTriggerPrice, tickSize, 'down'))}
+                  onClick={() =>
+                    setFormTriggerPrice(adjustPrice(formTriggerPrice, tickSize, 'down'))
+                  }
                 >
                   -
                 </Button>
@@ -499,7 +630,9 @@ export function PlaceOrderDialog({
             onClick={handleSubmit}
             disabled={!isValid() || isSubmitting}
             className={cn(
-              formAction === 'BUY' ? 'bg-green-600 hover:bg-green-700' : 'bg-red-600 hover:bg-red-700'
+              formAction === 'BUY'
+                ? 'bg-green-600 hover:bg-green-700'
+                : 'bg-red-600 hover:bg-red-700'
             )}
           >
             {isSubmitting ? 'Placing...' : `Place ${formAction} Order`}

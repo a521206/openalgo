@@ -1,5 +1,5 @@
+import functools
 import json
-import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -8,12 +8,117 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import httpx
 import pandas as pd
 
+from broker.tradejini.api.auth_api import API_KEY_MISSING_ERROR, get_api_key
 from broker.tradejini.api.nxtradstream import NxtradStream
 from database.token_db import get_br_symbol, get_oa_symbol, get_symbol, get_token
+from utils import runtime
+from utils.broker_backpressure import BrokerBusyError, max_queue_wait
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# --- How many requests may wait on the Tradejini feed at once, under gthread ---
+# A quote or depth request here subscribes on a WebSocket and then waits
+# seconds for the data, holding its thread the whole time. Under the gthread
+# worker those are request threads from a fixed pool, so at most
+# _FEED_WAITERS_MAX requests wait at once. The next waits at most the data
+# ceiling of utils.broker_backpressure for a place, and is refused with a
+# sentence the trader can act on.
+# Under eventlet and the development server nothing is capped, as before.
+_FEED_WAITERS_MAX = 8
+_feed_waiters = threading.BoundedSemaphore(_FEED_WAITERS_MAX)
+_feed_gate_held = threading.local()
+_FEED_BUSY_MESSAGE = (
+    "Too many live quote and depth requests are already waiting on the Tradejini "
+    "feed. Try again in a few seconds."
+)
+
+
+def _feed_gated(on_busy=None):
+    """Decorate a method that waits on the feed; a no-op outside gthread.
+
+    Args:
+        on_busy: Called with the method's arguments instead of raising when no
+            place frees up in time, for a method that has another way to answer.
+    """
+
+    def decorate(method):
+        @functools.wraps(method)
+        def wrapper(*args, **kwargs):
+            # Nested gated calls on one thread already hold a place.
+            if not runtime.gthread_active() or getattr(_feed_gate_held, "held", False):
+                return method(*args, **kwargs)
+            if not _feed_waiters.acquire(timeout=max_queue_wait("data")):
+                logger.warning(f"Tradejini feed: {method.__name__} refused, all places taken")
+                if on_busy is not None:
+                    return on_busy(*args, **kwargs)
+                raise BrokerBusyError(_FEED_BUSY_MESSAGE)
+            _feed_gate_held.held = True
+            try:
+                return method(*args, **kwargs)
+            finally:
+                _feed_gate_held.held = False
+                _feed_waiters.release()
+
+        return wrapper
+
+    return decorate
+
+
+# --- Waiting on the feed ---------------------------------------------------
+# A quote or depth request subscribes and then waits for its data. It used to
+# look once a second, or wait a fixed time for a batch; it now looks every
+# _FEED_POLL_SECONDS and stops as soon as what it reads is complete. What it
+# reads, and how, is unchanged, so the answer is the same one, only sooner.
+#
+# An L5 packet is a whole book, so the first one is complete. L1 arrives as a
+# snapshot followed by changes, which the stream merges, so an L1 quote counts
+# as complete once it holds every field the answer reads (_L1_FIELDS, and open
+# interest on a derivatives exchange). A quote that never holds them all is read
+# the way it always was: a single quote on the next one second step, a batch at
+# the end of its wait. The pause before a single quote subscribes is not a wait
+# for data and is left as it is.
+_FEED_POLL_SECONDS = 0.05
+_QUOTE_STEP_SECONDS = 1.0
+_QUOTE_STEPS = 40
+_DEPTH_WAIT_SECONDS = 20.0
+_L1_FIELDS = ("ltp", "open", "high", "low", "close", "vol", "bidPrice", "askPrice")
+_OI_EXCHANGES = frozenset({"NFO", "BFO", "CDS", "BCD", "MCX"})
+
+
+def _wait_for_feed(ready, seconds: float) -> bool:
+    """Look every _FEED_POLL_SECONDS until ready() is true, for at most ``seconds``.
+
+    True as soon as it is, False once the time is up. time.sleep yields to the
+    other requests under eventlet and holds only this request's thread elsewhere.
+    """
+    deadline = time.monotonic() + seconds
+    while not ready():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_FEED_POLL_SECONDS, remaining))
+    return True
+
+
+def _price(value) -> float:
+    """A bar value as a float; NaN when it is missing or not a number."""
+    if value is None or value == "":
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _l1_complete(quote_data, exchange: str) -> bool:
+    """Whether an L1 quote holds every field a quote answer reads."""
+    if not isinstance(quote_data, dict):
+        return False
+    if any(field not in quote_data for field in _L1_FIELDS):
+        return False
+    return exchange not in _OI_EXCHANGES or "OI" in quote_data
 
 
 class TradejiniWebSocket:
@@ -27,28 +132,40 @@ class TradejiniWebSocket:
         self.last_quote = None
         self.last_depth = None
         self.nxtrad_host = "api.tradejini.com"
+        # Set by close() so the close callback can tell an intentional shutdown
+        # from a dropped connection. The SDK reports both the same way, and
+        # reconnecting after our own close() strands a socket and its thread
+        # with no owner - one leaked descriptor per quote/depth request.
+        self._closing = False
 
         # L1 cache for storing quote data like in original SDK
         self.L1_dict = {}
         self.L5_dict = {}
 
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def connect(self, auth_token):
         """Connect to Tradejini WebSocket using official SDK"""
         try:
             self.auth_token = auth_token
+            self._closing = False
 
             # Get API key from environment if not provided in token
-            api_key = os.environ.get("BROKER_API_SECRET", "")
+            api_key = get_api_key()
 
             # Format the auth token exactly as per TradeJini requirements
             if ":" not in auth_token and api_key:
                 auth_header = f"{api_key}:{auth_token}"
-                logger.debug("Using API key from BROKER_API_SECRET environment variable")
+                logger.debug("Using API key from environment")
             elif ":" in auth_token:
                 auth_header = auth_token
                 logger.debug("Using provided API key and access token")
             else:
-                error_msg = "Invalid auth token format. Expected 'api_key:access_token' or set BROKER_API_SECRET"
+                error_msg = f"Invalid auth token format. Expected 'api_key:access_token'. {API_KEY_MISSING_ERROR}"
                 logger.error(error_msg)
                 raise ValueError(error_msg)
 
@@ -60,9 +177,7 @@ class TradejiniWebSocket:
             )
 
             # Connect with formatted auth token
-            logger.debug(
-                f"Connecting with auth token format: {auth_header.split(':')[0][:4]}***:{auth_header.split(':')[1][:4]}***"
-            )
+            logger.debug("Connecting with auth token in api_key:access_token format")
             self.nx_stream.connect(auth_header)
 
             # Wait for connection
@@ -106,11 +221,16 @@ class TradejiniWebSocket:
                 reason = event.get("reason", "Unknown reason")
                 logger.warning(f"WebSocket closed: {reason}")
 
-                # Auto-reconnect if not unauthorized
-                if reason != "Unauthorized Access":
+                # Auto-reconnect only when the connection dropped on its own.
+                # close() is called from the finally block of every quote/depth
+                # request, and reconnecting there resurrects a socket nothing
+                # will ever close.
+                if self._closing:
+                    logger.debug("Close was requested locally - not reconnecting")
+                elif reason != "Unauthorized Access":
                     logger.info("Attempting to reconnect...")
                     time.sleep(5)
-                    if self.nx_stream:
+                    if self.nx_stream and not self._closing:
                         self.nx_stream.reconnect()
 
         except Exception as e:
@@ -182,7 +302,9 @@ class TradejiniWebSocket:
                 return False
 
             # Format token as per Tradejini requirement
-            formatted_token = f"{token}_{exchange}"
+            # Strip _INDEX suffix: WebSocket expects NSE/BSE, not NSE_INDEX/BSE_INDEX
+            ws_exchange = exchange.replace("_INDEX", "")
+            formatted_token = f"{token}_{ws_exchange}"
 
             logger.info(f"Subscribing to L5 depth for {formatted_token}")
 
@@ -202,6 +324,9 @@ class TradejiniWebSocket:
 
     def close(self):
         """Close WebSocket connection"""
+        # Set before disconnect(): the SDK fires the close callback from its
+        # reader thread, and that callback must see the close as intentional.
+        self._closing = True
         try:
             if self.nx_stream:
                 self.nx_stream.disconnect()
@@ -226,6 +351,19 @@ class BrokerData:
             "30m": "30m",  # 30 minutes
         }
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def connect_websocket(self):
         """Initialize WebSocket connection if not already connected"""
         try:
@@ -234,6 +372,13 @@ class BrokerData:
                 return True
 
             logger.info("Initializing new WebSocket connection...")
+
+            # Close existing WebSocket before creating a new one
+            if hasattr(self, "ws") and self.ws:
+                try:
+                    self.ws.close()
+                except Exception:
+                    pass
 
             # Initialize new WebSocket instance
             self.ws = TradejiniWebSocket()
@@ -304,6 +449,7 @@ class BrokerData:
                 "oi": 0,  # Include OI with default value
             }
 
+    @_feed_gated()
     def get_quotes(self, symbol: str, exchange: str) -> dict:
         """Get real-time quotes for given symbol"""
         try:
@@ -336,7 +482,9 @@ class BrokerData:
                 logger.debug("Cleared all cached quote data")
 
             # Subscribe to quotes - format as per Tradejini requirements
-            symbol_key = f"{token}_{exchange}"
+            # Strip _INDEX suffix: WebSocket expects NSE/BSE, not NSE_INDEX/BSE_INDEX
+            ws_exchange = exchange.replace("_INDEX", "")
+            symbol_key = f"{token}_{ws_exchange}"
             logger.debug(f"Subscribing to quotes for: {symbol_key}")
             subscription_success = self.ws.subscribe_quotes([symbol_key])
 
@@ -348,23 +496,40 @@ class BrokerData:
             logger.debug("Quote subscription sent successfully, waiting for data...")
 
             # Wait for quote data with retries
-            max_retries = 40
+            max_retries = _QUOTE_STEPS
             retry_count = 0
 
             # Possible symbol key formats the data might arrive with
             symbol_keys = [
-                symbol_key,  # token_exchange format
-                f"{token}_NSE",  # Most likely format
-                f"{token}_{exchange}",
+                symbol_key,  # token_ws_exchange format
+                f"{token}_{ws_exchange}",
+                f"{token}_NSE",
+                f"{token}_BSE",
                 str(token),
-                f"{exchange}_{token}",
-                f"NSE_{token}",
+                f"{ws_exchange}_{token}",
             ]
 
             logger.debug(f"Will look for data with these symbol keys: {symbol_keys}")
 
+            def cached_quote():
+                """The quote the step below would find, in the order it looks."""
+                for check_key in symbol_keys:
+                    if check_key in self.ws.L1_dict:
+                        return self.ws.L1_dict[check_key]
+                last = self.ws.last_quote
+                if last is not None and last.get("symbol", "") in symbol_keys:
+                    return last
+                return None
+
+            def complete_quote():
+                with self.ws.lock:
+                    return _l1_complete(cached_quote(), exchange)
+
             while retry_count < max_retries:
-                time.sleep(1.0)
+                # Up to one step, ending as soon as the quote is complete.
+                if _wait_for_feed(complete_quote, _QUOTE_STEP_SECONDS):
+                    with self.ws.lock:
+                        return self._format_quote(cached_quote(), symbol, exchange)
 
                 with self.ws.lock:
                     # Check L1 cache with different key formats
@@ -432,6 +597,12 @@ class BrokerData:
                 "prev_close": 0.0,
                 "volume": 0,
             }
+        finally:
+            # Always close WebSocket after quotes request to prevent FD leaks
+            try:
+                self.ws.close()
+            except Exception:
+                pass
 
     def get_multiquotes(self, symbols: list) -> list:
         """
@@ -469,10 +640,22 @@ class BrokerData:
             else:
                 return self._process_multiquotes_batch(symbols)
 
+        except BrokerBusyError:
+            # Refused by the feed gate before anything was sent (gthread only).
+            # Passed through so the service answers 429 with its sentence; a
+            # 500 here would let an option chain show zero prices as success.
+            raise
         except Exception as e:
             logger.exception("Error fetching multiquotes")
             raise Exception(f"Error fetching multiquotes: {e}")
+        finally:
+            # Always close WebSocket after multiquotes request to prevent FD leaks
+            try:
+                self.ws.close()
+            except Exception:
+                pass
 
+    @_feed_gated()
     def _process_multiquotes_batch(self, symbols: list) -> list:
         """
         Process a batch of symbols using WebSocket subscription
@@ -514,11 +697,18 @@ class BrokerData:
                 continue
 
             # Format as per Tradejini requirements: token_exchange
-            symbol_key = f"{token}_{exchange}"
+            # Strip _INDEX suffix: WebSocket expects NSE/BSE, not NSE_INDEX/BSE_INDEX
+            ws_exchange = exchange.replace("_INDEX", "")
+            symbol_key = f"{token}_{ws_exchange}"
             symbol_keys.append(symbol_key)
 
             # Store mapping for response processing
-            symbol_map[symbol_key] = {"symbol": symbol, "exchange": exchange, "token": token}
+            symbol_map[symbol_key] = {
+                "symbol": symbol,
+                "exchange": exchange,
+                "ws_exchange": ws_exchange,
+                "token": token,
+            }
 
         if not symbol_keys:
             logger.warning("No valid symbols to fetch quotes for")
@@ -541,31 +731,43 @@ class BrokerData:
                 )
             return skipped_symbols + results
 
-        # Step 3: Wait for data to arrive
+        def cached_quote(symbol_key, info):
+            """The L1 quote for one symbol, looked up in the order Step 4 always has."""
+            # Try different key formats that Tradejini WebSocket might use
+            ws_exch = info.get("ws_exchange", info["exchange"].replace("_INDEX", ""))
+            possible_keys = [
+                symbol_key,  # token_ws_exchange (e.g., "1234_NSE")
+                f"{info['token']}_{ws_exch}",
+                f"{ws_exch}_{info['token']}",
+                f"{info['token']}_NSE",
+                f"{info['token']}_BSE",
+                str(info["token"]),  # just token
+            ]
+            for key in possible_keys:
+                if key in self.ws.L1_dict:
+                    return key, self.ws.L1_dict[key]
+            return None, None
+
+        def batch_complete():
+            with self.ws.lock:
+                return all(
+                    _l1_complete(cached_quote(symbol_key, info)[1], info["exchange"])
+                    for symbol_key, info in symbol_map.items()
+                )
+
+        # Step 3: Wait for data to arrive, for up to the same time as before,
+        # ending as soon as every symbol's quote is complete.
         # Dynamic wait time based on number of symbols
         wait_time = min(max(len(symbol_keys) * 0.05, 2), 10)  # Between 2-10 seconds
-        logger.debug(f"Waiting {wait_time:.1f}s for quote data...")
-        time.sleep(wait_time)
+        logger.debug(f"Waiting up to {wait_time:.1f}s for quote data...")
+        _wait_for_feed(batch_complete, wait_time)
 
         # Step 4: Collect results from L1 cache
         with self.ws.lock:
             for symbol_key, info in symbol_map.items():
-                # Try different key formats that Tradejini WebSocket might use
-                possible_keys = [
-                    symbol_key,  # token_exchange (e.g., "1234_NSE")
-                    f"{info['exchange']}_{info['token']}",  # exchange_token (e.g., "NSE_1234")
-                    f"{info['token']}_NSE",  # token_NSE fallback
-                    f"{info['token']}_{info['exchange']}",  # token_exchange format
-                    f"NSE_{info['token']}",  # NSE_token format
-                    str(info["token"]),  # just token
-                ]
-
-                quote_data = None
-                for key in possible_keys:
-                    if key in self.ws.L1_dict:
-                        quote_data = self.ws.L1_dict[key]
-                        logger.debug(f"Found quote data for {info['symbol']} using key: {key}")
-                        break
+                key, quote_data = cached_quote(symbol_key, info)
+                if quote_data:
+                    logger.debug(f"Found quote data for {info['symbol']} using key: {key}")
 
                 if quote_data:
                     results.append(
@@ -600,6 +802,7 @@ class BrokerData:
         )
         return skipped_symbols + results
 
+    @_feed_gated()
     def get_depth(self, symbol: str, exchange: str) -> dict:
         """Get market depth for given symbol"""
         try:
@@ -622,38 +825,33 @@ class BrokerData:
 
             # Subscribe to market depth
             logger.debug(f"Subscribing to depth for {symbol} (token: {token})")
-            success = self.ws.subscribe_depth(symbol, exchange, token)
+            # Strip _INDEX suffix for WebSocket subscription
+            ws_exchange = exchange.replace("_INDEX", "")
+            success = self.ws.subscribe_depth(symbol, ws_exchange, token)
 
             if not success:
                 raise ConnectionError("Failed to send depth subscription")
 
             logger.info("Depth subscription sent successfully, waiting for data...")
 
-            # Wait for depth data
-            max_retries = 20
-            retry_count = 0
-            symbol_key = f"{token}_{exchange}"
+            # Wait for depth data, for up to the same 20 seconds, taking the
+            # first book as soon as it arrives: an L5 packet is a whole book.
+            symbol_key = f"{token}_{ws_exchange}"
 
-            while retry_count < max_retries:
-                time.sleep(1.0)
+            def cached_depth():
+                # Check L5 cache, then last_depth as fallback
+                if symbol_key in self.ws.L5_dict:
+                    return self.ws.L5_dict[symbol_key]
+                return self.ws.last_depth
 
+            def depth_arrived():
                 with self.ws.lock:
-                    # Check L5 cache
-                    if symbol_key in self.ws.L5_dict:
-                        depth_data = self.ws.L5_dict[symbol_key]
-                        logger.debug(f"Found depth data for {symbol}")
-                        return self._format_depth(depth_data, symbol, exchange)
+                    return cached_depth() is not None
 
-                    # Check last_depth as fallback
-                    if self.ws.last_depth is not None:
-                        logger.debug(f"Found depth data in last_depth for {symbol}")
-                        return self._format_depth(self.ws.last_depth, symbol, exchange)
-
-                retry_count += 1
-                if retry_count % 5 == 0:
-                    logger.debug(
-                        f"Still waiting for depth data... (attempt {retry_count}/{max_retries})"
-                    )
+            if _wait_for_feed(depth_arrived, _DEPTH_WAIT_SECONDS):
+                with self.ws.lock:
+                    logger.debug(f"Found depth data for {symbol}")
+                    return self._format_depth(cached_depth(), symbol, exchange)
 
             # Return default depth structure if no data received
             logger.warning(f"No depth data received for {symbol}")
@@ -662,6 +860,12 @@ class BrokerData:
         except Exception as e:
             logger.error(f"Error in get_depth: {str(e)}", exc_info=True)
             return self._get_default_depth()
+        finally:
+            # Always close WebSocket after depth request to prevent FD leaks
+            try:
+                self.ws.close()
+            except Exception:
+                pass
 
     def _format_depth(self, depth_data: dict, symbol: str, exchange: str) -> dict:
         """Format depth data from Tradejini to OpenAlgo standard format"""
@@ -825,15 +1029,17 @@ class BrokerData:
             # Convert to pandas DataFrame
             df = pd.DataFrame(result)
 
-            # Convert timestamps to datetime in IST and create DataFrame
-            if "timestamp" in df.columns and df["timestamp"].max() > 1e12:
-                df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(
+            # Bar times are epoch seconds; tolerate epoch milliseconds too
+            # rather than silently manufacturing a synthetic time axis.
+            if "timestamp" in df.columns:
+                unit = "ms" if df["timestamp"].max() > 1e12 else "s"
+                df["datetime"] = pd.to_datetime(df["timestamp"], unit=unit, utc=True).dt.tz_convert(
                     "Asia/Kolkata"
                 )
             else:
                 # If no timestamp, generate based on interval
                 start_dt = pd.Timestamp(start_ts, unit="s", tz="Asia/Kolkata")
-                freq = interval.replace("m", "T").replace("h", "H").replace("d", "D")
+                freq = interval.replace("m", "min").replace("h", "h").replace("d", "D")
                 df["datetime"] = pd.date_range(start=start_dt, periods=len(df), freq=freq)
 
             # Set datetime as index and sort
@@ -844,10 +1050,15 @@ class BrokerData:
             if "timestamp" in df.columns:
                 df["timestamp"] = df.index.astype("int64") // 10**9
 
-            # Ensure all required columns exist
+            # Ensure all required columns exist. A missing price is NaN, so
+            # _repair_candles drops the bar instead of drawing it at zero.
             for col in ["open", "high", "low", "close", "volume"]:
                 if col not in df.columns:
-                    df[col] = 0.0
+                    df[col] = float("nan")
+
+            df = self._repair_candles(df, exchange, symbol, interval)
+            if df.empty:
+                return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
             # Reset index to include datetime as a column
             df = df.reset_index()
@@ -872,6 +1083,67 @@ class BrokerData:
             logger.error(f"Error in get_history: {str(e)}", exc_info=True)
             return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
+    @staticmethod
+    def _repair_candles(
+        df: pd.DataFrame, exchange: str, symbol: str, interval: str
+    ) -> pd.DataFrame:
+        """Make every candle satisfy low <= open, close <= high with volume >= 0.
+
+        Chart clients validate that invariant and reject the whole series over
+        one bad bar ("History contains an invalid candle"). Tradejini's chart
+        API returns such bars: MCX GOLDPETAL30NOV26FUT 1m at 2026-10-27 09:00,
+        the session's first minute, came back open=14328 with low=14334, so
+        /trading could not load the contract on 1m.
+
+        Same repair as broker/shoonya and broker/kotak: the open and the close
+        are prices that actually traded, so the wick is widened to cover them,
+        and a volume that cannot be true is zeroed rather than costing the bar
+        its prices. Rows missing an OHLC value are dropped: a NaN reaches the
+        client as an invalid candle too, and there is no honest repair.
+        """
+        if df.empty:
+            return df
+
+        ohlc = ["open", "high", "low", "close"]
+        df = df.copy()
+        for col in ohlc + ["volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # +/-inf is as unplaceable as a missing price
+        df[ohlc] = df[ohlc].replace([float("inf"), float("-inf")], float("nan"))
+        usable = df[ohlc].notna().all(axis=1)
+        if not usable.all():
+            logger.warning(
+                f"HISTORY API - Dropping {int((~usable).sum())} candle(s) with missing "
+                f"OHLC for {exchange}:{symbol} {interval}"
+            )
+            df = df[usable]
+            if df.empty:
+                return df
+
+        high = df[ohlc].max(axis=1)
+        low = df[ohlc].min(axis=1)
+        broken = (high != df["high"]) | (low != df["low"])
+        if broken.any():
+            logger.info(
+                f"HISTORY API - Widened {int(broken.sum())} candle(s) whose high/low "
+                f"excluded their own open/close for {exchange}:{symbol} {interval}"
+            )
+            df["high"] = high
+            df["low"] = low
+
+        volume = df["volume"].replace([float("inf"), float("-inf")], float("nan")).fillna(0)
+        negative = volume < 0
+        if negative.any():
+            logger.warning(
+                f"HISTORY API - Zeroing {int(negative.sum())} negative volume(s) for "
+                f"{exchange}:{symbol} {interval}"
+            )
+            volume = volume.mask(negative, 0)
+        df["volume"] = volume
+
+        return df
+
     def _get_historical_data(
         self, symbol: str, exchange: str, interval: str, from_ts: int, to_ts: int
     ) -> tuple[bool, list[dict[str, Any]] | str]:
@@ -883,11 +1155,10 @@ class BrokerData:
             url = f"{base_url}{endpoint}"
 
             # Get API key from environment
-            api_key = os.getenv("BROKER_API_SECRET")
+            api_key = get_api_key()
             if not api_key:
-                error_msg = "BROKER_API_SECRET environment variable not set"
-                logger.error(error_msg)
-                return False, error_msg
+                logger.error(API_KEY_MISSING_ERROR)
+                return False, API_KEY_MISSING_ERROR
 
             # Check if auth_token is available
             if not self.auth_token:
@@ -929,30 +1200,56 @@ class BrokerData:
                 logger.error(f"Failed to parse JSON response: {e}")
                 return False, f"Invalid JSON response: {str(e)}"
 
-            # Check if the response is successful
+            # 'no-data' means the window simply has no candles - not an error
+            if data.get("s") == "no-data":
+                logger.info(f"No chart data for {symbol_id} in the requested window")
+                return True, []
+
+            # Check if the response is successful. Error text is in 'msg'.
             if data.get("s") != "ok":
-                error_msg = f"API Error: Status='{data.get('s')}', Message='{data.get('message', 'No error message')}'"
+                error_msg = (
+                    f"API Error: Status='{data.get('s')}', "
+                    f"Message='{data.get('msg', 'No error message')}'"
+                )
                 logger.error(error_msg)
                 return False, error_msg
 
             # Process the response data
             ohlc_data = []
-            bars = data.get("d", {}).get("bars", [])
+            bars = (data.get("d") or {}).get("bars", []) or []
             logger.debug(f"Processing {len(bars)} bars from response")
 
             for bar in bars:
-                if not isinstance(bar, list) or len(bar) < 5:
-                    logger.warning(f"Skipping invalid bar format: {bar}")
-                    continue
-
                 try:
-                    # Parse the bar data [timestamp, open, high, low, close, volume]
-                    timestamp = int(bar[0])
-                    open_price = float(bar[1])
-                    high = float(bar[2])
-                    low = float(bar[3])
-                    close = float(bar[4])
-                    volume = int(bar[5]) if len(bar) > 5 else 0
+                    # Bars come back either as objects keyed
+                    # time/open/high/low/close/volume, or as positional arrays
+                    # [time, open, high, low, close, volume]. Accept both.
+                    # A missing price stays NaN so _repair_candles drops the
+                    # bar; defaulting it to 0 would draw a wick to zero. A bar
+                    # without a time cannot be placed and is skipped.
+                    if isinstance(bar, dict):
+                        if bar.get("time") is None:
+                            logger.warning(f"Skipping bar without a time: {bar}")
+                            continue
+                        timestamp = int(bar["time"])
+                        open_price = _price(bar.get("open"))
+                        high = _price(bar.get("high"))
+                        low = _price(bar.get("low"))
+                        close = _price(bar.get("close"))
+                        volume = _price(bar.get("volume"))
+                    elif isinstance(bar, (list, tuple)) and len(bar) >= 5:
+                        if bar[0] is None:
+                            logger.warning(f"Skipping bar without a time: {bar}")
+                            continue
+                        timestamp = int(bar[0])
+                        open_price = _price(bar[1])
+                        high = _price(bar[2])
+                        low = _price(bar[3])
+                        close = _price(bar[4])
+                        volume = _price(bar[5]) if len(bar) > 5 else float("nan")
+                    else:
+                        logger.warning(f"Skipping invalid bar format: {bar}")
+                        continue
 
                     ohlc_data.append(
                         {
@@ -965,7 +1262,7 @@ class BrokerData:
                         }
                     )
 
-                except (IndexError, ValueError, TypeError) as e:
+                except (IndexError, KeyError, ValueError, TypeError) as e:
                     logger.warning(f"Error parsing bar data: {bar}, error: {str(e)}")
                     continue
 

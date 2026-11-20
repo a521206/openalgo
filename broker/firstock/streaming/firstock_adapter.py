@@ -1,15 +1,17 @@
 import json
-import logging
 import os
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
 from database.auth_db import get_auth_token
 from database.token_db import get_token
+from utils.logging import get_logger
+from utils import runtime as _runtime
 
 # Load environment variables
 load_dotenv()
@@ -23,20 +25,30 @@ from websocket_proxy.mapping import SymbolMapper
 from .firstock_mapping import FirstockExchangeMapper
 from .firstock_websocket import FirstockWebSocket
 
+_real_threading = _runtime.original("threading")
+
 
 class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
     """Firstock-specific implementation of the WebSocket adapter"""
 
     def __init__(self):
         super().__init__()
-        self.logger = logging.getLogger("firstock_websocket")
+        self.logger = get_logger("firstock_websocket")
         self.ws_client = None
         self.user_id = None
         self.broker_name = "firstock"
         self.running = False
-        self.lock = threading.Lock()
-        # Snapshot management for value retention (similar to Shoonya implementation)
-        self.market_snapshots = {}  # {token: snapshot_data} - retains previous values
+        self.lock = _real_threading.Lock()
+        self._wire_operation_lock = _real_threading.Lock()
+        self.subscription_queue = []
+        self.batch_timer = None
+        self.batch_delay = 0.5
+        # Snapshot management for value retention (similar to Shoonya implementation).
+        # Keyed by scrip ("NFO:65872"), not by the bare token: Firstock tokens are
+        # unique only within an exchange segment and the live master carries
+        # thousands of cross-exchange duplicates (NSE/CDS, BSE_INDEX/NSE, BSE/MCX),
+        # which a token-keyed snapshot merged into one slot - see #1732
+        self.market_snapshots = {}  # {scrip: snapshot_data} - retains previous values
         self.ws_subscription_refs = {}  # Reference counting for WebSocket subscriptions
 
     def initialize(
@@ -60,7 +72,7 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         if not auth_data:
             # Fetch authentication tokens from database
             # IMPORTANT: For Firstock, this must be the 'susertoken' from login API response
-            auth_token = get_auth_token(user_id)
+            auth_token = get_auth_token(user_id, bypass_cache=True)
 
             # Auth token must come from database (after Firstock login)
 
@@ -126,12 +138,16 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     )
 
         # Create FirstockWebSocket instance
-        # Use Firstock-specific user ID if available
+        # Use Firstock-specific user ID if available.
+        # Pass a token_provider so the client can re-read a fresh susertoken
+        # from the DB before each reconnect (Firstock tokens roll over daily
+        # at ~3 AM IST; reusing the construction-time token reconnects dead).
         self.ws_client = FirstockWebSocket(
             user_id=self.firstock_user_id,
             auth_token=self.auth_token,
             max_retry_attempt=5,
             retry_delay=5,
+            token_provider=self._fetch_fresh_auth_token,
         )
 
         # Set callbacks
@@ -142,6 +158,28 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.ws_client.on_message = self._on_message
 
         self.running = True
+
+    def _fetch_fresh_auth_token(self) -> str | None:
+        """Re-read a fresh auth token (susertoken) from the database.
+
+        Used by the WebSocket client to refresh the token before each
+        reconnect so a daily token rollover does not leave the feed dead.
+        Returns None if no user_id or token is available, in which case the
+        client keeps its existing token.
+        """
+        if not self.user_id:
+            return None
+        try:
+            fresh_token = get_auth_token(self.user_id, bypass_cache=True)
+            if not fresh_token:
+                self.logger.warning(
+                    "Could not fetch fresh auth token on reconnect; using existing token"
+                )
+                return None
+            return fresh_token
+        except Exception as e:
+            self.logger.error(f"Error fetching fresh auth token on reconnect: {e}")
+            return None
 
     def connect(self) -> None:
         """Establish connection to Firstock WebSocket"""
@@ -158,6 +196,12 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
     def disconnect(self) -> None:
         """Disconnect from Firstock WebSocket"""
         self.running = False
+
+        with self.lock:
+            if self.batch_timer:
+                self.batch_timer.cancel()
+                self.batch_timer = None
+            self.subscription_queue.clear()
 
         if self.ws_client:
             self.ws_client.close_connection()
@@ -203,8 +247,6 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         # Generate a unique correlation_id for each subscription
         # This allows multiple clients to subscribe to the same symbol
-        import uuid
-
         unique_id = str(uuid.uuid4())[:8]
         correlation_id = f"{symbol}_{exchange}_{mode}_{unique_id}"
 
@@ -236,18 +278,14 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Subscribe via WebSocket (reference counting will handle duplicates)
         if self.ws_client and self.ws_client.is_connected():
             # Check if we need to send WebSocket subscription
-            if self._should_ws_subscribe(subscription_token, mode):
-                try:
-                    # Create token list for Firstock WebSocket client
-                    token_list = [{"exchangeType": brexchange, "tokens": [token]}]
-
-                    self.ws_client.subscribe(correlation_id, mode, token_list)
-                    self.logger.info(
-                        f"[SUBSCRIBE] WebSocket subscription sent for {subscription_token}"
-                    )
-                except Exception as e:
-                    self.logger.error(f"Error subscribing to {symbol}.{exchange}: {e}")
-                    return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
+            with self.lock:
+                should_subscribe = self._should_ws_subscribe(subscription_token, mode)
+                if should_subscribe:
+                    self._queue_ws_subscription_locked(brexchange, token)
+            if should_subscribe:
+                self.logger.info(
+                    f"[SUBSCRIBE] Queued WebSocket subscription for {subscription_token}"
+                )
             else:
                 self.logger.info(
                     f"[SUBSCRIBE] WebSocket already has active subscription for {subscription_token}"
@@ -297,6 +335,7 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Find base correlation ID pattern
         base_correlation_id = f"{symbol}_{exchange}_{mode}"
 
+        unsubscribe_ws = False
         with self.lock:
             # Find the first matching subscription for this client
             matching_subscriptions = [
@@ -313,24 +352,32 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # Remove the first matching subscription
             correlation_id, subscription = matching_subscriptions[0]
 
-            # Check if this is the last subscription for this symbol/exchange/mode
-            is_last = len(matching_subscriptions) == 1
-
             # Remove the subscription
             del self.subscriptions[correlation_id]
 
-            # Only unsubscribe from WebSocket if this was the last subscription
-            if is_last and self._should_ws_unsubscribe(subscription_token, mode):
-                # Unsubscribe if connected
-                if self.ws_client and self.ws_client.is_connected():
-                    try:
-                        # Create token list for Firstock WebSocket client
-                        token_list = [{"exchangeType": brexchange, "tokens": [token]}]
+            # Drop the retained snapshot once nothing is subscribed to this scrip.
+            # Keyed on scrip, not token: a token still subscribed on another
+            # exchange segment must keep its own snapshot slot intact (#1732)
+            if not any(
+                sub["subscription_token"] == subscription_token
+                for sub in self.subscriptions.values()
+            ):
+                self.market_snapshots.pop(subscription_token, None)
 
-                        self.ws_client.unsubscribe(correlation_id, mode, token_list)
-                        self.logger.info(f"WebSocket unsubscribed from {symbol}.{exchange}")
-                    except Exception as e:
-                        self.logger.error(f"Error unsubscribing from {symbol}.{exchange}: {e}")
+            # Only unsubscribe from WebSocket if this was the last subscription
+            if self._should_ws_unsubscribe(subscription_token, mode):
+                queued = self._remove_queued_ws_subscription_locked(subscription_token)
+                unsubscribe_ws = not queued
+
+        # Only send an unsubscribe if the subscribe already left the batch queue.
+        if unsubscribe_ws and self.ws_client and self.ws_client.is_connected():
+            try:
+                token_list = [{"exchangeType": brexchange, "tokens": [token]}]
+                with self._wire_operation_lock:
+                    self.ws_client.unsubscribe(correlation_id, mode, token_list)
+                self.logger.info(f"WebSocket unsubscribed from {symbol}.{exchange}")
+            except Exception as e:
+                self.logger.error(f"Error unsubscribing from {symbol}.{exchange}: {e}")
 
         return self._create_success_response(
             f"Unsubscribed from {symbol}.{exchange}", symbol=symbol, exchange=exchange, mode=mode
@@ -344,17 +391,105 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Resubscribe to existing subscriptions if reconnecting
         self._resubscribe_all()
 
+    def _queue_ws_subscription_locked(self, brexchange: str, token: str) -> None:
+        subscription_token = f"{brexchange}:{token}"
+        if not any(
+            item["subscription_token"] == subscription_token
+            for item in self.subscription_queue
+        ):
+            self.subscription_queue.append(
+                {
+                    "brexchange": brexchange,
+                    "token": token,
+                    "subscription_token": subscription_token,
+                }
+            )
+
+        if self.batch_timer is None:
+            self.batch_timer = _real_threading.Timer(
+                self.batch_delay, self._process_subscription_batch
+            )
+            self.batch_timer.daemon = True
+            self.batch_timer.start()
+
+    def _remove_queued_ws_subscription_locked(self, subscription_token: str) -> bool:
+        queued_before = len(self.subscription_queue)
+        self.subscription_queue = [
+            item
+            for item in self.subscription_queue
+            if item["subscription_token"] != subscription_token
+        ]
+        removed = len(self.subscription_queue) < queued_before
+        if not self.subscription_queue and self.batch_timer:
+            self.batch_timer.cancel()
+            self.batch_timer = None
+        return removed
+
+    def _process_subscription_batch(self) -> None:
+        with self.lock:
+            self.batch_timer = None
+            if not self.subscription_queue:
+                return
+
+            ws_client = self.ws_client
+            if (
+                not ws_client
+                or not ws_client.is_connected()
+                or not getattr(ws_client, "is_running", True)
+            ):
+                return
+            if not getattr(ws_client, "authenticated", True):
+                self._queue_ws_subscription_locked(
+                    self.subscription_queue[0]["brexchange"],
+                    self.subscription_queue[0]["token"],
+                )
+                return
+
+            queued = self.subscription_queue
+            self.subscription_queue = []
+
+        try:
+            with self._wire_operation_lock:
+                with self.lock:
+                    queued = [
+                        item
+                        for item in queued
+                        if any(
+                            self.ws_subscription_refs.get(item["subscription_token"], {}).values()
+                        )
+                    ]
+                if not queued:
+                    return
+                token_list = []
+                exchange_tokens = {}
+                for item in queued:
+                    exchange_tokens.setdefault(item["brexchange"], []).append(item["token"])
+                for exchange_type, tokens in exchange_tokens.items():
+                    token_list.append({"exchangeType": exchange_type, "tokens": tokens})
+                ws_client.subscribe(f"batch_{uuid.uuid4().hex}", 2, token_list)
+            self.logger.info(
+                f"Batch subscribed {sum(len(tokens) for tokens in exchange_tokens.values())} Firstock tokens"
+            )
+        except Exception as e:
+            with self.lock:
+                for item in queued:
+                    if self.ws_subscription_refs.get(item["subscription_token"]):
+                        self._queue_ws_subscription_locked(
+                            item["brexchange"], item["token"]
+                        )
+            self.logger.error(f"Firstock batch subscription failed: {e}")
+
     def _resubscribe_all(self) -> None:
         """Resubscribe to all existing subscriptions after reconnection"""
         with self.lock:
             # Reset reference counts
             self.ws_subscription_refs = {}
 
-            # Group subscriptions by unique token and mode
+            # Group client subscriptions by token while preserving per-mode refs.
             unique_subscriptions = {}
 
             for correlation_id, sub in self.subscriptions.items():
-                subscription_key = f"{sub['subscription_token']}_{sub['mode']}"
+                subscription_key = sub["subscription_token"]
 
                 if subscription_key not in unique_subscriptions:
                     unique_subscriptions[subscription_key] = {
@@ -376,24 +511,9 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self.ws_subscription_refs[sub["subscription_token"]][mode_key] = 0
                 self.ws_subscription_refs[sub["subscription_token"]][mode_key] += 1
 
-            # Resubscribe unique subscriptions
-            for sub_key, sub_info in unique_subscriptions.items():
-                try:
-                    # Create token list for resubscription
-                    token_list = [
-                        {"exchangeType": sub_info["brexchange"], "tokens": [sub_info["token"]]}
-                    ]
-
-                    # Use any correlation_id for WebSocket subscription
-                    temp_correlation_id = f"resubscribe_{sub_key}"
-                    self.ws_client.subscribe(temp_correlation_id, sub_info["mode"], token_list)
-                    self.logger.info(
-                        f"Resubscribed to {sub_info['subscription_token']} with {sub_info['count']} client subscriptions"
-                    )
-                except Exception as e:
-                    self.logger.error(
-                        f"Error resubscribing to {sub_info['subscription_token']}: {e}"
-                    )
+            # Queue unique tokens together; _on_open runs before Firstock auth completes.
+            for sub_info in unique_subscriptions.values():
+                self._queue_ws_subscription_locked(sub_info["brexchange"], sub_info["token"])
 
     def _should_ws_subscribe(self, subscription_token: str, mode: int) -> bool:
         """
@@ -406,20 +526,15 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         Returns:
             bool: True if we need to subscribe, False if already subscribed
         """
-        if subscription_token not in self.ws_subscription_refs:
-            self.ws_subscription_refs[subscription_token] = {}
-
+        refs = self.ws_subscription_refs.setdefault(subscription_token, {})
         mode_key = f"mode_{mode}"
-
-        if mode_key not in self.ws_subscription_refs[subscription_token]:
-            self.ws_subscription_refs[subscription_token][mode_key] = 1
-            return True
-        else:
-            self.ws_subscription_refs[subscription_token][mode_key] += 1
+        first_wire_subscription = not refs
+        refs[mode_key] = refs.get(mode_key, 0) + 1
+        if not first_wire_subscription:
             self.logger.info(
-                f"Additional subscription for {subscription_token} mode {mode}, count: {self.ws_subscription_refs[subscription_token][mode_key]}"
+                f"Additional subscription for {subscription_token} mode {mode}, count: {refs[mode_key]}"
             )
-            return False
+        return first_wire_subscription
 
     def _should_ws_unsubscribe(self, subscription_token: str, mode: int) -> bool:
         """
@@ -432,25 +547,19 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         Returns:
             bool: True if we should unsubscribe, False if other clients still subscribed
         """
-        if subscription_token not in self.ws_subscription_refs:
+        refs = self.ws_subscription_refs.get(subscription_token)
+        if not refs:
             return True
-
         mode_key = f"mode_{mode}"
+        if mode_key in refs:
+            refs[mode_key] -= 1
+            if refs[mode_key] <= 0:
+                del refs[mode_key]
 
-        if mode_key in self.ws_subscription_refs[subscription_token]:
-            self.ws_subscription_refs[subscription_token][mode_key] -= 1
-
-            if self.ws_subscription_refs[subscription_token][mode_key] <= 0:
-                # Remove mode key if count is 0
-                del self.ws_subscription_refs[subscription_token][mode_key]
-
-                # Clean up token entry if no modes left
-                if not self.ws_subscription_refs[subscription_token]:
-                    del self.ws_subscription_refs[subscription_token]
-
-                return True
+        if refs:
             return False
 
+        self.ws_subscription_refs.pop(subscription_token, None)
         return True
 
     def _on_error(self, ws, error) -> None:
@@ -469,7 +578,9 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
     def _on_data(self, ws, data) -> None:
         """Callback for data messages from the WebSocket"""
         try:
-            self.logger.info(f"Received data from Firstock WebSocket: {data}")
+            # Per-tick — keep at debug; the live feed would otherwise dump
+            # every tick's full payload at info, drowning the log.
+            self.logger.debug(f"Received data from Firstock WebSocket: {data}")
 
             # Handle market data
             if isinstance(data, dict) and "c_symbol" in data:
@@ -486,13 +597,19 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         except Exception as e:
             self.logger.error(f"Error processing data: {e}", exc_info=True)
 
-    def _update_market_snapshot(self, token: str, data: dict[str, Any]) -> dict[str, Any]:
+    def _update_market_snapshot(self, scrip: str, data: dict[str, Any]) -> dict[str, Any]:
         """
         Update market snapshot for value retention.
         Only updates non-zero/non-invalid values to retain previous valid data.
+
+        Keyed by scrip (``"NFO:65872"``), never by the bare token: Firstock tokens
+        are unique only within an exchange segment, and the live master carries
+        thousands of cross-exchange duplicates (NSE/CDS, BSE_INDEX/NSE, BSE/MCX).
+        A token-keyed snapshot merged two different instruments into one slot, so
+        one symbol's retained values bled into the other's feed (#1732).
         """
         # Get existing snapshot or create empty one
-        snapshot = self.market_snapshots.get(token, {})
+        snapshot = self.market_snapshots.get(scrip, {})
 
         # Fields to merge (only if not invalid/zero)
         merge_fields = [
@@ -569,7 +686,7 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
             new_sell_depth = self._filter_depth_data(data.get("best_sell", []))
 
             self.logger.debug(
-                f"Token {token} depth analysis - buy entries: {len(new_buy_depth)}, sell entries: {len(new_sell_depth)}"
+                f"Scrip {scrip} depth analysis - buy entries: {len(new_buy_depth)}, sell entries: {len(new_sell_depth)}"
             )
 
             # Only update depth if we have valid new data, otherwise retain previous snapshot
@@ -577,33 +694,33 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 snapshot["best_buy"] = new_buy_depth
                 updated_fields.append("best_buy")
                 self.logger.debug(
-                    f"Token {token} updated buy depth with {len(new_buy_depth)} valid entries"
+                    f"Scrip {scrip} updated buy depth with {len(new_buy_depth)} valid entries"
                 )
             elif "best_buy" not in snapshot:  # No previous data, initialize empty
                 snapshot["best_buy"] = []
             else:
                 self.logger.debug(
-                    f"Token {token} retaining previous buy depth ({len(snapshot.get('best_buy', []))} entries)"
+                    f"Scrip {scrip} retaining previous buy depth ({len(snapshot.get('best_buy', []))} entries)"
                 )
 
             if new_sell_depth:  # Has valid sell data
                 snapshot["best_sell"] = new_sell_depth
                 updated_fields.append("best_sell")
                 self.logger.debug(
-                    f"Token {token} updated sell depth with {len(new_sell_depth)} valid entries"
+                    f"Scrip {scrip} updated sell depth with {len(new_sell_depth)} valid entries"
                 )
             elif "best_sell" not in snapshot:  # No previous data, initialize empty
                 snapshot["best_sell"] = []
             else:
                 self.logger.debug(
-                    f"Token {token} retaining previous sell depth ({len(snapshot.get('best_sell', []))} entries)"
+                    f"Scrip {scrip} retaining previous sell depth ({len(snapshot.get('best_sell', []))} entries)"
                 )
 
         # Update stored snapshot
-        self.market_snapshots[token] = snapshot
+        self.market_snapshots[scrip] = snapshot
 
         if updated_fields:
-            self.logger.debug(f"Updated snapshot fields for token {token}: {updated_fields}")
+            self.logger.debug(f"Updated snapshot fields for scrip {scrip}: {updated_fields}")
 
         return snapshot
 
@@ -652,8 +769,12 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.logger.debug(f"Available subscriptions: {list(self.subscriptions.keys())}")
                 return
 
-            # Update snapshot with current data (retains previous values for invalid/zero fields)
-            processed_data = self._update_market_snapshot(token, data)
+            # Update snapshot with current data (retains previous values for
+            # invalid/zero fields). Keyed on the full scrip so a token shared
+            # across exchange segments does not merge two instruments (#1732)
+            processed_data = self._update_market_snapshot(
+                matching_subscriptions[0]["subscription_token"], data
+            )
 
             # Publish data for each subscribed mode
             for subscription in matching_subscriptions:
@@ -678,7 +799,11 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     }
                 )
 
-                self.logger.info(
+                # Per-tick publish — keep at debug to avoid per-message
+                # spam. The ZMQ publish itself is the real event; for
+                # debugging payloads, raise log level via the logging
+                # config rather than leaving this at info permanently.
+                self.logger.debug(
                     f"Publishing {mode_str} data for {symbol}.{exchange}: {market_data}"
                 )
 

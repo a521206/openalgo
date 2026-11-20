@@ -1,7 +1,11 @@
 import {
   BarChart3,
   Bell,
+  BellRing,
   BookOpen,
+  Bot,
+  Boxes,
+  CandlestickChart,
   ClipboardList,
   Code2,
   Database,
@@ -9,36 +13,44 @@ import {
   FileStack,
   FileText,
   FlaskConical,
+  Gauge,
   Key,
   Layers,
   LayoutDashboard,
   type LucideIcon,
-  MessageSquare,
   Search,
   Settings,
   TrendingUp,
   User,
   Workflow,
   Wrench,
+  Zap,
 } from 'lucide-react'
 
 export interface NavItem {
   href: string
   label: string
   icon: LucideIcon
+  /** Served by Flask (not a React route): render as a full-page link. */
+  external?: boolean
+  /**
+   * Desktop navbar only: below this Tailwind breakpoint the item leaves the
+   * bar and is listed under More instead. Items without it always stay.
+   */
+  collapseBelow?: 'lg' | 'xl'
 }
 
 // Main navigation items shown in desktop navbar
 export const navItems: NavItem[] = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/orderbook', label: 'Orderbook', icon: ClipboardList },
-  { href: '/tradebook', label: 'Tradebook', icon: FileText },
+  { href: '/tradebook', label: 'Tradebook', icon: FileText, collapseBelow: 'lg' },
   { href: '/positions', label: 'Positions', icon: TrendingUp },
-  { href: '/action-center', label: 'Action Center', icon: Bell },
-  { href: '/platforms', label: 'Platforms', icon: Layers },
-  { href: '/strategy', label: 'Strategy', icon: Code2 },
-  { href: '/logs', label: 'Logs', icon: FileBarChart },
-  { href: '/tools', label: 'Tools', icon: Wrench },
+  { href: '/trading', label: 'Trading', icon: CandlestickChart, collapseBelow: 'lg' },
+  { href: '/platforms', label: 'Platforms', icon: Layers, collapseBelow: 'xl' },
+  { href: '/strategy', label: 'Strategies', icon: Boxes, collapseBelow: 'xl' },
+  { href: '/logs', label: 'Logs', icon: FileBarChart, collapseBelow: 'xl' },
+  { href: '/tools', label: 'Tools', icon: Wrench, collapseBelow: 'xl' },
 ]
 
 // Items shown in mobile bottom navigation
@@ -47,7 +59,6 @@ export const bottomNavItems: NavItem[] = [
   { href: '/orderbook', label: 'Orderbook', icon: ClipboardList },
   { href: '/tradebook', label: 'Tradebook', icon: FileText },
   { href: '/positions', label: 'Positions', icon: TrendingUp },
-  { href: '/strategy', label: 'Strategy', icon: Code2 },
 ]
 
 // Paths in bottom nav (for filtering mobile sheet items)
@@ -60,15 +71,28 @@ export const mobileSheetItems = navItems.filter((item) => !bottomNavPaths.includ
 export const profileMenuItems: NavItem[] = [
   { href: '/profile', label: 'Profile', icon: User },
   { href: '/apikey', label: 'API Key', icon: Key },
+  // Action Center stays immediately after API Key. It was moved here out of the
+  // main navbar on that understanding and a test pins the adjacency, so a new
+  // entry goes after it rather than between the two.
+  { href: '/action-center', label: 'Action Center', icon: Bell },
+  // Agent Config is NOT here. It lives under /admin with the other
+  // configuration surfaces. The chat header carries its own settings control,
+  // so a configured /agent still has a route back to its settings without this
+  // menu holding one.
+  { href: '/agent', label: 'Agent', icon: Bot },
   { href: '/master-contract', label: 'Master Contract', icon: FileStack },
-  { href: '/telegram', label: 'Telegram Bot', icon: MessageSquare },
+  // One entry for every alert channel. /alerts links to the Telegram,
+  // WhatsApp, Slack and Discord pages, so none needs an entry of its own.
+  { href: '/alerts', label: 'Alerts', icon: BellRing },
   { href: '/holdings', label: 'Holdings', icon: ClipboardList },
   { href: '/flow', label: 'Flow Editor', icon: Workflow },
+  { href: '/scalping', label: 'Scalping', icon: Zap },
   { href: '/python', label: 'Python Strategies', icon: Code2 },
   { href: '/pnl-tracker', label: 'PnL Tracker', icon: BarChart3 },
   { href: '/historify', label: 'Historify', icon: Database },
   { href: '/search/token', label: 'Search', icon: Search },
   { href: '/sandbox', label: 'Sandbox', icon: FlaskConical },
+  { href: '/leverage', label: 'Leverage', icon: Gauge },
   { href: '/admin', label: 'Admin', icon: Settings },
 ]
 
@@ -77,11 +101,8 @@ export const externalLinks = {
   docs: { href: 'https://docs.openalgo.in', label: 'Docs', icon: BookOpen },
 }
 
-// Shared utility to check if a route is active
-// Uses startsWith for routes with nested pages (like /strategy/*)
+// Shared utility to check if a route is active.
+// Every nav item is a leaf route, so an exact match is all that is needed.
 export function isActiveRoute(pathname: string, href: string): boolean {
-  if (href === '/strategy') {
-    return pathname.startsWith('/strategy')
-  }
   return pathname === href
 }

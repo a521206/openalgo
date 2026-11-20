@@ -69,7 +69,7 @@ The PnL (Profit & Loss) Tracker provides real-time intraday P&L monitoring by co
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                              │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  P&L Chart (LightWeight Charts)                                     │   │
+│  │  P&L Chart (openalgo-charts)                                        │   │
 │  │                                                                      │   │
 │  │       ₹                                                              │   │
 │  │    4000│        ╭──────╮                                            │   │
@@ -284,14 +284,12 @@ The PnL tracker relies on these services (no dedicated database):
 The React frontend:
 - Polls `/pnltracker/api/pnl` periodically
 - Renders metrics cards (current MTM, max, min, drawdown)
-- Uses LightWeight Charts for interactive P&L visualization
-- Shows separate drawdown chart below main chart
+- Draws the P&L curve with openalgo-charts, the engine the /trading terminal uses
+- Shows the drawdown in its own pane below the P&L curve, on the same time axis
 
-### Legacy Jinja Template
+### Legacy Compatibility Route
 
-**Location:** `templates/pnltracker.html`
-
-Available at `/pnltracker/legacy` for backwards compatibility.
+`/pnltracker/legacy` is still registered, but the referenced `templates/pnltracker.html` file is absent from the current tree. Treat this route as unavailable until the route is removed or a template is restored. The supported UI is the React `/pnltracker` page.
 
 ## Edge Cases Handled
 
@@ -342,4 +340,3 @@ max_drawdown = portfolio_pnl["Drawdown"].min()
 | `services/positionbook_service.py` | Fetches current positions |
 | `services/history_service.py` | Fetches historical price data |
 | `frontend/src/pages/PnLTracker.tsx` | React UI component |
-| `templates/pnltracker.html` | Legacy Jinja template |

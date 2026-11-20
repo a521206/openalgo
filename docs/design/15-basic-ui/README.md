@@ -1,314 +1,74 @@
-# 15 - Basic UI Elements
-
-## Overview
-
-OpenAlgo provides core trading UI components including Dashboard, OrderBook, TradeBook, Positions, and Holdings, along with advanced analytics tools (GEX Dashboard, IV Smile, OI Profile, Volatility Surface, etc.). These components display real-time data with auto-refresh via the React frontend.
-
-## Architecture Diagram
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                        Basic UI Components                                    │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Dashboard                                           │
-│                          /dashboard                                          │
-│                                                                              │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
-│  │   Funds     │  │  Positions  │  │   P&L       │  │   Orders    │        │
-│  │   Summary   │  │   Count     │  │   Summary   │  │   Pending   │        │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘        │
-│                                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Quick Actions: Place Order | View Positions | API Key              │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          OrderBook                                           │
-│                          /orderbook                                          │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐ │
-│  │ Order ID | Symbol | Exchange | Action | Qty | Price | Status | Time   │ │
-│  ├───────────────────────────────────────────────────────────────────────┤ │
-│  │ 123456   | SBIN   | NSE      | BUY    | 100 | MKT   | Complete| 09:30 │ │
-│  │ 123457   | INFY   | NSE      | SELL   | 50  | 1650  | Pending | 10:15 │ │
-│  └───────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  Actions: Cancel Order | Modify Order | Refresh                            │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          TradeBook                                           │
-│                          /tradebook                                          │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐ │
-│  │ Trade ID | Symbol | Exchange | Action | Qty | Price | Time            │ │
-│  ├───────────────────────────────────────────────────────────────────────┤ │
-│  │ T001     | SBIN   | NSE      | BUY    | 100 | 625.50| 09:30:15       │ │
-│  │ T002     | SBIN   | NSE      | SELL   | 100 | 627.25| 14:45:30       │ │
-│  └───────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  Summary: Total Trades | Buy Value | Sell Value | Net P&L                  │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Positions                                           │
-│                          /positions                                          │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐ │
-│  │ Symbol | Exchange | Product | Qty | Avg Price | LTP | P&L | P&L%     │ │
-│  ├───────────────────────────────────────────────────────────────────────┤ │
-│  │ SBIN   | NSE      | MIS     | 100 | 625.50    | 627 | +150 | +0.24%  │ │
-│  │ INFY   | NSE      | MIS     | -50 | 1655.00   | 1650| +250 | +0.30%  │ │
-│  └───────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  Actions: Close Position | Close All | Refresh                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Holdings                                            │
-│                          /holdings                                           │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐ │
-│  │ Symbol | Exchange | Qty | Avg Price | LTP | Current Value | P&L      │ │
-│  ├───────────────────────────────────────────────────────────────────────┤ │
-│  │ SBIN   | NSE      | 500 | 580.00    | 625 | 312,500 | +22,500       │ │
-│  │ INFY   | NSE      | 100 | 1500.00   | 1650| 165,000 | +15,000       │ │
-│  └───────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  Summary: Total Investment | Current Value | Overall P&L                   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-## Data Sources
-
-### API Endpoints
-
-| Component | API Endpoint | Method |
-|-----------|--------------|--------|
-| Dashboard | Multiple | GET |
-| OrderBook | `/api/v1/orderbook` | POST |
-| TradeBook | `/api/v1/tradebook` | POST |
-| Positions | `/api/v1/positions` | POST |
-| Holdings | `/api/v1/holdings` | POST |
-| Funds | `/api/v1/funds` | POST |
-
-### Real-Time Updates
-
-Socket.IO events for live updates:
-
-| Event | Description |
-|-------|-------------|
-| `order_update` | Order status change |
-| `trade_update` | New trade executed |
-| `position_update` | Position change |
-| `pnl_update` | P&L refresh |
-
-## Component Details
-
-### Dashboard
-
-**Route:** `/dashboard`
-
-Features:
-- Account summary (funds, margin)
-- Open positions count
-- Today's P&L
-- Pending orders count
-- Quick action buttons
-
-### OrderBook
-
-**Route:** `/orderbook`
-
-Columns:
-- Order ID
-- Symbol
-- Exchange
-- Action (BUY/SELL)
-- Quantity
-- Price / Price Type
-- Status (pending/complete/cancelled/rejected)
-- Timestamp
-
-Actions:
-- Cancel pending order
-- Modify order (qty, price)
-- Filter by status
-
-### TradeBook
-
-**Route:** `/tradebook`
-
-Columns:
-- Trade ID
-- Order ID (linked)
-- Symbol
-- Exchange
-- Action
-- Quantity
-- Execution Price
-- Timestamp
-
-Summary:
-- Total trades count
-- Buy/Sell breakdown
-- Turnover
-
-### Positions
-
-**Route:** `/positions`
-
-Columns:
-- Symbol
-- Exchange
-- Product (MIS/CNC/NRML)
-- Quantity (+ve long, -ve short)
-- Average Price
-- LTP (Last Traded Price)
-- P&L (absolute)
-- P&L % (percentage)
-
-Actions:
-- Close individual position
-- Close all positions
-- Add to position
-
-### Holdings
-
-**Route:** `/holdings`
-
-Columns:
-- Symbol
-- Exchange
-- Quantity
-- Average Cost
-- Current Price
-- Current Value
-- Day's P&L
-- Overall P&L
-
-Features:
-- T1 holdings (unsettled)
-- Pledged quantities
-- Portfolio value
-
-## React Components
-
-### File Structure
-
-```
-frontend/src/
-├── pages/
-│   ├── Dashboard.tsx
-│   ├── OrderBook.tsx
-│   ├── TradeBook.tsx
-│   ├── Positions.tsx
-│   └── Holdings.tsx
-├── components/
-│   ├── DataTable.tsx       # Reusable table
-│   ├── PnLBadge.tsx        # P&L display
-│   ├── StatusBadge.tsx     # Order status
-│   └── ActionButton.tsx    # Quick actions
-└── hooks/
-    ├── useOrders.ts
-    ├── useTrades.ts
-    ├── usePositions.ts
-    └── useHoldings.ts
-```
-
-### TanStack Query Usage
-
-```typescript
-// hooks/usePositions.ts
-export function usePositions() {
-  return useQuery({
-    queryKey: ['positions'],
-    queryFn: () => api.getPositions(),
-    refetchInterval: 5000,  // Auto-refresh every 5 seconds
-  });
-}
-```
-
-## Analytics Tools
-
-OpenAlgo includes a suite of options analytics tools accessible from the **Tools** hub page (`/tools`). These tools use Plotly.js for interactive charting and visualization.
-
-### Tools Hub (`/tools`)
-
-Central navigation page listing all available analytical tools with descriptions.
-
-### GEX Dashboard (`/gex`)
-
-Gamma Exposure (GEX) analysis showing the net gamma exposure across strike prices. Helps identify key support/resistance levels driven by options market makers.
-
-- **Blueprint:** `blueprints/gex.py`
-- **Service:** `services/gex_service.py`
-- **API:** `frontend/src/api/gex.ts`
-
-### IV Smile (`/ivsmile`)
-
-Implied Volatility Smile chart showing IV across different strike prices for a given expiry. Visualizes the volatility skew pattern.
-
-- **Blueprint:** `blueprints/ivsmile.py`
-- **Service:** `services/iv_smile_service.py`
-
-### IV Chart (`/ivchart`)
-
-IV time series chart tracking implied volatility changes over time for specific options contracts.
-
-- **Blueprint:** `blueprints/ivchart.py`
-- **Service:** `services/iv_chart_service.py`
-
-### OI Profile (`/oiprofile`)
-
-Open Interest profile analysis showing OI distribution across strike prices. Identifies where maximum OI is concentrated.
-
-- **Blueprint:** `blueprints/oiprofile.py`
-- **Service:** `services/oi_profile_service.py`
-
-### OI Tracker (`/oitracker`)
-
-Real-time OI change tracker monitoring changes in open interest across strikes. Useful for tracking smart money positioning.
-
-- **Blueprint:** `blueprints/oitracker.py`
-- **Service:** `services/oi_tracker_service.py`
-
-### Max Pain (`/maxpain`)
-
-Max Pain analysis calculating the strike price at which the maximum number of options contracts would expire worthless.
-
-- **Blueprint:** (shared with option chain infrastructure)
-- **Service:** Option chain data with max pain calculation
-
-### ATM Straddle Chart (`/straddle`)
-
-Dynamic ATM Straddle chart showing combined premium of at-the-money call and put options over time.
-
-- **Blueprint:** `blueprints/straddle_chart.py`
-- **Service:** `services/straddle_chart_service.py`
-
-### 3D Volatility Surface (`/volsurface`)
-
-Interactive 3D visualization of implied volatility across strike prices and expiry dates, rendered with Plotly.
-
-- **Blueprint:** `blueprints/vol_surface.py`
-- **Service:** `services/vol_surface_service.py`
-
-## Key Files Reference
+# 15 - React UI And Analytics Surfaces
+
+## Application Shell
+
+`frontend/src/App.tsx` defines public, authenticated, standard-layout, and full-width routes. `frontend/src/components/layout/Layout.tsx` owns the standard navigation shell; `FullWidthLayout.tsx` is used for dense workspaces. `frontend/src/config/navigation.ts` determines visible navigation groups.
+
+## Operational Pages
+
+| Area | Routes/pages |
+|---|---|
+| Account | Dashboard, OrderBook, TradeBook, Positions, Holdings |
+| Automation | Strategy, Chartink, Python Strategy Host, Flow |
+| Execution | Action Center, Analyzer, Sandbox, Scalping |
+| Monitoring | PnL Tracker, Latency, Traffic, Health, Security, Logs |
+| Configuration | API key, broker credentials, admin, Telegram, WhatsApp |
+| Data | Search, Historify, Download, Master Contract |
+
+Account pages combine TanStack Query with Socket.IO-triggered refreshes. The active broker capability store controls exchange/feature options; app mode comes from the backend analyzer setting.
+
+## Analytics And Trading Tools
+
+The `/tools` page and home page derive the current 20-tool list from `frontend/src/lib/tools.ts`. Routed analytics surfaces include:
+
+| Route | Purpose | Backend source |
+|---|---|---|
+| `/strategybuilder` | Multi-leg payoff, Greeks, P&L, strategy chart, OI | Multiple strategy services |
+| `/optionchain` | Live option chain and quick execution | `option_chain_service.py` |
+| `/ivchart` | Historical IV/Greeks charts | `iv_chart_service.py` |
+| `/ivsmile` | Call/put IV smile and skew | `iv_smile_service.py` |
+| `/volsurface` | 3D volatility surface | `vol_surface_service.py` |
+| `/strikeprofile` | GEX/DEX grid across strikes and expiries | `strike_profile_service.py` |
+| `/sector-rotation` | Relative rotation map against a benchmark | `sector_rotation_service.py` |
+| `/portfolio-backtester` | Weighted portfolio backtest and tearsheet | `portfolio/`, REST portfolio API |
+| `/sip-backtester` | Periodic-investment simulation | REST SIP API |
+| `/portfolio-analyzer` | Holdings concentration, co-movement and resilience | REST portfolio API |
+| `/gex` | Gamma exposure by strike | `gex_service.py` |
+| `/gammadensity` | Gamma-times-OI and convexity zones | `gamma_density_service.py` |
+| `/oitracker` | OI bars and PCR | `oi_tracker_service.py` |
+| `/oirange` | Client-side strike-range OI view | Option-chain API |
+| `/oiprofile` | Candles plus OI profile | `oi_profile_service.py` |
+| `/maxpain` | Max-pain distribution | OI tracker max-pain route |
+| `/straddle` | ATM straddle chart | `straddle_chart_service.py` |
+| `/customstraddle` | Custom multi-leg straddle chart | `custom_straddle_service.py` |
+| `/arbitrage` | Futures calendar-spread scanner | `arbitrage_service.py` |
+| `/scalping` | Keyboard execution and server-side stop risk | `scalping.py`, risk monitor |
+
+The registry controls tool discovery; `frontend/src/App.tsx` and backend route decorators control supported routes. The Strategy Module at `/strategy` and the tools Strategy Builder at `/strategybuilder` are separate surfaces.
+
+## Live Data
+
+Tools use the shared `MarketDataManager` through hooks rather than opening ad hoc browser feeds. Continuous option-chain or price views merge initial REST snapshots with WebSocket ticks. Pages use visibility controls and stale-data fallbacks to avoid unnecessary broker traffic.
+
+## Shared Components
+
+- `components/trading/`: order dialog, market depth, quote header, GTT and basket execution.
+- `components/strategy-builder/`: leg editor, payoff, Greeks, P&L, strategy charts, portfolio save.
+- `components/option-chain/`: column configuration and bar settings.
+- `components/scalping/`: chart and stop-loss dialog.
+- `components/ui/`: local Radix/shadcn-style primitives.
+
+## Error And Loading Behavior
+
+TanStack Query owns request states. Route modules are lazy-loaded, `ErrorBoundary.tsx` handles render failures, `PageLoader` covers route loading, and Sonner-based helpers in `frontend/src/utils/toast.ts` expose categorized user feedback.
+
+## Key Files
 
 | File | Purpose |
-|------|---------|
-| `blueprints/dashboard.py` | Dashboard routes |
-| `blueprints/orders.py` | OrderBook/TradeBook routes |
-| `restx_api/positionbook.py` | Positions API |
-| `restx_api/holdings.py` | Holdings API |
-| `blueprints/gex.py` | GEX Dashboard routes |
-| `blueprints/ivsmile.py` | IV Smile routes |
-| `blueprints/oiprofile.py` | OI Profile routes |
-| `blueprints/oitracker.py` | OI Tracker routes |
-| `blueprints/straddle_chart.py` | Straddle Chart routes |
-| `blueprints/vol_surface.py` | Volatility Surface routes |
-| `frontend/src/pages/` | React UI components |
+|---|---|
+| `frontend/src/App.tsx` | Route inventory |
+| `frontend/src/config/navigation.ts` | Navigation inventory |
+| `frontend/src/api/trading.ts` | Account/trading client |
+| `frontend/src/hooks/useOrderEventRefresh.ts` | Event-driven account refresh |
+| `frontend/src/lib/MarketDataManager.ts` | Shared market-data subscriptions |
+| `blueprints/react_app.py` | Production SPA route serving |

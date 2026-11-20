@@ -11,7 +11,7 @@
  *
  * // With category (respects user settings)
  * showToast.success('Order placed', 'orders')
- * showToast.error('Failed to save', 'strategy')
+ * showToast.error('Failed to save', 'flow')
  *
  * // Without category (always shows if master toggle enabled)
  * showToast.success('Copied to clipboard')
@@ -21,7 +21,7 @@
  */
 
 import { toast } from 'sonner'
-import { useAlertStore, type AlertCategories } from '@/stores/alertStore'
+import { type AlertCategories, useAlertStore } from '@/stores/alertStore'
 
 type ToastType = 'success' | 'error' | 'warning' | 'info'
 
@@ -55,44 +55,28 @@ const show = (
 /**
  * Show a success toast
  */
-const success = (
-  message: string,
-  category?: keyof AlertCategories,
-  options?: ToastOptions
-) => {
+const success = (message: string, category?: keyof AlertCategories, options?: ToastOptions) => {
   show('success', message, category, options)
 }
 
 /**
  * Show an error toast
  */
-const error = (
-  message: string,
-  category?: keyof AlertCategories,
-  options?: ToastOptions
-) => {
+const error = (message: string, category?: keyof AlertCategories, options?: ToastOptions) => {
   show('error', message, category, options)
 }
 
 /**
  * Show a warning toast
  */
-const warning = (
-  message: string,
-  category?: keyof AlertCategories,
-  options?: ToastOptions
-) => {
+const warning = (message: string, category?: keyof AlertCategories, options?: ToastOptions) => {
   show('warning', message, category, options)
 }
 
 /**
  * Show an info toast
  */
-const info = (
-  message: string,
-  category?: keyof AlertCategories,
-  options?: ToastOptions
-) => {
+const info = (message: string, category?: keyof AlertCategories, options?: ToastOptions) => {
   show('info', message, category, options)
 }
 

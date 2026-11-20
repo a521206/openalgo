@@ -5,11 +5,12 @@ from io import StringIO
 
 import pandas as pd
 import requests
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from database.auth_db import get_auth_token
+from database.engine_factory import create_db_engine
 from extensions import socketio
 from utils.logging import get_logger
 
@@ -19,7 +20,7 @@ logger = get_logger(__name__)
 # DATABASE SETUP
 # -------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(DATABASE_URL)
+engine = create_db_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -242,7 +243,8 @@ def fetch_and_process_mstock_indices():
         token_df["instrumenttype"] = "INDEX"
         token_df["tick_size"] = 0.05
 
-        # Standardize common symbol names (similar to aliceblue)
+        # Standardize NSE index symbols that differ from OpenAlgo standard format
+        # Only map symbols where mstock name differs; unlisted symbols pass through as-is
         token_df["symbol"] = token_df["symbol"].replace(
             {
                 "NIFTY50": "NIFTY",
@@ -250,7 +252,16 @@ def fetch_and_process_mstock_indices():
                 "NIFTYFINSERVICE": "FINNIFTY",
                 "NIFTYBANK": "BANKNIFTY",
                 "NIFTYMIDSELECT": "MIDCPNIFTY",
-                "INDIAVIX": "INDIAVIX",
+                "NIFTYMIDCAPSELECT": "MIDCPNIFTY",
+                "NIFTYMCAP50": "NIFTYMIDCAP50",
+                "NIFTYMIDSMALLCAP400": "NIFTYMIDSML400",
+                "NIFTYSMALLCAP100": "NIFTYSMLCAP100",
+                "NIFTYSMALLCAP250": "NIFTYSMLCAP250",
+                "NIFTYSMALLCAP50": "NIFTYSMLCAP50",
+                "NIFTY100EQUALWEIGHT": "NIFTY100EQLWGT",
+                "NIFTY100LOWVOLATILITY30": "NIFTY100LOWVOL30",
+                "NIFTYMID100FREE": "NIFTYMIDCAP100",
+                "HANGSENGBEES-NAV": "HANGSENGBEESNAV",
             }
         )
 
@@ -367,6 +378,53 @@ def process_mstock_json(json_data):
             df.loc[mask_bse_index, "exchange"] = "BSE_INDEX"
             logger.info(
                 f"Mapped {mask_bse_index.sum()} BSE index tokens to BSE_INDEX from master contract"
+            )
+
+            # Normalize BSE Index symbols to OpenAlgo standard format
+            bse_index_symbol_map = {
+                "SNSX50": "SENSEX50",
+                "SNXT50": "BSESENSEXNEXT50",
+                "MID150": "BSE150MIDCAPINDEX",
+                "LMI250": "BSE250LARGEMIDCAPINDEX",
+                "MSL400": "BSE400MIDSMALLCAPINDEX",
+                "AUTO": "BSEAUTO",
+                "BSE CG": "BSECAPITALGOODS",
+                "BSECG": "BSECAPITALGOODS",
+                "CARBON": "BSECARBONEX",
+                "BSE CD": "BSECONSUMERDURABLES",
+                "BSECD": "BSECONSUMERDURABLES",
+                "CPSE": "BSECPSE",
+                "DOL100": "BSEDOLLEX100",
+                "DOL200": "BSEDOLLEX200",
+                "DOL30": "BSEDOLLEX30",
+                "ENERGY": "BSEENERGY",
+                "BSEFMC": "BSEFASTMOVINGCONSUMERGOODS",
+                "FINSER": "BSEFINANCIALSERVICES",
+                "GREENX": "BSEGREENEX",
+                "BSE HC": "BSEHEALTHCARE",
+                "BSEHC": "BSEHEALTHCARE",
+                "INFRA": "BSEINDIAINFRASTRUCTUREINDEX",
+                "INDSTR": "BSEINDUSTRIALS",
+                "BSE IT": "BSEINFORMATIONTECHNOLOGY",
+                "BSEIT": "BSEINFORMATIONTECHNOLOGY",
+                "BSEIPO": "BSEIPO",
+                "LRGCAP": "BSELARGECAP",
+                "METAL": "BSEMETAL",
+                "MIDCAP": "BSEMIDCAP",
+                "MIDSEL": "BSEMIDCAPSELECTINDEX",
+                "OILGAS": "BSEOIL&GAS",
+                "POWER": "BSEPOWER",
+                "BSEPSU": "BSEPSU",
+                "REALTY": "BSEREALTY",
+                "SMLCAP": "BSESMALLCAP",
+                "SMLSEL": "BSESMALLCAPSELECTINDEX",
+                "SMEIPO": "BSESMEIPO",
+                "TECK": "BSETECK",
+                "TELCOM": "BSETELECOM",
+            }
+            mask_bse_idx = df["exchange"] == "BSE_INDEX"
+            df.loc[mask_bse_idx, "symbol"] = (
+                df.loc[mask_bse_idx, "name"].replace(bse_index_symbol_map)
             )
     except Exception as e:
         logger.warning(f"Could not fetch BSE index tokens for mapping: {e}")
@@ -620,6 +678,24 @@ def process_mstock_json(json_data):
         + df.loc[mask_pe, "strike"].astype(str).str.replace(r"\.0$", "", regex=True)
         + "PE"
     )
+
+    # -------------------------------------------------------------------
+    # Normalize instrumenttype to OpenAlgo standard (match Angel format)
+    # Options: OPTIDX/OPTSTK/OPTFUT/OPTCUR/OPTIRC -> CE or PE
+    # Futures: FUTIDX/FUTSTK/FUTCOM/FUTCUR/FUTIRC/FUTIRT -> FUT
+    # -------------------------------------------------------------------
+    option_types = ["OPTIDX", "OPTSTK", "OPTFUT", "OPTCUR", "OPTIRC"]
+    df.loc[
+        (df["instrumenttype"].isin(option_types)) & (df["symbol"].str.endswith("CE", na=False)),
+        "instrumenttype",
+    ] = "CE"
+    df.loc[
+        (df["instrumenttype"].isin(option_types)) & (df["symbol"].str.endswith("PE", na=False)),
+        "instrumenttype",
+    ] = "PE"
+
+    future_types = ["FUTIDX", "FUTSTK", "FUTCOM", "FUTCUR", "FUTIRC", "FUTIRT"]
+    df.loc[df["instrumenttype"].isin(future_types), "instrumenttype"] = "FUT"
 
     # Return the processed DataFrame
     # Note: Index symbol formatting is handled in fetch_and_process_mstock_indices()

@@ -20,6 +20,18 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/symbol
 }
 ```
 
+## Sample cURL Request
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/v1/symbol \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "apikey": "<your_app_apikey>",
+  "symbol": "RELIANCE",
+  "exchange": "NSE"
+}'
+```
+
 ## Sample API Response (Equity)
 
 ```json
@@ -47,7 +59,7 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/symbol
 ```json
 {
   "apikey": "<your_app_apikey>",
-  "symbol": "NIFTY30DEC25FUT",
+  "symbol": "NIFTY25AUG26FUT",
   "exchange": "NFO"
 }
 ```
@@ -59,16 +71,16 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/symbol
   "status": "success",
   "data": {
     "brexchange": "NSE_FO",
-    "brsymbol": "NIFTY FUT 30 DEC 25",
+    "brsymbol": "NIFTY FUT 25 AUG 26",
     "exchange": "NFO",
-    "expiry": "30-DEC-25",
+    "expiry": "25-AUG-26",
     "freeze_qty": 1800,
     "id": 57900,
     "instrumenttype": "FUT",
     "lotsize": 65,
     "name": "NIFTY",
     "strike": 0,
-    "symbol": "NIFTY30DEC25FUT",
+    "symbol": "NIFTY25AUG26FUT",
     "tick_size": 10,
     "token": "NSE_FO|49543"
   }
@@ -81,7 +93,7 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/symbol
 |-----------|-------------|-------------------|---------------|
 | apikey | Your OpenAlgo API key | Mandatory | - |
 | symbol | Trading symbol in OpenAlgo format | Mandatory | - |
-| exchange | Exchange code: NSE, BSE, NFO, BFO, CDS, BCD, MCX | Mandatory | - |
+| exchange | Exchange code from the [shared constants](../../prompt/order-constants.md), supported by the active broker | Mandatory | - |
 
 ## Response Fields
 
@@ -110,13 +122,9 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/symbol
 
 ## Notes
 
-- Use this endpoint to get the **broker-specific symbol** for order placement
-- The **lotsize** field shows:
-  - NIFTY: 65
-  - BANKNIFTY: 30
-  - SENSEX: 20
-  - Equity: 1
-- The **freeze_qty** field indicates the maximum quantity allowed per order
+- Send the OpenAlgo `symbol` and `exchange` to unified order APIs; `brsymbol` is broker metadata, not a replacement for the standard symbol
+- Read **lotsize** from the exact refreshed contract/expiry. Equity is normally 1; derivative sizes vary by instrument and expiry. Do not size orders from a static underlying table
+- The **freeze_qty** field is a separate maximum-order constraint from lot size. Read it for the exact instrument and keep installed exchange freeze-limit data up to date
 - The **token** is used by brokers for faster symbol lookup
 
 ---

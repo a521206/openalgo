@@ -2,17 +2,12 @@ import copy
 import importlib
 import os
 import time
-import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
-from database.analyzer_db import async_log_analyzer
-from database.apilog_db import async_log_order
-from database.apilog_db import executor as log_executor
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
-from extensions import socketio
-from services.telegram_alert_service import telegram_alert_service
-from utils.api_analyzer import analyze_request, generate_order_id
+from events import AnalyzerErrorEvent, OrderFailedEvent, SplitCompletedEvent
+from utils.broker_backpressure import BrokerBusyError
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -20,6 +15,8 @@ from utils.constants import (
     VALID_PRICE_TYPES,
     VALID_PRODUCT_TYPES,
 )
+from utils.event_bus import bus
+from utils.httpx_client import UNANSWERED_ORDER_MESSAGE, watch_for_unanswered_writes
 from utils.logging import get_logger
 
 # Initialize logger
@@ -42,7 +39,7 @@ def get_order_rate_limit():
 
 def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dict[str, Any]:
     """
-    Helper function to emit analyzer error events
+    Helper function to emit analyzer error events via the event bus.
 
     Args:
         request_data: Original request data
@@ -59,13 +56,14 @@ def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dic
         del analyzer_request["apikey"]
     analyzer_request["api_type"] = "splitorder"
 
-    # Log to analyzer database
-    log_executor.submit(async_log_analyzer, analyzer_request, error_response, "splitorder")
-
-    # Emit socket event asynchronously (non-blocking)
-    socketio.start_background_task(
-        socketio.emit, "analyzer_update", {"request": analyzer_request, "response": error_response}
-    )
+    bus.publish(AnalyzerErrorEvent(
+        mode="analyze",
+        api_type="splitorder",
+        request_data=analyzer_request,
+        response_data=error_response,
+        error_message=error_message,
+        api_key=request_data.get("apikey", ""),
+    ))
 
     return error_response
 
@@ -109,9 +107,11 @@ def place_single_order(
     Returns:
         Order result dictionary
     """
+    unanswered: list[str] = []
     try:
         # Place the order using place_order_api
-        res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
+        with watch_for_unanswered_writes() as unanswered:
+            res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
 
         if res.status == 200:
             # No per-order event emission - a summary event is emitted at the end of all orders
@@ -127,6 +127,8 @@ def place_single_order(
                 if isinstance(response_data, dict)
                 else "Failed to place order"
             )
+            if unanswered:
+                message = UNANSWERED_ORDER_MESSAGE
             return {
                 "order_num": order_num,
                 "quantity": int(order_data["quantity"]),
@@ -134,13 +136,26 @@ def place_single_order(
                 "message": message,
             }
 
+    except BrokerBusyError as e:
+        # Refused before it was sent: the broker's request queue was longer
+        # than a caller may wait under the gthread worker. Never raised under
+        # eventlet or the development server.
+        logger.warning(f"Split order {order_num} not sent, broker busy: {e}")
+        return {
+            "order_num": order_num,
+            "quantity": int(order_data["quantity"]),
+            "status": "error",
+            "message": str(e),
+        }
     except Exception as e:
         logger.exception(f"Error placing order {order_num}: {e}")
         return {
             "order_num": order_num,
             "quantity": int(order_data["quantity"]),
             "status": "error",
-            "message": "Failed to place order due to internal error",
+            "message": UNANSWERED_ORDER_MESSAGE
+            if unanswered
+            else "Failed to place order due to internal error",
         }
 
 
@@ -175,7 +190,14 @@ def split_order_with_auth(
             if get_analyze_mode():
                 return False, emit_analyzer_error(original_data, error_message), 400
             error_response = {"status": "error", "message": error_message}
-            log_executor.submit(async_log_order, "splitorder", original_data, error_response)
+            bus.publish(OrderFailedEvent(
+                mode="live",
+                api_type="splitorder",
+                request_data=split_request_data,
+                response_data=error_response,
+                error_message=error_message,
+                api_key=original_data.get("apikey", ""),
+            ))
             return False, error_response, 400
 
         # Calculate number of full-size orders and remaining quantity
@@ -189,7 +211,14 @@ def split_order_with_auth(
             if get_analyze_mode():
                 return False, emit_analyzer_error(original_data, error_message), 400
             error_response = {"status": "error", "message": error_message}
-            log_executor.submit(async_log_order, "splitorder", original_data, error_response)
+            bus.publish(OrderFailedEvent(
+                mode="live",
+                api_type="splitorder",
+                request_data=split_request_data,
+                response_data=error_response,
+                error_message=error_message,
+                api_key=original_data.get("apikey", ""),
+            ))
             return False, error_response, 400
 
     except ValueError:
@@ -197,10 +226,17 @@ def split_order_with_auth(
         if get_analyze_mode():
             return False, emit_analyzer_error(original_data, error_message), 400
         error_response = {"status": "error", "message": error_message}
-        log_executor.submit(async_log_order, "splitorder", original_data, error_response)
+        bus.publish(OrderFailedEvent(
+            mode="live",
+            api_type="splitorder",
+            request_data=split_request_data,
+            response_data=error_response,
+            error_message=error_message,
+            api_key=original_data.get("apikey", ""),
+        ))
         return False, error_response, 400
 
-    # If in analyze mode, route to sandbox for virtual trading
+    # If in analyze mode, route to sandbox for sandbox trading
     if get_analyze_mode():
         from services.sandbox_service import sandbox_place_order
 
@@ -214,15 +250,35 @@ def split_order_with_auth(
 
         analyze_results = []
 
+        # Pre-fetch quote once for the symbol — all split orders share the
+        # same symbol, so N individual REST calls are redundant.
+        prefetched_quote = None
+        try:
+            from services.quotes_service import get_quotes
+            success_q, q_response, _ = get_quotes(
+                symbol=split_data.get("symbol"),
+                exchange=split_data.get("exchange"),
+                api_key=api_key,
+            )
+            if success_q and "data" in q_response:
+                prefetched_quote = q_response["data"]
+                logger.info(
+                    f"Pre-fetched quote for split order: {split_data.get('symbol')} "
+                    f"LTP={prefetched_quote.get('ltp')}"
+                )
+        except Exception as e:
+            logger.debug(f"Quote pre-fetch failed for split order, falling back to per-order fetch: {e}")
+
         # Place full-size orders in sandbox
         for i in range(num_full_orders):
             order_data = copy.deepcopy(split_data)
             order_data["quantity"] = str(split_size)
             order_data["apikey"] = api_key
 
-            # Place order in sandbox
+            # Place order in sandbox with pre-fetched quote
             success, response, status_code = sandbox_place_order(
-                order_data, api_key, {"apikey": api_key, "order_type": "split"}
+                order_data, api_key, {"apikey": api_key, "order_type": "split"},
+                prefetched_quote=prefetched_quote,
             )
 
             if success:
@@ -251,7 +307,8 @@ def split_order_with_auth(
             order_data["apikey"] = api_key
 
             success, response, status_code = sandbox_place_order(
-                order_data, api_key, {"apikey": api_key, "order_type": "split"}
+                order_data, api_key, {"apikey": api_key, "order_type": "split"},
+                prefetched_quote=prefetched_quote,
             )
 
             if success:
@@ -285,31 +342,40 @@ def split_order_with_auth(
         analyzer_request = split_request_data.copy()
         analyzer_request["api_type"] = "splitorder"
 
-        # Log to analyzer database
-        log_executor.submit(async_log_analyzer, analyzer_request, response_data, "splitorder")
+        successful_orders = sum(1 for r in analyze_results if r.get("status") == "success")
+        bus.publish(SplitCompletedEvent(
+            mode="analyze",
+            api_type="splitorder",
+            strategy=split_data.get("strategy", ""),
+            symbol=split_data.get("symbol", ""),
+            exchange=split_data.get("exchange", ""),
+            action=split_data.get("action", ""),
+            pricetype=split_data.get("pricetype", ""),
+            product=split_data.get("product", ""),
+            total_quantity=total_quantity,
+            split_size=split_size,
+            results=analyze_results,
+            successful=successful_orders,
+            total=len(analyze_results),
+            request_data=analyzer_request,
+            response_data=response_data,
+            api_key=split_data.get("apikey", ""),
+        ))
 
-        # Emit socket event for toast notification asynchronously (non-blocking)
-        socketio.start_background_task(
-            socketio.emit,
-            "analyzer_update",
-            {"request": analyzer_request, "response": response_data},
-        )
-
-        # Send Telegram alert in background task (non-blocking)
-        socketio.start_background_task(
-            telegram_alert_service.send_order_alert,
-            "splitorder",
-            split_data,
-            response_data,
-            split_data.get("apikey"),
-        )
         return True, response_data, 200
 
     # Live mode - process actual orders
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}
-        log_executor.submit(async_log_order, "splitorder", original_data, error_response)
+        bus.publish(OrderFailedEvent(
+            mode="live",
+            api_type="splitorder",
+            request_data=split_request_data,
+            response_data=error_response,
+            error_message="Broker-specific module not found",
+            api_key=original_data.get("apikey", ""),
+        ))
         return False, error_response, 404
 
     # Process orders sequentially with rate limiting
@@ -343,34 +409,26 @@ def split_order_with_auth(
         "split_size": split_size,
         "results": results,
     }
-    log_executor.submit(async_log_order, "splitorder", split_request_data, response_data)
 
-    # Emit single summary order event at the end (page refreshes only once)
     successful_orders = sum(1 for r in results if r.get("status") == "success")
-    socketio.start_background_task(
-        socketio.emit,
-        "order_event",
-        {
-            "symbol": split_data.get("symbol", "Split"),
-            "action": split_data.get("action", "SPLIT"),
-            "orderid": f"{successful_orders}/{len(results)} orders",
-            "exchange": split_data.get("exchange", "Unknown"),
-            "price_type": split_data.get("pricetype", "MARKET"),
-            "product_type": split_data.get("product", "MIS"),
-            "mode": "live",
-            "batch_order": True,
-            "is_last_order": True,
-        },
-    )
-
-    # Send Telegram alert in background task (non-blocking)
-    socketio.start_background_task(
-        telegram_alert_service.send_order_alert,
-        "splitorder",
-        split_data,
-        response_data,
-        original_data.get("apikey"),
-    )
+    bus.publish(SplitCompletedEvent(
+        mode="live",
+        api_type="splitorder",
+        strategy=split_data.get("strategy", ""),
+        symbol=split_data.get("symbol", ""),
+        exchange=split_data.get("exchange", ""),
+        action=split_data.get("action", ""),
+        pricetype=split_data.get("pricetype", ""),
+        product=split_data.get("product", ""),
+        total_quantity=total_quantity,
+        split_size=split_size,
+        results=results,
+        successful=successful_orders,
+        total=len(results),
+        request_data=split_request_data,
+        response_data=response_data,
+        api_key=original_data.get("apikey", ""),
+    ))
 
     return True, response_data, 200
 

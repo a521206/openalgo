@@ -1,5 +1,4 @@
 import json
-import logging
 import threading
 import time
 from collections.abc import Callable
@@ -9,6 +8,7 @@ import requests
 import socketio
 
 from broker.jainamxts.baseurl import BASE_URL, INTERACTIVE_URL, MARKET_DATA_URL
+from utils.logging import get_logger
 
 
 class JainamXTSWebSocketClient:
@@ -77,7 +77,7 @@ class JainamXTSWebSocketClient:
         self.on_message = None
 
         # Logger
-        self.logger = logging.getLogger("jainamxts_websocket")
+        self.logger = get_logger("jainamxts_websocket")
 
         # Subscriptions tracking
         self.subscriptions = {}
@@ -144,7 +144,7 @@ class JainamXTSWebSocketClient:
 
             if response.status_code == 200:
                 result = response.json()
-                self.logger.debug(f"[MARKET DATA LOGIN] Response: {result}")
+                self.logger.debug(f"[MARKET DATA LOGIN] Response type: {result.get('type')}")
 
                 if result.get("type") == "success":
                     login_result = result.get("result", {})
@@ -175,6 +175,10 @@ class JainamXTSWebSocketClient:
     def connect(self):
         """Establish Socket.IO connection with proper authentication"""
         try:
+            # Re-create Socket.IO client if it was released by a prior disconnect()
+            if self.sio is None:
+                self._setup_socketio()
+
             # First, login to market data API to get proper tokens
             if not self.marketdata_login():
                 raise Exception("Market data login failed")
@@ -187,7 +191,7 @@ class JainamXTSWebSocketClient:
             # Use the market data token and actual user ID from login response
             connection_url = f"{self.base_url}/?token={self.market_data_token}&userID={self.actual_user_id}&publishFormat={publish_format}&broadcastMode={broadcast_mode}"
 
-            self.logger.info(f"Connecting to JainamXTS Socket.IO: {connection_url}")
+            self.logger.info(f"Connecting to JainamXTS Socket.IO: {self.base_url}")
             self.logger.info(f"Socket path: {self.SOCKET_PATH}")
 
             # Connect to Socket.IO server
@@ -208,7 +212,7 @@ class JainamXTSWebSocketClient:
             raise
 
     def disconnect(self):
-        """Disconnect from Socket.IO"""
+        """Disconnect from Socket.IO and release transport resources"""
         self.running = False
         self.connected = False
 
@@ -218,6 +222,9 @@ class JainamXTSWebSocketClient:
                 self.logger.info("Socket.IO client disconnected")
         except Exception as e:
             self.logger.warning(f"Error during Socket.IO disconnect: {e}")
+
+        # Release the socketio.Client so its engine-io transport threads can be GC'd
+        self.sio = None
 
         # Clear subscriptions
         self.subscriptions.clear()
@@ -266,9 +273,7 @@ class JainamXTSWebSocketClient:
             headers = {"Authorization": self.market_data_token, "Content-Type": "application/json"}
 
             self.logger.debug(f"[SUBSCRIPTION REQUEST] URL: {self.API_BASE_URL}")
-            self.logger.debug(
-                f"[SUBSCRIPTION REQUEST] Headers: Authorization={self.market_data_token[:20]}..."
-            )
+            self.logger.debug(f"[SUBSCRIPTION REQUEST] Header names: {list(headers)}")
             self.logger.debug(f"[SUBSCRIPTION REQUEST] Payload: {subscription_request}")
 
             response = requests.post(
@@ -373,9 +378,7 @@ class JainamXTSWebSocketClient:
         self.connected = True
         self.logger.debug("[SOCKET.IO] Connected successfully!")
         self.logger.debug(f"[SOCKET.IO] UserID: {self.actual_user_id}")
-        self.logger.debug(
-            f"[SOCKET.IO] Token: {self.market_data_token[:30] if self.market_data_token else 'None'}..."
-        )
+        self.logger.debug(f"[SOCKET.IO] Market data token present: {bool(self.market_data_token)}")
 
         # Call external callback
         if self.on_open:
@@ -705,9 +708,7 @@ class JainamXTSWebSocketClient:
 
         except Exception as e:
             self.logger.error(f"[XTS-BINARY] Error: {e}")
-            import traceback
-
-            self.logger.error(traceback.format_exc())
+            self.logger.exception(f"[XTS-BINARY] Error details: {e}")
 
     def _parse_touchline(self, payload, market_data, ltp_offset):
         """Parse touchline/price data from payload at given offset"""

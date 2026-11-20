@@ -10,7 +10,7 @@ Ensure you have:
 - [ ] OpenAlgo running
 - [ ] Logged into your broker
 - [ ] API key generated
-- [ ] Understand order types (review [Module 02](../02-key-concepts/README.md) if needed)
+- [ ] Understand order types (review [Module 03](../03-key-concepts/README.md) if needed)
 
 ## Method 1: Using the Playground (Easiest)
 
@@ -18,13 +18,13 @@ The Playground is the best way to start - it's a visual interface to test orders
 
 ### Step 1: Enable Analyzer Mode (Recommended for First Order)
 
-1. Go to **Analyzer** page
-2. Click **Enable Analyzer Mode**
-3. You now have ₹1 Crore sandbox capital to practice
+1. Use the header mode control to switch to **Analyze**
+2. Verify the **Analyze** badge before submitting an order
+3. Inspect `/sandbox` for the configured sandbox capital (INR 1 Crore by default)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  ⚠️ ANALYZER MODE ACTIVE                                        │
+│ ANALYZER MODE ACTIVE                                        │
 │  Orders will NOT go to your real broker                         │
 │  Sandbox Balance: ₹1,00,00,000                                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -32,7 +32,7 @@ The Playground is the best way to start - it's a visual interface to test orders
 
 ### Step 2: Open Playground
 
-Navigate to **Playground** in the sidebar.
+Navigate to **API Playground** from the Dashboard.
 
 ### Step 3: Fill Order Details
 
@@ -86,7 +86,7 @@ Fill in:
 4. Go to **Positions**
 5. See your new SBIN position
 
-Congratulations! You've placed your first order! 🎉
+Congratulations! You've placed your first order!
 
 ## Method 2: Using API (For Automation)
 
@@ -119,7 +119,7 @@ client = api(
 )
 
 # Place order
-response = client.place_order(
+response = client.placeorder(
     symbol="SBIN",
     exchange="NSE",
     action="BUY",
@@ -134,6 +134,10 @@ print(response)
 ```
 
 ## Understanding the Order Response
+
+A successful placement is an acceptance, not proof of a fill. Verify the order's status and its trades/position before acting on an assumed execution. In Semi-Auto, success with `mode: "semi_auto"` and `pending_order_id` means it is waiting in [Action Center](../22-action-center/README.md).
+
+If a request times out or its outcome is unclear, check the broker's order book, trades and positions before sending another order. Do not treat a missing response as a rejection.
 
 ### Success Response
 
@@ -182,7 +186,7 @@ Common error messages:
 │         ▼                                                                    │
 │  3. Check Analyzer Mode                                                     │
 │         │                                                                    │
-│         ├──→ ON?  Execute in sandbox (virtual)                              │
+│         ├──→ ON?  Execute in sandbox (sandbox)                              │
 │         │                                                                    │
 │         ▼                                                                    │
 │  4. Check Order Mode                                                        │
@@ -251,7 +255,7 @@ Once comfortable with sandbox testing:
 
 ### Step 2: Verify Broker Connection
 
-- Check broker status is 🟢 Connected
+- Check broker status is Connected
 - Verify available margin
 
 ### Step 3: Start Small
@@ -259,7 +263,7 @@ Once comfortable with sandbox testing:
 For your first real order:
 - Use small quantity
 - Choose liquid stocks (SBIN, RELIANCE, INFY)
-- Use MARKET orders (guaranteed execution)
+- Choose an order type intentionally; MARKET orders can slip or be rejected and do not guarantee a fill
 - Use MIS (auto-closes if you forget)
 
 ### Step 4: Place Real Order
@@ -290,7 +294,7 @@ Before every order:
 
 ### Mistake 2: Wrong Lot Size
 
-**Problem**: Buying 100 NIFTY options (should be lot size of 50)
+**Problem**: An option quantity is not a multiple of that contract's current lot size
 **Solution**: Check lot size in Search page
 
 ### Mistake 3: CNC for F&O

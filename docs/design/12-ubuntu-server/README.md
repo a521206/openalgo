@@ -2,7 +2,9 @@
 
 ## Overview
 
-This guide covers deploying OpenAlgo on an Ubuntu server (20.04/22.04 LTS) with Nginx reverse proxy, systemd services, and SSL configuration for production use.
+For the maintained installer walkthrough, see [Ubuntu Server Installation](../../installation-guidelines/getting-started/ubuntu-server-installation.md). The default service below uses eventlet with one worker. To select gthread with 64 request threads, use the [worker switching guide](../../gthread/README.md); do not add worker processes. New installs add broker keys in OpenAlgo after app sign-in.
+
+This guide covers deploying OpenAlgo on an Ubuntu server (22.04 LTS or later, with Python 3.12+) with Nginx reverse proxy, systemd services, and SSL configuration for production use.
 
 ## Architecture Diagram
 
@@ -31,7 +33,7 @@ This guide covers deploying OpenAlgo on an Ubuntu server (20.04/22.04 LTS) with 
 │           OpenAlgo (Gunicorn + WebSocket)           │
 │                                                     │
 │  Flask App ─────────── localhost:5000               │
-│  WebSocket Thread ──── localhost:8765               │
+│  WebSocket Process ──── localhost:8765               │
 │                                                     │
 │  systemd: openalgo                                  │
 └─────────────────────────────────────────────────────┘
@@ -77,22 +79,20 @@ sudo chown $USER:$USER /opt/openalgo
 
 # Clone repository
 cd /opt/openalgo
-git clone https://github.com/marketcalls/openalgo.git .
+git clone --filter=blob:none https://github.com/marketcalls/openalgo.git .
 ```
 
 ### 2. Setup Python Environment
 
 ```bash
-# Install uv package manager
-pip install uv
+# Install uv using the supported installer if it is not already available
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Create virtual environment and install dependencies
-uv venv .venv
-source .venv/bin/activate
+# Create/sync the project environment without activating it
 uv sync
 
 # Install production dependencies
-uv pip install gunicorn eventlet==0.35.2
+uv pip install "gunicorn>=25.0,<26" "eventlet==0.41.2"
 ```
 
 ### 3. Configure Environment
@@ -101,15 +101,17 @@ uv pip install gunicorn eventlet==0.35.2
 # Copy sample environment file
 cp .sample.env .env
 
-# Generate secure keys
-python -c "import secrets; print(secrets.token_hex(32))"
-# Copy output to APP_KEY and API_KEY_PEPPER in .env
+# Public sample APP_KEY, API_KEY_PEPPER and FERNET_SALT placeholders
+# are replaced with fresh values on first run for a new installation.
+# Preserve the original keys when using an existing database.
 
 # Edit configuration
 nano .env
 ```
 
-### 4. Build Frontend
+### 4. Build Frontend (Source Development Only)
+
+A normal checkout from `main` already contains the CI-built React bundle; server-only deployments need no Node.js. Build locally when testing frontend source changes or a branch without a current bundle. Use the Node version supported by `frontend/package.json`.
 
 ```bash
 cd frontend
@@ -120,7 +122,7 @@ cd ..
 
 ### 5. Create Systemd Service
 
-**Note:** The WebSocket server runs as a thread inside the main app (port 8765), so only ONE systemd service is needed.
+**Note:** One systemd service is sufficient. Under either Gunicorn worker (default eventlet or opt-in gthread), `websocket_proxy.app_integration` spawns the WebSocket proxy as an isolated child process on port 8765; it is not an in-process daemon thread.
 
 ```bash
 sudo nano /etc/systemd/system/openalgo.service
@@ -171,6 +173,15 @@ sudo nano /etc/nginx/sites-available/openalgo
 ```
 
 ```nginx
+# Send "Connection: upgrade" upstream only for a real WebSocket handshake.
+# Hardcoding "upgrade" makes every ordinary request reach gunicorn claiming an
+# upgrade with an empty Upgrade:, which breaks HTTP/1.1 keep-alive and causes
+# intermittent truncated responses and 5xx. See GitHub issue #1807.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
 server {
     listen 80;
     server_name your-domain.com;
@@ -201,9 +212,10 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # WebSocket support for Socket.IO
+        # WebSocket support for Socket.IO. Socket.IO also long-polls over plain
+        # HTTP, so this must not force the upgrade header - see the map above.
         proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection $connection_upgrade;
         proxy_read_timeout 86400;
     }
 
@@ -212,7 +224,7 @@ server {
         proxy_pass http://127.0.0.1:8765;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection $connection_upgrade;
         proxy_set_header Host $host;
         proxy_read_timeout 86400;
     }
@@ -319,4 +331,4 @@ sudo systemctl start openalgo
 | `/opt/openalgo/.env` | Application config |
 | `/var/log/nginx/` | Nginx logs |
 
-**Note:** There is no separate `openalgo-ws.service`. The WebSocket server runs as a thread inside the main Flask application on port 8765.
+**Note:** There is no separate `openalgo-ws.service`. The Gunicorn-managed application starts the WebSocket proxy as a child process on port 8765, and systemd's service cgroup owns both processes.

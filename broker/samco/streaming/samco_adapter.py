@@ -1,14 +1,15 @@
 import json
-import logging
 import os
 import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote
 
 from broker.samco.api.data import BrokerData
 from broker.samco.streaming.samcoWebSocket import SamcoWebSocket
 from database.auth_db import get_auth_token
+from utils.logging import get_logger
 
 # Add parent directory to path to allow imports
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../"))
@@ -24,7 +25,7 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def __init__(self):
         super().__init__()
-        self.logger = logging.getLogger("samco_websocket")
+        self.logger = get_logger("samco_websocket")
         self.ws_client = None
         self.user_id = None
         self.broker_name = "samco"
@@ -34,6 +35,10 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.max_reconnect_attempts = 10
         self.running = False
         self.lock = threading.Lock()
+        self._reconnecting = False  # Guard against concurrent reconnect threads
+        self._broker_data = None  # Cached BrokerData for index listing lookups
+        self._index_listing_cache = {}  # {symbol_exchange: listing_id}
+        self.auth_failed = False  # Set when the broker rejects the session token
 
     def initialize(
         self, broker_name: str, user_id: str, auth_data: dict[str, str] | None = None
@@ -55,7 +60,7 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Get tokens from database if not provided
         if not auth_data:
             # Fetch authentication token from database
-            session_token = get_auth_token(user_id)
+            session_token = get_auth_token(user_id, bypass_cache=True)
 
             if not session_token:
                 self.logger.error(f"No authentication token found for user {user_id}")
@@ -69,7 +74,13 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 raise ValueError("Missing required authentication data (session_token)")
 
         # Create SamcoWebSocket instance
-        self.ws_client = SamcoWebSocket(session_token=session_token, user_id=user_id)
+        self.ws_client = SamcoWebSocket(
+            session_token=session_token,
+            user_id=user_id,
+            # is_auth_error() is inherited from BaseBrokerWebSocketAdapter, so
+            # samco shares the fleet's 401/403 vocabulary instead of its own.
+            auth_error_check=self.is_auth_error,
+        )
 
         # Set callbacks
         self.ws_client.on_open = self._on_open
@@ -79,6 +90,23 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.ws_client.on_message = self._on_message
 
         self.running = True
+
+    def _get_index_listing_id(self, symbol: str, exchange: str) -> str:
+        """Get index listing ID with caching to avoid repeated API calls"""
+        cache_key = f"{symbol}_{exchange}"
+        if cache_key in self._index_listing_cache:
+            return self._index_listing_cache[cache_key]
+
+        # Get or create BrokerData instance
+        if not self._broker_data:
+            auth_token = get_auth_token(self.user_id, bypass_cache=True)
+            if not auth_token:
+                raise ValueError(f"No auth token found for user {self.user_id}")
+            self._broker_data = BrokerData(auth_token)
+
+        listing_id = self._broker_data.get_index_listing_id(symbol, exchange)
+        self._index_listing_cache[cache_key] = listing_id
+        return listing_id
 
     def connect(self) -> None:
         """Establish connection to Samco WebSocket"""
@@ -90,31 +118,93 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def _connect_with_retry(self) -> None:
         """Connect to Samco WebSocket with retry logic"""
-        while self.running and self.reconnect_attempts < self.max_reconnect_attempts:
-            try:
-                self.logger.info(
-                    f"Connecting to Samco WebSocket (attempt {self.reconnect_attempts + 1})"
-                )
-                self.ws_client.connect()
-                self.reconnect_attempts = 0  # Reset attempts on successful connection
-                break
+        # Prevent multiple reconnect threads from running concurrently
+        with self.lock:
+            if self._reconnecting:
+                self.logger.debug("Reconnect already in progress, skipping")
+                return
+            self._reconnecting = True
 
-            except Exception as e:
-                self.reconnect_attempts += 1
-                delay = min(
-                    self.reconnect_delay * (2**self.reconnect_attempts), self.max_reconnect_delay
-                )
-                self.logger.error(f"Connection failed: {e}. Retrying in {delay} seconds...")
-                time.sleep(delay)
+        try:
+            while self.running and self.reconnect_attempts < self.max_reconnect_attempts:
+                try:
+                    self.logger.info(
+                        f"Connecting to Samco WebSocket (attempt {self.reconnect_attempts + 1})"
+                    )
 
-        if self.reconnect_attempts >= self.max_reconnect_attempts:
-            self.logger.error("Max reconnection attempts reached. Giving up.")
+                    # Re-read a fresh session token from the database before connecting.
+                    # Indian broker tokens roll over daily at ~3 AM IST, so a reconnect
+                    # after rollover must not reuse the construction-time token. Apply the
+                    # same unquote() parsing the SamcoWebSocket constructor uses.
+                    fresh_token = get_auth_token(self.user_id, bypass_cache=True)
+                    if fresh_token:
+                        self.ws_client.session_token = unquote(fresh_token)
+                    else:
+                        self.logger.warning(
+                            "Could not fetch fresh auth token from database; "
+                            "reusing existing token for reconnection"
+                        )
+
+                    self.ws_client.connect()
+
+                    # A rejected session token cannot be fixed by retrying: the
+                    # user has to re-login. Retrying anyway hammers the broker
+                    # for the rest of the session and risks an IP rate-limit.
+                    if getattr(self.ws_client, "auth_failed", False):
+                        self._stop_for_auth_failure(
+                            getattr(self.ws_client, "auth_failure_reason", None)
+                        )
+                        return
+
+                    self.reconnect_attempts = 0  # Reset attempts on successful connection
+                    break
+
+                except Exception as e:
+                    if self.is_auth_error(str(e)):
+                        self._stop_for_auth_failure(str(e))
+                        return
+
+                    self.reconnect_attempts += 1
+                    delay = min(
+                        self.reconnect_delay * (2**self.reconnect_attempts),
+                        self.max_reconnect_delay,
+                    )
+                    self.logger.error(f"Connection failed: {e}. Retrying in {delay} seconds...")
+                    time.sleep(delay)
+
+            if self.reconnect_attempts >= self.max_reconnect_attempts:
+                self.logger.error("Max reconnection attempts reached. Giving up.")
+        finally:
+            with self.lock:
+                self._reconnecting = False
+
+    def _stop_for_auth_failure(self, reason: str | None) -> None:
+        """
+        Stop reconnecting because the broker refused our credentials.
+
+        Clearing `running` is what breaks the loop: `_connect_with_retry` tests
+        it on every pass and `_on_close` only respawns the retry thread while it
+        is set. Without this, a dead token produces a reconnect storm that runs
+        until the process is restarted.
+        """
+        with self.lock:
+            self.auth_failed = True
+            self.connected = False
+            self.running = False
+        self.logger.error(
+            f"Auth failure on Samco WebSocket ({reason}); stopping reconnect loop. "
+            "User must re-login to refresh the session token."
+        )
 
     def disconnect(self) -> None:
         """Disconnect from Samco WebSocket"""
         self.running = False
         if hasattr(self, "ws_client") and self.ws_client:
             self.ws_client.close_connection()
+
+        # Clear cached BrokerData and index listings (stale after disconnect)
+        self._broker_data = None
+        self._index_listing_cache = {}
 
         # Clean up ZeroMQ resources
         self.cleanup_zmq()
@@ -146,19 +236,10 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 "INVALID_DEPTH", f"Invalid depth level {depth_level}. Must be 5"
             )
 
-        # Handle index symbols - fetch listingId from API
+        # Handle index symbols - fetch listingId from API (cached)
         if exchange in ["NSE_INDEX", "BSE_INDEX"]:
             try:
-                # Get auth token for API call
-                auth_token = get_auth_token(self.user_id)
-                if not auth_token:
-                    return self._create_error_response(
-                        "AUTH_ERROR", f"No auth token found for user {self.user_id}"
-                    )
-
-                # Create BrokerData instance and fetch listingId
-                broker_data = BrokerData(auth_token)
-                listing_id = broker_data.get_index_listing_id(symbol, exchange)
+                listing_id = self._get_index_listing_id(symbol, exchange)
 
                 # For index, use listingId as token (e.g., '-23' for NIFTY)
                 token = listing_id
@@ -264,16 +345,10 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
         Returns:
             Dict: Response with status
         """
-        # Handle index symbols - need to use listingId for streaming
+        # Handle index symbols - use cached listingId for streaming
         if exchange in ["NSE_INDEX", "BSE_INDEX"]:
             try:
-                auth_token = get_auth_token(self.user_id)
-                if not auth_token:
-                    return self._create_error_response(
-                        "AUTH_ERROR", "Authentication token not found"
-                    )
-                broker_data = BrokerData(auth_token)
-                listing_id = broker_data.get_index_listing_id(symbol, exchange)
+                listing_id = self._get_index_listing_id(symbol, exchange)
                 token = listing_id  # e.g., '-21' for NIFTY
                 brexchange = "NSE" if exchange == "NSE_INDEX" else "BSE"
                 self.logger.info(
@@ -365,10 +440,21 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
         """Callback for WebSocket errors"""
         self.logger.error(f"Samco WebSocket error: {error}")
 
+        # The close callback owns reconnect scheduling; we only have to clear
+        # `running` here so it short-circuits.
+        if self.is_auth_error(str(error)):
+            self._stop_for_auth_failure(str(error))
+
     def _on_close(self, wsapp) -> None:
         """Callback when connection is closed"""
         self.logger.info("Samco WebSocket connection closed")
         self.connected = False
+
+        # The client keeps the close code/message to itself (this callback only
+        # gets `wsapp`), so read the verdict it latched for us.
+        if getattr(self.ws_client, "auth_failed", False):
+            self._stop_for_auth_failure(getattr(self.ws_client, "auth_failure_reason", None))
+            return
 
         # Attempt to reconnect if we're still running
         if self.running:
@@ -410,6 +496,12 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
             # Find ALL subscriptions that match this symbol and have compatible modes
             matching_subscriptions = []
+            # Samco names a stock as scripCode_segment ("2885_NSE"); only index
+            # ids ("-23") come bare. A bare stock scrip code does not say which
+            # segment it belongs to, so it is accepted only when it resolves to
+            # subscriptions in a single segment.
+            bare_stock_code = "_" not in symbol_key and not symbol_key.startswith("-")
+            bare_matches = []
             with self.lock:
                 for sub in self.subscriptions.values():
                     # Check if mode is compatible
@@ -418,21 +510,32 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
                     # Match by token (may be "11536_NSE" or "11536")
                     if sub["token"] == symbol_key or sub["symbol"] == symbol_key:
-                        matching_subscriptions.append(sub)
-                        continue
-
-                    # Try matching with exchange suffix (if token doesn't have it)
-                    token_with_exchange = f"{sub['token']}_{sub['brexchange']}"
-                    if symbol_key == token_with_exchange:
-                        matching_subscriptions.append(sub)
-                        continue
-
-                    # Try matching by extracting scripCode from symbol_key (handle "11536_NSE" -> "11536")
-                    if "_" in symbol_key:
-                        scripcode = symbol_key.split("_")[0]
-                        if sub["token"] == scripcode:
+                        if bare_stock_code:
+                            bare_matches.append(sub)
+                        else:
                             matching_subscriptions.append(sub)
-                            continue
+                        continue
+
+                    # Try matching with exchange suffix (if token doesn't have it).
+                    # The scrip code alone is not unique across segments, so the
+                    # suffix must be the one this subscription was sent with.
+                    token_with_exchange = f"{sub['token']}_{sub['brexchange']}"
+                    token_with_segment = (
+                        f"{sub['token']}_{SamcoExchangeMapper.get_exchange_type(sub['brexchange'])}"
+                    )
+                    if symbol_key in (token_with_exchange, token_with_segment):
+                        matching_subscriptions.append(sub)
+                        continue
+
+            if bare_matches:
+                segments = {sub["brexchange"] for sub in bare_matches}
+                if len(segments) == 1:
+                    matching_subscriptions.extend(bare_matches)
+                else:
+                    self.logger.debug(
+                        f"Dropping tick for bare scrip code {symbol_key}: it matches "
+                        f"subscriptions in {sorted(segments)}"
+                    )
 
             if not matching_subscriptions:
                 self.logger.debug(
@@ -488,15 +591,29 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
         Returns:
             Dict: Market data for publishing
         """
+        # Exchange last-trade time (lTrdT / ltt / lttUTC), omitted when Samco
+        # did not send one: the local clock is not the trade time.
+        trade_time = {}
+        if message.get("last_trade_time_ms"):
+            trade_time = {
+                "ltt": message["last_trade_time_ms"],
+                "last_trade_time": message["last_trade_time_ms"],
+            }
+        optional = {
+            key: message[key]
+            for key in ("average_price", "total_buy_quantity", "total_sell_quantity")
+            if key in message
+        }
+
         if mode == 1:  # LTP mode
             return {
                 "ltp": message.get("last_traded_price", 0),
-                "ltt": message.get("exchange_timestamp", 0),
+                **trade_time,
             }
         elif mode == 2:  # Quote mode
             return {
                 "ltp": message.get("last_traded_price", 0),
-                "ltt": message.get("exchange_timestamp", 0),
+                **trade_time,
                 "volume": message.get("volume_trade_for_the_day", 0),
                 "open": message.get("open_price_of_the_day", 0),
                 "high": message.get("high_price_of_the_day", 0),
@@ -509,11 +626,13 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 "best_bid_quantity": message.get("best_bid_quantity", 0),
                 "best_ask_price": message.get("best_ask_price", 0),
                 "best_ask_quantity": message.get("best_ask_quantity", 0),
+                "last_quantity": message.get("last_traded_quantity", 0),
+                **optional,
             }
         elif mode == 3:  # Snap Quote mode (includes depth data)
             result = {
                 "ltp": message.get("last_traded_price", 0),
-                "ltt": message.get("exchange_timestamp", 0),
+                **trade_time,
                 "volume": message.get("volume_trade_for_the_day", 0),
                 "open": message.get("open_price_of_the_day", 0),
                 "high": message.get("high_price_of_the_day", 0),
@@ -522,6 +641,7 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 "last_quantity": message.get("last_traded_quantity", 0),
                 "change": message.get("change", 0),
                 "change_percentage": message.get("change_percentage", 0),
+                **optional,
             }
 
             # Pass through depth data from samcoWebSocket normalization

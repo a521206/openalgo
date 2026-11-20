@@ -1,14 +1,16 @@
 # Docker Installation Scripts - Compatibility Analysis
 
+This is a historical January 2026 implementation/troubleshooting record. For current setup, writable `.env` mounts, resource defaults and worker selection, use [Docker Deployment](docker.md) and [Docker Build Guide](DOCKER_BUILD_GUIDE.md).
+
 ## Summary
 
 All three Docker installation scripts need updates to support the numba/llvmlite/scipy fixes:
 
 | Script | Status | Issues Found | Priority |
 |--------|--------|--------------|----------|
-| docker-run.sh | ❌ NEEDS UPDATE | Missing shm_size, tmp volume | HIGH |
-| docker-run.bat | ❌ NEEDS UPDATE | Missing shm_size, tmp volume | HIGH |
-| install-docker.sh | ❌ NEEDS UPDATE | docker-compose.yaml missing config | HIGH |
+| docker-run.sh | NEEDS UPDATE | Missing shm_size, tmp volume | HIGH |
+| docker-run.bat | NEEDS UPDATE | Missing shm_size, tmp volume | HIGH |
+| install-docker.sh | NEEDS UPDATE | docker-compose.yaml missing config | HIGH |
 
 ---
 
@@ -25,15 +27,15 @@ docker run -d \
     -v "$OPENALGO_DIR/db:/app/db" \
     -v "$OPENALGO_DIR/strategies:/app/strategies" \
     -v "$OPENALGO_DIR/log:/app/log" \
-    -v "$OPENALGO_DIR/.env:/app/.env:ro" \
+    -v "$OPENALGO_DIR/.env:/app/.env" \
     --restart unless-stopped \
     "$IMAGE"
 ```
 
 **Missing:**
-- ❌ `--shm-size=2g` - Required for scipy memory operations
-- ❌ Volume for `/app/tmp` - Required for numba cache
-- ❌ Volume for `/app/keys` - Required for API keys/certificates
+- `--shm-size=2g` - Required for scipy memory operations
+- Volume for `/app/tmp` - Required for numba cache
+- Volume for `/app/keys` - Required for API keys/certificates
 
 **Should be:**
 ```bash
@@ -47,7 +49,7 @@ docker run -d \
     -v "$OPENALGO_DIR/log:/app/log" \
     -v "$OPENALGO_DIR/keys:/app/keys" \
     -v "$OPENALGO_DIR/tmp:/app/tmp" \
-    -v "$OPENALGO_DIR/.env:/app/.env:ro" \
+    -v "$OPENALGO_DIR/.env:/app/.env" \
     --restart unless-stopped \
     "$IMAGE"
 ```
@@ -71,15 +73,15 @@ docker run -d ^
     -v "%OPENALGO_DIR%\db:/app/db" ^
     -v "%OPENALGO_DIR%\strategies:/app/strategies" ^
     -v "%OPENALGO_DIR%\log:/app/log" ^
-    -v "%OPENALGO_DIR%\.env:/app/.env:ro" ^
+    -v "%OPENALGO_DIR%\.env:/app/.env" ^
     --restart unless-stopped ^
     %IMAGE%
 ```
 
 **Missing:**
-- ❌ `--shm-size=2g` - Required for scipy memory operations
-- ❌ Volume for `/app/tmp` - Required for numba cache
-- ❌ Volume for `/app/keys` - Required for API keys/certificates
+- `--shm-size=2g` - Required for scipy memory operations
+- Volume for `/app/tmp` - Required for numba cache
+- Volume for `/app/keys` - Required for API keys/certificates
 
 **Should be:**
 ```batch
@@ -93,7 +95,7 @@ docker run -d ^
     -v "%OPENALGO_DIR%\log:/app/log" ^
     -v "%OPENALGO_DIR%\keys:/app/keys" ^
     -v "%OPENALGO_DIR%\tmp:/app/tmp" ^
-    -v "%OPENALGO_DIR%\.env:/app/.env:ro" ^
+    -v "%OPENALGO_DIR%\.env:/app/.env" ^
     --restart unless-stopped ^
     %IMAGE%
 ```
@@ -129,7 +131,7 @@ services:
       - openalgo_log:/app/log
       - openalgo_strategies:/app/strategies
       - openalgo_keys:/app/keys
-      - ./.env:/app/.env:ro
+      - ./.env:/app/.env
 
     environment:
       - FLASK_ENV=production
@@ -159,8 +161,8 @@ volumes:
 ```
 
 **Missing:**
-- ❌ `shm_size: '2gb'` - Required for scipy/numba memory operations
-- ❌ `openalgo_tmp` volume and mount - Required for numba cache
+- `shm_size: '2gb'` - Required for scipy/numba memory operations
+- `openalgo_tmp` volume and mount - Required for numba cache
 
 **Should be:**
 ```yaml
@@ -183,7 +185,7 @@ services:
       - openalgo_strategies:/app/strategies
       - openalgo_keys:/app/keys
       - openalgo_tmp:/app/tmp
-      - ./.env:/app/.env:ro
+      - ./.env:/app/.env
 
     environment:
       - FLASK_ENV=production
@@ -226,28 +228,28 @@ volumes:
 ## Impact if Not Updated
 
 ### Without `--shm-size=2g`:
-- ❌ scipy operations may fail with memory errors
-- ❌ Option Greeks calculations will fail
-- ❌ Statistical analysis functions will be unreliable
+- scipy operations may fail with memory errors
+- Option Greeks calculations will fail
+- Statistical analysis functions will be unreliable
 
 ### Without `/app/tmp` volume:
-- ❌ numba JIT compilation will fail
-- ❌ Master contract CSV processing errors
-- ❌ Strategy indicators (Supertrend, EMA, TEMA) won't work
+- numba JIT compilation will fail
+- Master contract CSV processing errors
+- Strategy indicators (Supertrend, EMA, TEMA) won't work
 
 ### Without `/app/keys` volume:
-- ⚠️  API keys/certificates not persisted across container rebuilds
-- ⚠️  Need to reconfigure on every restart
+- API keys/certificates not persisted across container rebuilds
+- Need to reconfigure on every restart
 
 ---
 
 ## Backward Compatibility
 
 All changes are **backward compatible**:
-- ✅ Existing installations can pull new image without breaking
-- ✅ New volumes will be created automatically
-- ✅ Shared memory allocation is transparent to application
-- ✅ No database migrations required
+- Existing installations can pull new image without breaking
+- New volumes will be created automatically
+- Shared memory allocation is transparent to application
+- No database migrations required
 
 ---
 
@@ -288,11 +290,11 @@ After updating scripts:
 
 ## Recommended Actions
 
-1. ✅ Update all three scripts
-2. ✅ Test each script thoroughly
-3. ✅ Update Docker Hub image with fixes
-4. ✅ Document changes in CHANGELOG
-5. ✅ Notify users to update their installations
+1. Update all three scripts
+2. Test each script thoroughly
+3. Update Docker Hub image with fixes
+4. Document changes in CHANGELOG
+5. Notify users to update their installations
 
 ---
 

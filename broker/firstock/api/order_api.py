@@ -11,6 +11,10 @@ from database.auth_db import get_auth_token
 from database.token_db import get_br_symbol, get_symbol, get_token
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
+from utils.position_read import read_position_book, refuse_smart_order_on_read_failure
+from utils.smart_order_guard import PositionBookCache, SymbolLocks
+import threading
+import time
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -102,11 +106,11 @@ def get_ltp(auth, exchange, token):
 
 
 def get_holdings(auth):
-    """Get holdings from Firstock"""
+    """Get holdings from Firstock, enriched with NSE LTP for each holding."""
     response = get_api_response("/holdings", auth)
-    logger.info(f"Raw holdings response: {json.dumps(response, indent=2)}")
+    logger.debug(f"Raw holdings response: {json.dumps(response, indent=2)}")
 
-    # If successful, get LTP for each holding
+    # If successful, fetch LTP for each NSE entry
     if response.get("status") == "success":
         for holding in response.get("data", []):
             nse_entries = [
@@ -117,17 +121,62 @@ def get_holdings(auth):
             if nse_entries:
                 nse_entry = nse_entries[0]
                 ltp_response = get_ltp(auth, nse_entry["exchange"], nse_entry["token"])
-                logger.info(
-                    "LTP response for {nse_entry['tradingSymbol']}:",
-                    json.dumps(ltp_response, indent=2),
+                logger.debug(
+                    f"LTP response for {nse_entry['tradingSymbol']}: "
+                    f"{json.dumps(ltp_response, indent=2)}"
                 )
                 if ltp_response.get("status") == "success":
                     nse_entry["ltp"] = ltp_response.get("data", {}).get("ltp", "0.00")
                 else:
-                    logger.info(f"Failed to get LTP for {nse_entry['tradingSymbol']}")
+                    logger.debug(f"Failed to get LTP for {nse_entry['tradingSymbol']}")
                     nse_entry["ltp"] = "0.00"
 
     return response
+
+
+# --- Per-Symbol Smart Order Lock ---
+# Ensures only one smart order per symbol executes at a time.
+# Others queue and execute sequentially, each getting a fresh position book.
+# The registry only holds the symbols in use right now, and under the gthread
+# worker a smart order gives up after SMART_ORDER_LOCK_WAIT_SECONDS rather
+# than hold a request thread behind a slow broker. Under eventlet and the dev
+# server it waits as long as it takes, as before.
+_symbol_locks = SymbolLocks(name="firstock smart orders")
+
+# --- Position Book Cache ---
+# Caches get_positions() for 1 second. Invalidated after each smart order placement.
+# A fetch still in flight when an order invalidates the book is returned to
+# its own caller but never cached, so the next order cannot size itself
+# against the position from before that fill.
+_position_cache = PositionBookCache()
+
+
+def _get_symbol_lock(symbol, exchange, product):
+    """Hold the per-symbol smart-order lock for the body of a ``with`` block.
+
+    Yields True while held, or False when the bounded wait under the gthread
+    worker ran out; the caller then returns ``SymbolLocks.busy(symbol)`` and
+    places nothing.
+    """
+    return _symbol_locks.hold(symbol, exchange, product)
+
+
+def _position_book_ok(positions_data):
+    """Firstock wraps a book it read as {"status": "success", ...}; failures say "failed"."""
+    return isinstance(positions_data, dict) and positions_data.get("status") == "success"
+
+
+def _get_cached_positions(auth):
+    """Get positions from cache if fresh, otherwise fetch from broker API."""
+    return _position_cache.get(
+        auth,
+        lambda: read_position_book("firstock", lambda: get_positions(auth), _position_book_ok),
+    )
+
+
+def _invalidate_position_cache(auth):
+    """Invalidate the position cache so the next queued order fetches fresh data."""
+    _position_cache.invalidate(auth)
 
 
 def get_open_position(tradingsymbol, exchange, producttype, auth):
@@ -151,7 +200,7 @@ def get_open_position(tradingsymbol, exchange, producttype, auth):
     # Convert product type to Firstock format
     producttype = map_product_type(producttype)
 
-    positions_data = get_positions(auth)
+    positions_data = _get_cached_positions(auth)
     net_qty = "0"
 
     if positions_data.get("status") == "success":
@@ -186,10 +235,11 @@ def place_order_api(data, auth):
     api_key = api_key[:-4]
 
     token = get_token(data["symbol"], data["exchange"])
-    transformed_data = transform_data(data, token)
+    transformed_data = transform_data(data, token, auth)
     transformed_data.update({"jKey": auth, "userId": api_key})
 
-    logger.info(f"{transformed_data}")
+    safe_data = {k: v for k, v in transformed_data.items() if k != "jKey"}
+    logger.debug(f"{safe_data}")
 
     try:
         # Get the shared httpx client with connection pooling
@@ -205,8 +255,8 @@ def place_order_api(data, auth):
         response.status = response.status_code
 
         response_data = response.json()
-        logger.info(f"Response Status: {response.status}")
-        logger.info(f"Response Data: {response_data}")
+        logger.debug(f"Response Status: {response.status}")
+        logger.debug(f"Response Data: {response_data}")
 
         if response_data.get("status") == "success":
             orderid = response_data.get("data", {}).get("orderNumber")
@@ -220,6 +270,7 @@ def place_order_api(data, auth):
         return None, {"status": "failed", "error": str(e)}, None
 
 
+@refuse_smart_order_on_read_failure
 def place_smartorder_api(data, auth):
     AUTH_TOKEN = auth
 
@@ -230,79 +281,87 @@ def place_smartorder_api(data, auth):
     symbol = data.get("symbol")
     exchange = data.get("exchange")
     product = data.get("product")
-    position_size = int(data.get("position_size", "0"))
+    # Per-symbol lock: serialize smart orders per symbol
+    symbol_lock = _get_symbol_lock(symbol, exchange, product)
 
-    # Get current open position for the symbol
-    current_position = int(
-        get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
-    )
+    with symbol_lock as acquired:
+        if not acquired:
+            return SymbolLocks.busy(symbol)
+        position_size = int(data.get("position_size", "0"))
 
-    logger.info(f"position_size : {position_size}")
-    logger.info(f"Open Position : {current_position}")
+        # Get current open position for the symbol
+        current_position = int(
+            get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
+        )
 
-    # Determine action based on position_size and current_position
-    action = None
-    quantity = 0
+        logger.debug(f"position_size : {position_size}")
+        logger.debug(f"Open Position : {current_position}")
 
-    # If both position_size and current_position are 0, do nothing
-    if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
-        action = data["action"]
-        quantity = data["quantity"]
-        # logger.info(f"action : {action}")
-        # logger.info(f"Quantity : {quantity}")
-        res, response, orderid = place_order_api(data, AUTH_TOKEN)
-        # logger.info(f"{res}")
-        # logger.info(f"{response}")
+        # Determine action based on position_size and current_position
+        action = None
+        quantity = 0
 
-        return res, response, orderid
+        # If both position_size and current_position are 0, do nothing
+        if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
+            action = data["action"]
+            quantity = data["quantity"]
+            # logger.debug(f"action : {action}")
+            # logger.debug(f"Quantity : {quantity}")
+            res, response, orderid = place_order_api(data, AUTH_TOKEN)
+            _invalidate_position_cache(AUTH_TOKEN)
+            # logger.debug(f"{res}")
+            # logger.debug(f"{response}")
 
-    elif position_size == current_position:
-        if int(data["quantity"]) == 0:
-            response = {
-                "status": "success",
-                "message": "No OpenPosition Found. Not placing Exit order.",
-            }
-        else:
-            response = {
-                "status": "success",
-                "message": "No action needed. Position size matches current position",
-            }
-        orderid = None
-        return res, response, orderid  # res remains None as no API call was made
+            return res, response, orderid
 
-    if position_size == 0 and current_position > 0:
-        action = "SELL"
-        quantity = abs(current_position)
-    elif position_size == 0 and current_position < 0:
-        action = "BUY"
-        quantity = abs(current_position)
-    elif current_position == 0:
-        action = "BUY" if position_size > 0 else "SELL"
-        quantity = abs(position_size)
-    else:
-        if position_size > current_position:
-            action = "BUY"
-            quantity = position_size - current_position
-            # logger.info(f"smart buy quantity : {quantity}")
-        elif position_size < current_position:
+        elif position_size == current_position:
+            if int(data["quantity"]) == 0:
+                response = {
+                    "status": "success",
+                    "message": "No OpenPosition Found. Not placing Exit order.",
+                }
+            else:
+                response = {
+                    "status": "success",
+                    "message": "No action needed. Position size matches current position",
+                }
+            orderid = None
+            return res, response, orderid  # res remains None as no API call was made
+
+        if position_size == 0 and current_position > 0:
             action = "SELL"
-            quantity = current_position - position_size
-            # logger.info(f"smart sell quantity : {quantity}")
+            quantity = abs(current_position)
+        elif position_size == 0 and current_position < 0:
+            action = "BUY"
+            quantity = abs(current_position)
+        elif current_position == 0:
+            action = "BUY" if position_size > 0 else "SELL"
+            quantity = abs(position_size)
+        else:
+            if position_size > current_position:
+                action = "BUY"
+                quantity = position_size - current_position
+                # logger.debug(f"smart buy quantity : {quantity}")
+            elif position_size < current_position:
+                action = "SELL"
+                quantity = current_position - position_size
+                # logger.debug(f"smart sell quantity : {quantity}")
 
-    if action:
-        # Prepare data for placing the order
-        order_data = data.copy()
-        order_data["action"] = action
-        order_data["quantity"] = str(quantity)
+        if action:
+            # Prepare data for placing the order
+            order_data = data.copy()
+            order_data["action"] = action
+            order_data["quantity"] = str(quantity)
 
-        # logger.info(f"{order_data}")
-        # Place the order
-        res, response, orderid = place_order_api(order_data, auth)
-        # logger.info(f"{res}")
-        logger.info(f"{response}")
-        logger.info(f"{orderid}")
+            # logger.debug(f"{order_data}")
+            # Place the order
+            res, response, orderid = place_order_api(order_data, auth)
+            _invalidate_position_cache(AUTH_TOKEN)
+            # logger.debug(f"{res}")
+            logger.debug(f"{response}")
+            logger.debug(f"{orderid}")
 
-        return res, response, orderid
+            return res, response, orderid
 
 
 def close_all_positions(current_api_key, auth):
@@ -498,12 +557,15 @@ def modify_order(data, auth):
     api_key = os.getenv("BROKER_API_KEY")
     api_key = api_key[:-4]  # Remove last 4 characters
 
-    # Get token and transform symbol
+    # Get token. Do NOT mutate data["symbol"] to the broker symbol — MPP
+    # inside transform_modify_order_data needs the OpenAlgo symbol for
+    # get_quotes / get_instrument_type_from_symbol / get_symbol_info
+    # lookups. transform_modify_order_data computes the broker symbol
+    # itself via get_br_symbol, matching the transform_data pattern.
     token = get_token(data["symbol"], data["exchange"])
-    data["symbol"] = get_br_symbol(data["symbol"], data["exchange"])
 
-    # Transform the data to Firstock format
-    transformed_data = transform_modify_order_data(data, token)
+    # Transform the data to Firstock format (auth passed for MPP quote fetch)
+    transformed_data = transform_modify_order_data(data, token, auth)
     transformed_data.update({"jKey": auth, "userId": api_key})
 
     # Set up the request
@@ -550,7 +612,7 @@ def cancel_all_orders_api(data, auth):
     AUTH_TOKEN = auth
 
     order_book_response = get_order_book(AUTH_TOKEN)
-    # logger.info(f"{order_book_response}")
+    # logger.debug(f"{order_book_response}")
     if order_book_response is None:
         return [], []  # Return empty lists indicating failure to retrieve the order book
 
@@ -560,7 +622,7 @@ def cancel_all_orders_api(data, auth):
         for order in order_book_response.get("data", [])
         if order["status"] in ["OPEN", "TRIGGER_PENDING"]
     ]
-    # logger.info(f"{orders_to_cancel}")
+    # logger.debug(f"{orders_to_cancel}")
     canceled_orders = []
     failed_cancellations = []
 
@@ -591,7 +653,7 @@ def placeorder(data, auth):
     api_key = api_key[:-4]  # Remove last 4 characters
 
     token = get_token(data["symbol"], data["exchange"])
-    transformed_data = transform_data(data, token)
+    transformed_data = transform_data(data, token, auth)
     transformed_data.update({"jKey": auth, "userId": api_key})
 
     return get_api_response("/placeOrder", auth, payload=transformed_data)

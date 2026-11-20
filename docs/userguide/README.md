@@ -10,7 +10,8 @@ This guide takes you from zero to automated trading, covering everything from ba
 
 ### Getting Started (Modules 01-05)
 - [01 - What is OpenAlgo](./01-what-is-openalgo/README.md)
-- [02 - Key Concepts](./02-key-concepts/README.md)
+- [02 - Why Build with OpenAlgo](./02-why-build-with-openalgo/README.md)
+- [03 - Key Concepts](./03-key-concepts/README.md)
 - [03 - System Requirements](./03-system-requirements/README.md)
 - [04 - Installation Guide](./04-installation/README.md)
 - [05 - First-Time Setup](./05-first-time-setup/README.md)
@@ -55,6 +56,12 @@ This guide takes you from zero to automated trading, covering everything from ba
 - [29 - Troubleshooting](./29-troubleshooting/README.md)
 - [30 - FAQs](./30-faqs/README.md)
 
+### Analytics Tools (Module 31)
+- [31 - Tools (Options & Portfolio Analytics Suite)](./31-tools/README.md)
+
+### Charting (Module 32)
+- [32 - Charting Terminal](./32-charting-terminal/README.md) - trade from the chart, the order dock, drawing tools and every keyboard shortcut
+
 ## Quick Navigation
 
 | I want to... | Go to |
@@ -68,10 +75,16 @@ This guide takes you from zero to automated trading, covering everything from ba
 | Connect TradingView | [Module 16](./16-tradingview-integration/README.md) |
 | Build visual strategies | [Module 21](./21-flow-visual-builder/README.md) |
 | Get Telegram alerts | [Module 23](./23-telegram-bot/README.md) |
+| Use options and portfolio analytics | [Module 31](./31-tools/README.md) |
+| Host a Python script with a schedule | [Module 20](./20-python-strategies/README.md) |
+| Write, backtest or deploy OpenScript | [OpenScript](../openscript.md) |
+| Configure a batch or signal strategy with RMS | [Strategy Module & RMS](../prompt/strategy_rms_documentation.md) |
+| Connect a remote MCP client | [Remote MCP](./remote-mcp.md) |
+| Install Desktop or companion apps | [Installation](./04-installation/README.md#desktop-and-companion-apps) |
 
 ## Additional Resources
 
-- **Developer Documentation**: See `/design` folder for technical architecture
+- **Developer Documentation**: [System design](../design/README.md) and [documentation index](../INDEX.md)
 - **Official Docs**: [docs.openalgo.in](https://docs.openalgo.in)
 - **Community**: [Discord](https://www.openalgo.in/discord)
 - **Video Tutorials**: [YouTube](https://www.youtube.com/@openalgo)

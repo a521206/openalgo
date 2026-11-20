@@ -34,6 +34,11 @@ uv run app.py
 - [ ] Dashboard shows funds
 
 ### Basic Trading Flow
+
+Rehearse these steps in Analyzer mode first. An order that loses its response
+may still have reached the broker: reconcile the order book, trades and
+positions before resubmitting.
+
 - [ ] Symbol search works
 - [ ] Place market order
 - [ ] Order appears in orderbook
@@ -96,7 +101,7 @@ uv run app.py
 
 | Feature | Works | Notes |
 |---------|-------|-------|
-| Webhook Strategy | [ ] | |
+| Flow Webhook | [ ] | |
 | Python Strategy | [ ] | |
 | ChartInk Strategy | [ ] | |
 | TradingView Webhook | [ ] | |
@@ -208,7 +213,12 @@ Currency: USDINR27JAN26FUT, USDINR27JAN2684CE
 MCX:      CRUDEOIL17JAN26FUT, GOLD05FEB26FUT
 ```
 
-### Lot Sizes
+### Illustrative lot sizes
+
+Read the current contract's `lotsize` and `freeze_qty` from the symbol/search
+API before sizing an order. The examples below are not a current exchange
+reference.
+
 | Symbol | Lot Size |
 |--------|----------|
 | NIFTY | 65 |
@@ -235,7 +245,6 @@ MCX:      CRUDEOIL17JAN26FUT, GOLD05FEB26FUT
 ## Platform Quick Check
 
 ### Python Versions
-- [ ] 3.11: `python3.11 -m venv venv && source venv/bin/activate && pip install -r requirements.txt && python app.py`
 - [ ] 3.12: `python3.12 -m venv venv && ...`
 - [ ] 3.13: `python3.13 -m venv venv && ...`
 
@@ -362,4 +371,3 @@ Run this sequence to verify basic functionality:
 _______________________________
 _______________________________
 _______________________________
-

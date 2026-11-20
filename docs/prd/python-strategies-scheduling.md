@@ -1,5 +1,7 @@
 # Python Strategies Scheduling
 
+Current scheduling contract: the logged-in broker's `plugin.json` controls the offered exchanges. Crypto brokers use `CRYPTO`; stock brokers use Indian exchanges. A CRYPTO schedule may omit `stop_time` (or use empty/null) for continuous operation: no stop job is created and the scheduled start can restart a script that exited. Equal start/stop times are rejected for CRYPTO. Indian-exchange strategies continue to follow the trading calendar and its session controls. The scheduler examples below illustrate the bounded-session path; see the maintained [API reference](python-strategies-api-reference.md) for the full contract.
+
 Complete documentation for APScheduler integration and market-aware scheduling.
 
 ## Overview
@@ -34,9 +36,10 @@ Python strategies use APScheduler with IST timezone support to automatically sta
 │  │    │                                                                     ││
 │  │    └── Check holiday calendar (NSE holidays)                            ││
 │  │                                                                          ││
-│  │  Market Hours:                                                           ││
+│  │  Market Hours (read from the market calendar DB, not hardcoded):         ││
 │  │    NSE/BSE: 09:15 - 15:30                                               ││
-│  │    MCX: 09:00 - 23:30                                                   ││
+│  │    NFO/BFO: 09:15 - 15:40  (F&O runs past the cash close)               ││
+│  │    MCX: 09:00 - 23:55                                                   ││
 │  │    CDS: 09:00 - 17:00                                                   ││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -90,11 +93,11 @@ def initialize_scheduler():
 │  Stop Time:  [15:15] IST                                    │
 │                                                              │
 │  Trading Days:                                               │
-│  [✓] Monday                                                  │
-│  [✓] Tuesday                                                 │
-│  [✓] Wednesday                                               │
-│  [✓] Thursday                                                │
-│  [✓] Friday                                                  │
+│  [ ] Monday                                                  │
+│  [ ] Tuesday                                                 │
+│  [ ] Wednesday                                               │
+│  [ ] Thursday                                                │
+│  [ ] Friday                                                  │
 │  [ ] Saturday                                                │
 │                                                              │
 │  [Save Schedule] [Clear Schedule]                           │

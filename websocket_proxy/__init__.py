@@ -57,6 +57,9 @@ from broker.ibulls.streaming.ibulls_adapter import IbullsWebSocketAdapter
 # Import the iifl_adapter
 from broker.iifl.streaming.iifl_adapter import IiflWebSocketAdapter
 
+# Import the iiflcapital_adapter
+from broker.iiflcapital.streaming.iiflcapital_adapter import IiflcapitalWebSocketAdapter
+
 # Import the indmoney_adapter
 from broker.indmoney.streaming.indmoney_adapter import IndmoneyWebSocketAdapter
 
@@ -74,6 +77,7 @@ from broker.mstock.streaming.mstock_adapter import MstockWebSocketAdapter
 
 # Import the nubra_adapter
 from broker.nubra.streaming.nubra_adapter import NubraWebSocketAdapter
+from broker.nuvama.streaming.nuvama_adapter import NuvamaWebSocketAdapter
 
 # Import the paytm_adapter
 from broker.paytm.streaming.paytm_adapter import PaytmWebSocketAdapter
@@ -81,11 +85,17 @@ from broker.paytm.streaming.paytm_adapter import PaytmWebSocketAdapter
 # Import the pocketful_adapter
 from broker.pocketful.streaming.pocketful_adapter import PocketfulWebSocketAdapter
 
+# Import the rmoney_adapter
+from broker.rmoney.streaming.rmoney_adapter import RMoneyWebSocketAdapter
+
 # Import the samco_adapter
 from broker.samco.streaming.samco_adapter import SamcoWebSocketAdapter
 
 # Import the shoonya_adapter
 from broker.shoonya.streaming.shoonya_adapter import ShoonyaWebSocketAdapter
+
+# Import the tradesmart_adapter
+from broker.tradesmart.streaming.tradesmart_adapter import TradeSmartWebSocketAdapter
 
 # Import the upstox_adapter
 from broker.upstox.streaming.upstox_adapter import UpstoxWebSocketAdapter
@@ -96,6 +106,21 @@ from broker.wisdom.streaming.wisdom_adapter import WisdomWebSocketAdapter
 # Import the zerodha_adapter
 from broker.zerodha.streaming.zerodha_adapter import ZerodhaWebSocketAdapter
 
+# Import the arrow_adapter
+from broker.arrow.streaming.arrow_adapter import ArrowWebSocketAdapter
+
+# Import the rupeezy_adapter
+from broker.rupeezy.streaming.rupeezy_adapter import RupeezyWebSocketAdapter
+from broker.sahi.streaming.sahi_adapter import SahiWebSocketAdapter
+
+# Import the hdfcsky_adapter
+from broker.hdfcsky.streaming.hdfcsky_adapter import HDFCSkyWebSocketAdapter
+
+# Import the hdfcsecurities_adapter
+from broker.hdfcsecurities.streaming.hdfcsecurities_adapter import (
+    HDFCSecuritiesWebSocketAdapter,
+)
+
 # AliceBlue adapter will be loaded dynamically
 
 # Register adapters
@@ -104,11 +129,13 @@ register_adapter("zerodha", ZerodhaWebSocketAdapter)
 register_adapter("dhan", DhanWebSocketAdapter)
 register_adapter("flattrade", FlattradeWebSocketAdapter)
 register_adapter("shoonya", ShoonyaWebSocketAdapter)
+register_adapter("tradesmart", TradeSmartWebSocketAdapter)
 register_adapter("ibulls", IbullsWebSocketAdapter)
 register_adapter("compositedge", CompositedgeWebSocketAdapter)
 register_adapter("fivepaisa", FivepaisaWebSocketAdapter)
 register_adapter("fivepaisaxts", FivepaisaXTSWebSocketAdapter)
 register_adapter("iifl", IiflWebSocketAdapter)
+register_adapter("iiflcapital", IiflcapitalWebSocketAdapter)
 register_adapter("wisdom", WisdomWebSocketAdapter)
 register_adapter("upstox", UpstoxWebSocketAdapter)
 register_adapter("kotak", KotakWebSocketAdapter)
@@ -122,6 +149,13 @@ register_adapter("jainamxts", JainamXTSWebSocketAdapter)
 register_adapter("samco", SamcoWebSocketAdapter)
 register_adapter("pocketful", PocketfulWebSocketAdapter)
 register_adapter("nubra", NubraWebSocketAdapter)
+register_adapter("nuvama", NuvamaWebSocketAdapter)
+register_adapter("rmoney", RMoneyWebSocketAdapter)
+register_adapter("arrow", ArrowWebSocketAdapter)
+register_adapter("rupeezy", RupeezyWebSocketAdapter)
+register_adapter("sahi", SahiWebSocketAdapter)
+register_adapter("hdfcsky", HDFCSkyWebSocketAdapter)
+register_adapter("hdfcsecurities", HDFCSecuritiesWebSocketAdapter)
 
 # AliceBlue adapter will be registered dynamically when first used
 
@@ -151,11 +185,13 @@ __all__ = [
     "DhanWebSocketAdapter",
     "FlattradeWebSocketAdapter",
     "ShoonyaWebSocketAdapter",
+    "TradeSmartWebSocketAdapter",
     "IbullsWebSocketAdapter",
     "CompositedgeWebSocketAdapter",
     "FivepaisaWebSocketAdapter",
     "FivepaisaXTSWebSocketAdapter",
     "IiflWebSocketAdapter",
+    "IiflcapitalWebSocketAdapter",
     "JainamWebSocketAdapter",
     "TrustlineWebSocketAdapter",
     "WisdomWebSocketAdapter",
@@ -171,4 +207,11 @@ __all__ = [
     "SamcoWebSocketAdapter",
     "PocketfulWebSocketAdapter",
     "NubraWebSocketAdapter",
+    "NuvamaWebSocketAdapter",
+    "RMoneyWebSocketAdapter",
+    "ArrowWebSocketAdapter",
+    "RupeezyWebSocketAdapter",
+    "SahiWebSocketAdapter",
+    "HDFCSkyWebSocketAdapter",
+    "HDFCSecuritiesWebSocketAdapter",
 ]

@@ -17,6 +17,7 @@ Works for:
 - Existing users on any version (skips already applied migrations)
 """
 
+import argparse
 import os
 import subprocess
 import sys
@@ -35,6 +36,25 @@ PROJECT_ROOT = os.path.dirname(UPGRADE_DIR)
 
 # Migration scripts in order of execution
 # Each migration is idempotent - safe to run multiple times
+#
+# DO NOT add destructive migrations here.
+# In particular, upgrade/rotate_pepper.py is intentionally absent from this
+# list. It rotates API_KEY_PEPPER and re-encrypts every PEPPER-derived
+# ciphertext, which invalidates Argon2 password hashes and forces a one-time
+# password reset for every user. That is operator-controlled work, not
+# something to run unattended on every update. Operators run it explicitly:
+#   cd upgrade && uv run rotate_pepper.py
+#
+# upgrade/migrate_drop_legacy_strategy.py is absent for the same reason. It
+# drops the retired `strategies` and `strategy_symbol_mappings` tables, whose
+# rows are user-authored trading configuration: which symbols a strategy
+# traded, at what quantity, with what product. It exports every row to JSON
+# before dropping and refuses to drop if that export fails, but an export is
+# not consent. Deleting a user's saved configuration during a routine upgrade
+# is exactly the class of surprise this list exists to prevent, so the operator
+# runs it when they have decided they no longer need the data:
+#   cd upgrade && uv run migrate_drop_legacy_strategy.py --status
+#   cd upgrade && uv run migrate_drop_legacy_strategy.py
 MIGRATIONS = [
     # Legacy migrations (for users upgrading from older versions)
     ("add_feed_token.py", "Feed Token Support"),
@@ -46,6 +66,8 @@ MIGRATIONS = [
     ("migrate_sandbox.py", "Sandbox Mode"),
     ("migrate_order_mode.py", "Order Mode & Action Center"),
     ("migrate_sandbox_pnl.py", "Sandbox Day-wise PnL Tracking"),
+    ("migrate_sandbox_trigger_pending.py", "Sandbox Trigger-Pending Order Status"),
+    ("migrate_gtt.py", "GTT Order Support"),
     # Performance migrations
     ("migrate_indexes.py", "Database Performance Indexes"),
     # Feature migrations
@@ -55,8 +77,43 @@ MIGRATIONS = [
     ("migrate_health_process_details.py", "Health Metrics Process Details"),
     ("migrate_master_contract_stats.py", "Master Contract Smart Download"),
     ("migrate_contract_value.py", "Contract Value Column for Crypto"),
-    ("migrate_smart_trade_rules.py", "Smart Trade Rules Columns"),
+    ("migrate_market_holidays.py", "2026 Market Holiday Calendar Update"),
+    ("migrate_leverage.py", "Leverage Configuration for Crypto"),
+    ("migrate_samco_auth.py", "Samco 2FA Authentication"),
+    ("migrate_zerodha_new_exchanges.py", "Zerodha NCO/GLOBAL_INDEX & GIFTNIFTY Cleanup"),
+    ("add_totp_purpose_flags.py", "Per-Purpose 2FA Flags (login/MCP/reset)"),
+    ("migrate_gtt_sandbox.py", "Sandbox GTT Support & CAS F&O Close (15:40)"),
+    ("migrate_historify_drop_indexes.py", "Historify Unused Index Removal (#1779)"),
+    ("migrate_historify_sequences.py", "Historify ID Sequences"),
+    ("migrate_watchlist.py", "Charting Terminal Watchlists"),
+    ("migrate_strategy_module.py", "Strategy Module (multi-leg options + RMS)"),
+    ("migrate_strategy_universe_tab.py", "Strategy Module Universe Tab Normalization"),
+    ("migrate_agent.py", "Agent Module (LLM chat and chart surfaces)"),
+    ("migrate_agent_voice.py", "Agent Voice Surface Settings"),
+    ("migrate_agent_voice_phrase_removal.py", "Agent Voice Approval Phrase Removal"),
+    ("migrate_alert_log.py", "Chart Alert Log (/trading alerts history)"),
+    ("migrate_qty_freeze_nov_2026.py", "NSE Index Freeze Limits (2 November 2026)"),
+    ("migrate_muhurat_2026.py", "Diwali Muhurat 2026 Published Timings"),
+    ("migrate_broker_keys.py", "Broker Keys, Session Sign-out and Broker Login State"),
+    ("migrate_alert_channels.py", "Alert Channels (/alerts, Slack and Discord webhooks)"),
+    ("migrate_password_reset_grants.py", "Password Reset Grants (single-use, expiring resets)"),
 ]
+
+# Legacy migrations historically used non-zero exits for best-effort warnings,
+# so changing every entry to fail-stop would break established upgrades. New
+# required schema migrations are listed explicitly: their failure must reach
+# this runner's summary and process exit code instead of being reported as a
+# successful warning.
+REQUIRED_MIGRATIONS = frozenset(
+    {
+        "migrate_strategy_module.py",
+        "migrate_strategy_universe_tab.py",
+        # Without its table the /alerts page and the settings it saves fail.
+        "migrate_alert_channels.py",
+        # Without its table every password reset is refused.
+        "migrate_password_reset_grants.py",
+    }
+)
 
 
 def run_migration(script_name, description):
@@ -65,6 +122,9 @@ def run_migration(script_name, description):
 
     # Check if script exists
     if not os.path.exists(script_path):
+        if script_name in REQUIRED_MIGRATIONS:
+            print(f"  [X] {script_name} - Required script not found")
+            return False
         print(f"  [SKIP] {script_name} - Script not found")
         return True  # Not an error, might be removed in future
 
@@ -82,9 +142,12 @@ def run_migration(script_name, description):
         if result.returncode == 0:
             print(f"[OK] {description} - Completed")
             return True
-        else:
-            print(f"[!] {description} - Completed with warnings")
-            return True  # Continue even with warnings
+        if script_name in REQUIRED_MIGRATIONS:
+            print(f"[X] {description} - Failed (exit code {result.returncode})")
+            return False
+
+        print(f"[!] {description} - Completed with warnings")
+        return True  # Preserve legacy best-effort migration behavior.
 
     except Exception as e:
         print(f"[X] {description} - Error: {e}")
@@ -93,6 +156,11 @@ def run_migration(script_name, description):
 
 def main():
     """Run all migrations"""
+    parser = argparse.ArgumentParser(
+        description="Run every OpenAlgo migration. This command has no status/preview mode."
+    )
+    parser.parse_args()
+
     print()
     print("#" * 60)
     print("#" + " " * 58 + "#")

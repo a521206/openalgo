@@ -4,14 +4,15 @@ Implements core NATS protocol without external dependencies
 """
 
 import json
-import logging
 import random
 import string
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-logger = logging.getLogger(__name__)
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 # NATS Protocol Commands
 INFO = "INFO"
@@ -195,7 +196,7 @@ class NATSProtocol:
 
             elif self.pending_data.startswith(MSG):
                 # MSG format: MSG <subject> <sid> [reply-to] <#bytes>\r\n<payload>\r\n
-                logger.info("🔍 Found MSG in data stream")
+                logger.debug("Found MSG in data stream")
                 end_idx = self.pending_data.find("\r\n")
                 if end_idx == -1:
                     logger.debug("MSG header incomplete, waiting for more data")
@@ -267,13 +268,13 @@ class NATSProtocol:
 
                 self.pending_data = remaining[size + 2 :]  # Skip payload and \r\n
 
-                logger.info(f"📊 MSG parsed - Subject: {subject}, SID: {sid}, Size: {size}")
+                logger.debug(f"MSG parsed - Subject: {subject}, SID: {sid}, Size: {size}")
 
                 # Process the message
                 if sid in self.subscriptions:
                     sub = self.subscriptions[sid]
                     sub.received_msgs += 1
-                    logger.info(f"✅ Subscription found for SID {sid}: {sub.subject}")
+                    logger.debug(f"Subscription found for SID {sid}: {sub.subject}")
 
                     messages.append(
                         {
@@ -291,7 +292,7 @@ class NATSProtocol:
                     if sub.max_msgs and sub.received_msgs >= sub.max_msgs:
                         del self.subscriptions[sid]
                 else:
-                    logger.warning(f"⚠️ No subscription for SID {sid}, still adding message")
+                    logger.warning(f"No subscription for SID {sid}, still adding message")
                     messages.append(
                         {
                             "type": "MSG",

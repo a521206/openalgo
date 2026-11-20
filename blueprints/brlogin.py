@@ -5,12 +5,27 @@ import json
 import os
 
 import jwt
-from flask import Blueprint, jsonify, make_response, redirect, request, session, url_for
+from flask import Blueprint, g, jsonify, make_response, redirect, request, session, url_for
 from flask import current_app as app
 
 from limiter import limiter  # Import the limiter instance
-from utils.auth_utils import handle_auth_failure, handle_auth_success
+from utils.auth_utils import (
+    begin_broker_login,
+    end_broker_login,
+    handle_auth_failure,
+    handle_auth_success,
+    is_ajax_request,
+    login_error_address,
+)
+from utils.broker_keys import BrokerKeysRefused
+from utils.broker_login import (
+    BrokerLoginRefused,
+    has_pending_login,
+    is_broker_site_post,
+    verify_broker_return,
+)
 from utils.config import (
+    build_external_url,
     get_broker_api_key,
     get_broker_api_secret,
     get_login_rate_limit_hour,
@@ -21,7 +36,6 @@ from utils.logging import get_logger
 # Initialize logger
 logger = get_logger(__name__)
 
-BROKER_API_KEY = get_broker_api_key()
 LOGIN_RATE_LIMIT_MIN = get_login_rate_limit_min()
 LOGIN_RATE_LIMIT_HOUR = get_login_rate_limit_hour()
 
@@ -33,18 +47,169 @@ def ratelimit_handler(e):
     return jsonify(error="Rate limit exceeded"), 429
 
 
+#: Codes the broker login page turns into a message (frontend BrokerSelect).
+#: A code rather than the text, so nobody can put words of their own on the page.
+LOGIN_NOT_STARTED = "login_not_started"
+FORM_EXPIRED = "form_expired"
+
+
+def _refuse_login(code, message, status=403):
+    """Answer a refused broker login: JSON for our pages, the login page otherwise."""
+    from_our_form = request.method == "POST" and not is_broker_site_post(
+        request.view_args.get("broker") if request.view_args else None, request.method
+    )
+    if is_ajax_request() or from_our_form:
+        return jsonify({"status": "error", "code": code, "message": message}), status
+    return redirect(login_error_address(code))
+
+
+def _form_csrf_ok():
+    """Whether a POST from OpenAlgo's broker login form carries a valid CSRF token.
+
+    The callback is exempt from the app-wide CSRF check because two brokers post
+    their answer to it from their own site, so the form posts are checked here.
+    """
+    if not app.config.get("WTF_CSRF_ENABLED", True):
+        return True
+    from flask_wtf.csrf import validate_csrf
+    from wtforms.validators import ValidationError
+
+    token = request.form.get("csrf_token") or request.headers.get("X-CSRFToken")
+    try:
+        validate_csrf(token)
+        return True
+    except ValidationError:
+        return False
+
+
+def _dhan_account_mismatch(keys, reported):
+    """Refuse a Dhan token unless Dhan confirmed it is for the configured client id.
+
+    The Dhan key is saved as ``client_id:::api_key``. A token that works but
+    belongs to a different account must not be stored: orders would reach an
+    account the trader did not configure. With a client id configured, an
+    account Dhan did not report (a failed or incomplete read) is not a match
+    either: the login is refused and can be tried again.
+    """
+    configured = (keys.api_key or "").split(":::")[0].strip() if ":::" in (keys.api_key or "") else ""
+    if not configured:
+        return None
+    if not reported:
+        logger.warning("Refused a Dhan login: Dhan did not confirm which account it is for")
+        return _refuse_login(
+            "account_unverified",
+            "Dhan did not confirm which account this login is for, so it was not stored. "
+            "Log in again.",
+            status=409,
+        )
+    if str(reported).strip() == configured:
+        return None
+    logger.warning("Refused a Dhan login for another account than the configured client id")
+    return _refuse_login(
+        "account_mismatch",
+        "This Dhan login is for a different account than the client ID saved for Dhan. "
+        "Log in with that account, or change the client ID under Broker Configuration.",
+        status=409,
+    )
+
+
+def _xts_account_mismatch(broker, session_user, feed_user):
+    """Refuse an XTS login whose session is for another account than the market data keys.
+
+    ``session_user`` must be the account the broker itself named for the
+    session token (never a label posted beside it); the market data keys log
+    in as the account they were issued to. Both are the trader's own, so two
+    different accounts mean the session is not the trader's.
+    """
+    a = str(session_user or "").strip().upper()
+    b = str(feed_user or "").strip().upper()
+    if not a or not b or a == b:
+        return None
+    return _refuse_xts_account(broker)
+
+
+def _refuse_xts_account(broker):
+    """The refusal for an XTS session of another account than the market data keys."""
+    logger.warning(f"Refused a {broker} login: the session and the market data keys name different accounts")
+    return _refuse_login(
+        "account_mismatch",
+        "This login is for a different account than the market data keys saved for this "
+        "broker. Log in with that account, or check the keys under Broker Configuration.",
+        status=409,
+    )
+
+
 @brlogin_bp.route("/<broker>/callback", methods=["POST", "GET"])
 @limiter.limit(LOGIN_RATE_LIMIT_MIN)
 @limiter.limit(LOGIN_RATE_LIMIT_HOUR)
 def broker_callback(broker, para=None):
+    """Complete a broker login, refusing one this browser did not start.
+
+    The endpoint name is what app.py exempts from the app-wide CSRF check, so
+    the work lives in _broker_callback and this wrapper turns a refusal into an
+    answer the trader can act on.
+    """
+    had_user = "user" in session
+    try:
+        return _broker_callback(broker, para)
+    except BrokerKeysRefused as exc:
+        logger.info(f"Broker login for {broker} refused: {exc}")
+        return _refuse_login("broker_unavailable", str(exc), status=409)
+    except BrokerLoginRefused:
+        logger.warning(f"Refused a {broker} login answer that no login started from this browser")
+        return _refuse_login(
+            LOGIN_NOT_STARTED,
+            "This broker login was not started from OpenAlgo, or it took longer than "
+            "10 minutes. Start the broker login again.",
+        )
+    finally:
+        # A browser that arrived without a sign-in (the XTS post-back, which
+        # carries no cookie) is given one only by a login that completed: a
+        # refused, failed or unfinished one leaves it signed out.
+        if not _end_login_request() and not had_user:
+            session.pop("user", None)
+
+
+def _begin_login_request(broker):
+    """This broker's keys, staged for this request under the broker slot."""
+    return begin_broker_login(broker)
+
+
+def _end_login_request():
+    """Drop the staged keys and give the slot back, however the request ended.
+
+    Returns:
+        bool: Whether the login completed.
+    """
+    return end_broker_login()
+
+
+def _claim_login(broker):
+    """Use up the pending login this answer completes, once per request.
+
+    Every completion goes through here, the broker's answer and OpenAlgo's own
+    login form alike: the login must have been started from Select Broker,
+    within ten minutes, and is used once. When it started is kept, so a
+    sign-out since then stops it from being stored.
+    """
+    if g.get("broker_login_started_at") is None:
+        g.broker_login_started_at = verify_broker_return(broker, state=request.args.get("state"))
+
+
+def _complete_login(auth_token, username, broker, feed_token=None, user_id=None):
+    """Store a broker login, once it is matched to the login it completes."""
+    _claim_login(broker)
+    return handle_auth_success(auth_token, username, broker, feed_token=feed_token, user_id=user_id)
+
+
+def _broker_callback(broker, para=None):
     logger.info(f"Broker callback initiated for: {broker}")
-    logger.debug(f"Session contents: {dict(session)}")
+    logger.debug("Session keys: %s", sorted(session.keys()))
     logger.info(f"Session has user key: {'user' in session}")
 
-    # Special handling for OAuth brokers that come from external OAuth and might lose session
-    if broker in ("compositedge", "rmoney") and "user" not in session:
-        # For Compositedge OAuth callback, we'll handle authentication differently
-        # The session will be established after successful auth token validation
+    # Special handling for brokers that come from external auth and might lose session
+    if broker in ("compositedge", "rmoney", "iiflcapital") and "user" not in session:
+        # Session will be established after successful auth token validation
         logger.info(f"{broker} callback without session - will establish session after auth")
     # Special handling for mstock POST - check session but provide better error instead of redirect
     elif broker == "mstock" and request.method == "POST" and "user" not in session:
@@ -56,10 +221,32 @@ def broker_callback(broker, para=None):
             logger.warning(f"User not in session for {broker} callback, redirecting to login")
             return redirect(url_for("auth.login"))
 
-    if session.get("logged_in"):
-        # Store broker in session and g
-        session["broker"] = broker
+    if session.get("logged_in") and session.get("broker") == broker:
+        # Already logged in to this broker: nothing to do here. A login to
+        # another broker goes on: it is the switch the trader confirmed on
+        # Select Broker, and it needs a login started there like any other.
         return redirect(url_for("dashboard_bp.dashboard"))
+
+    # A POST from OpenAlgo's own login form (PIN, password, TOTP) must carry
+    # the page's CSRF token. The broker-site posts are checked below, by the
+    # state they bring back.
+    if request.method == "POST" and not is_broker_site_post(broker, request.method):
+        if not _form_csrf_ok():
+            return _refuse_login(
+                FORM_EXPIRED, "This login form has expired. Reload the page and try again.", 400
+            )
+
+    # Everything arriving here (a broker's answer, our own login form, or a
+    # sign-in that starts at the callback) must belong to a login started from
+    # Select Broker, checked before any code is exchanged or OTP requested. It
+    # is used up only when the login completes (_claim_login).
+    if not has_pending_login(broker, state=request.args.get("state")):
+        raise BrokerLoginRefused(broker)
+
+    # This broker's keys (.env first, then the keys saved in OpenAlgo), for
+    # this request only, under the slot that keeps another broker's login
+    # from committing in the middle of this one.
+    keys = _begin_login_request(broker)
 
     broker_auth_functions = app.broker_auth_functions
     auth_function = broker_auth_functions.get(f"{broker}_auth")
@@ -67,8 +254,9 @@ def broker_callback(broker, para=None):
     if not auth_function:
         return jsonify(error="Broker authentication function not found."), 404
 
-    # Initialize feed_token to None by default
+    # Initialize optional outputs used by different broker auth flows
     feed_token = None
+    user_id = None
 
     if broker == "fivepaisa":
         if request.method == "GET":
@@ -105,7 +293,10 @@ def broker_callback(broker, para=None):
         elif request.method == "POST":
             # Check if user session is lost
             if "user" not in session:
-                logger.error(f"mstock POST - Session lost! Cookies: {request.cookies}")
+                logger.error(
+                    "mstock POST - Session lost; cookie names: %s",
+                    sorted(request.cookies.keys()),
+                )
                 return jsonify(
                     {"status": "error", "message": "Session expired. Please login again."}
                 ), 401
@@ -130,60 +321,43 @@ def broker_callback(broker, para=None):
 
             # Authentication successful
             logger.info("mStock TOTP authentication successful")
-            return handle_auth_success(
+            return _complete_login(
                 auth_token, session["user"], broker, feed_token=feed_token, user_id=None
             )
 
     elif broker == "aliceblue":
-        if request.method == "GET":
-            # Redirect to React TOTP page
-            return redirect("/broker/aliceblue/totp")
+        # New OAuth redirect flow:
+        # 1. GET without authCode → redirect to AliceBlue login page with appcode
+        # 2. GET with authCode + userId (callback) → authenticate and get session
+        authCode = request.args.get("authCode")
+        userId = request.args.get("userId")
 
-        elif request.method == "POST":
-            logger.info("Aliceblue Login Flow initiated")
-            userid = request.form.get("userid")
-            # Step 1: Get encryption key
-            # Use the shared httpx client with connection pooling
-            from utils.httpx_client import get_httpx_client
-
-            client = get_httpx_client()
-
-            # AliceBlue API expects only userId in the encryption key request
-            # Do not include API key in this initial request
-            payload = {"userId": userid}
-            headers = {"Content-Type": "application/json"}
-            try:
-                # Get encryption key
-                url = "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/api/customer/getAPIEncpkey"
-                response = client.post(url, json=payload, headers=headers)
-                response.raise_for_status()
-                data_dict = response.json()
-                logger.debug(f"Aliceblue response data: {data_dict}")
-
-                # Check if we successfully got the encryption key
-                if data_dict.get("stat") == "Ok" and data_dict.get("encKey"):
-                    enc_key = data_dict["encKey"]
-                    # Step 2: Authenticate with encryption key
-                    auth_token, error_message = auth_function(userid, enc_key)
-
-                    if auth_token:
-                        return handle_auth_success(auth_token, session["user"], broker)
-                    else:
-                        return handle_auth_failure(error_message, forward_url="broker.html")
-                else:
-                    # Failed to get encryption key
-                    error_msg = data_dict.get("emsg", "Failed to get encryption key")
-                    return handle_auth_failure(
-                        f"Failed to get encryption key: {error_msg}", forward_url="broker.html"
-                    )
-            except Exception as e:
-                return jsonify(
-                    {"status": "error", "message": f"Authentication error: {str(e)}"}
-                ), 500
+        if authCode and userId:
+            # Callback from AliceBlue with authorization code
+            logger.info(
+                "AliceBlue OAuth callback received (authCode present: %s, userId present: %s)",
+                bool(authCode),
+                bool(userId),
+            )
+            auth_token, client_id, error_message = auth_function(userId, authCode)
+            user_id = client_id or userId  # clientId from API response, fallback to OAuth userId
+            feed_token = None  # AliceBlue doesn't use a separate feed token
+            forward_url = "broker.html"
+        else:
+            # Initial visit — redirect to AliceBlue login page
+            logger.info("Redirecting to AliceBlue login page")
+            appcode = os.environ.get("BROKER_API_KEY")
+            if not appcode:
+                return handle_auth_failure(
+                    "BROKER_API_KEY (appCode) not configured in environment",
+                    forward_url="broker.html",
+                )
+            aliceblue_login_url = f"https://ant.aliceblueonline.com/?appcode={appcode}"
+            return redirect(aliceblue_login_url)
 
     elif broker == "fivepaisaxts":
         code = "fivepaisaxts"
-        logger.debug(f"FivePaisaXTS broker - code: {code}")
+        logger.debug("FivePaisaXTS broker - authentication initiated")
 
         # Fetch auth token, feed token and user ID
         auth_token, feed_token, user_id, error_message = auth_function(code)
@@ -238,10 +412,10 @@ def broker_callback(broker, para=None):
                 else:
                     session_json = session_data
 
-            except json.JSONDecodeError as e:
-                return jsonify(
-                    {"error": f"Invalid JSON format: {str(e)}", "raw_data": session_data}
-                ), 400
+            except json.JSONDecodeError:
+                # This is the broker's session/access-token container. Never
+                # reflect it into browser or proxy diagnostics.
+                return jsonify({"error": "Invalid session JSON"}), 400
 
             # Extract access token
             access_token = session_json.get("accessToken")
@@ -250,21 +424,29 @@ def broker_callback(broker, para=None):
             if not access_token:
                 return jsonify({"error": "No access token found"}), 400
 
-            # Fetch auth token, feed token and user ID
+            # Fetch auth token, feed token and user ID. The interactive session
+            # names its account in CompositEdge's own answer to the token
+            # exchange, compared with the market data keys' there.
             auth_token, feed_token, user_id, error_message = auth_function(access_token)
+            from broker.compositedge.api.auth_api import ACCOUNT_MISMATCH
+
+            if error_message == ACCOUNT_MISMATCH:
+                return _refuse_xts_account(broker)
 
             # print(f'Auth token is {auth_token}')
             # print(f'Feed token is {feed_token}')
             # print(f'User ID is {user_id}')
             forward_url = "broker.html"
 
-        except Exception as e:
-            # print(f"Error in compositedge callback: {str(e)}")
-            return jsonify({"error": f"Error processing request: {str(e)}"}), 500
+        except Exception as exc:
+            # Broker SDK exceptions can quote the entire session payload. Keep
+            # the response and application log to non-secret classification.
+            logger.error("Could not process Compositedge callback (%s)", type(exc).__name__)
+            return jsonify({"error": "Could not process broker callback"}), 500
 
     elif broker == "fyers":
         code = request.args.get("auth_code")
-        logger.debug(f"Fyers broker - The code is {code}")
+        logger.debug("Fyers broker - auth_code present: %s", bool(code))
         auth_token, error_message = auth_function(code)
         forward_url = "broker.html"
 
@@ -284,7 +466,7 @@ def broker_callback(broker, para=None):
             )
 
             if auth_token:
-                return handle_auth_success(auth_token, session["user"], broker)
+                return _complete_login(auth_token, session["user"], broker)
             else:
                 return jsonify({"status": "error", "message": error_message}), 401
 
@@ -292,15 +474,17 @@ def broker_callback(broker, para=None):
 
     elif broker == "icici":
         full_url = request.full_path
-        logger.debug(f"ICICI broker - Full URL: {full_url}")
+        from utils.url_redaction import redact_url_credentials
+
+        logger.debug(f"ICICI broker - Full URL: {redact_url_credentials(full_url)}")
         code = request.args.get("apisession")
-        logger.debug(f"ICICI broker - The code is {code}")
+        logger.debug("ICICI broker - apisession present: %s", bool(code))
         auth_token, error_message = auth_function(code)
         forward_url = "broker.html"
 
     elif broker == "ibulls":
         code = "ibulls"
-        logger.debug(f"Indiabulls broker - code: {code}")
+        logger.debug("Indiabulls broker - authentication initiated")
 
         # Fetch auth token, feed token and user ID
         auth_token, feed_token, user_id, error_message = auth_function(code)
@@ -308,15 +492,84 @@ def broker_callback(broker, para=None):
 
     elif broker == "iifl":
         code = "iifl"
-        logger.debug(f"IIFL broker - The code is {code}")
+        logger.debug("IIFL broker - authentication initiated")
 
         # Fetch auth token, feed token and user ID
         auth_token, feed_token, user_id, error_message = auth_function(code)
         forward_url = "broker.html"
 
+    elif broker == "iiflcapital":
+        # IIFL Capital uses redirect login and callback params authCode + clientId
+        callback_args = request.values.to_dict(flat=True)
+        auth_code = (
+            callback_args.get("authCode")
+            or callback_args.get("authcode")
+            or callback_args.get("auth_code")
+            or callback_args.get("code")
+        )
+        client_id = (
+            callback_args.get("clientId")
+            or callback_args.get("clientid")
+            or callback_args.get("client_id")
+            or callback_args.get("clientCode")
+            or callback_args.get("clientcode")
+        )
+
+        # Some callback variants may not include clientId explicitly.
+        # Fall back to BROKER_API_KEY to avoid false failures.
+        if not client_id:
+            broker_api_key = (os.getenv("BROKER_API_KEY") or "").strip()
+            if ":::" in broker_api_key:
+                client_id = broker_api_key.split(":::", 1)[0].strip()
+            elif broker_api_key:
+                client_id = broker_api_key
+
+        if request.method == "GET":
+            # Initial hit from OpenAlgo broker page has no callback parameters.
+            if not callback_args:
+                referrer = (request.headers.get("Referer") or "").lower()
+                if "iiflcapital.com" in referrer:
+                    logger.warning(
+                        "IIFL Capital callback returned without auth params after broker login. "
+                        "This usually indicates redirect URL mismatch/whitelisting issue."
+                    )
+                    return handle_auth_failure(
+                        "IIFL Capital callback was received without auth parameters. "
+                        "Please verify the exact callback URL is whitelisted in IIFL "
+                        "and matches REDIRECT_URL (including protocol, host, port, and path).",
+                        forward_url="broker.html",
+                    )
+
+                from broker.iiflcapital.api.auth_api import get_login_url
+                from utils.broker_login import state_for
+
+                login_url = get_login_url(state=state_for("iiflcapital"))
+                if not login_url:
+                    return handle_auth_failure(
+                        "IIFL Capital login URL could not be generated. "
+                        "Please verify BROKER_API_KEY and REDIRECT_URL.",
+                        forward_url="broker.html",
+                    )
+                return redirect(login_url)
+
+            # Callback reached OpenAlgo but required params were not provided.
+            if not auth_code or not client_id:
+                logger.warning(
+                    "IIFL Capital callback missing required params. "
+                    f"Received keys: {list(callback_args.keys())}"
+                )
+                return handle_auth_failure(
+                    "IIFL Capital callback did not include required auth parameters. "
+                    "Please verify callback URL registration and try again.",
+                    forward_url="broker.html",
+                )
+
+        auth_token, error_message = auth_function(auth_code, client_id)
+        forward_url = "broker.html"
+
     elif broker == "jainamxts":
         code = "jainamxts"
-        logger.debug(f"JainamXTS broker - code: {code}")
+        logger.debug("JainamXTS broker - authentication initiated")
 
         # Fetch auth token, feed token and user ID
         auth_token, feed_token, user_id, error_message = auth_function(code)
@@ -329,15 +582,22 @@ def broker_callback(broker, para=None):
 
         if request.method == "GET":
             # Handle OAuth callback with tokenId
-            # Log all incoming parameters to debug
-            logger.info(f"Dhan callback - GET parameters: {dict(request.args)}")
-            logger.info(f"Dhan callback - Full URL: {request.url}")
-            logger.info(f"Dhan callback - Request path: {request.path}")
-            logger.info(f"Dhan callback - Query string: {request.query_string.decode()}")
+            from utils.url_redaction import redact_url_credentials
+
+            logger.info(
+                "Dhan callback received with parameters: %s",
+                sorted(request.args.keys()),
+            )
+            logger.info(
+                f"Dhan callback - Full URL: {redact_url_credentials(request.url)}"
+            )
 
             # Log if we're coming from a redirect
             referrer = request.headers.get("Referer", "No referrer")
-            logger.info(f"Dhan callback - Referrer: {referrer}")
+            logger.info(
+                "Dhan callback - Referrer: %s",
+                redact_url_credentials(referrer),
+            )
 
             # Check for tokenId in various possible parameter names
             token_id = (
@@ -347,41 +607,39 @@ def broker_callback(broker, para=None):
             )
 
             if token_id:
-                # Step 3: Consume consent with tokenId
-                logger.debug(f"Dhan broker - Received tokenId: {token_id}")
-                # auth_function now returns (auth_token, user_id, error_message)
-                auth_result = auth_function(token_id)
+                # Step 3: Consume consent with tokenId. The redirect carries only
+                # Dhan's consent token: a ready access token is accepted from
+                # OpenAlgo's own form (the POST below), never from an address.
+                # The consent must be one this browser asked Dhan for.
+                logger.debug("Dhan broker - tokenId present: %s", bool(token_id))
+                consent_app_id = session.pop("consent_app_id", None)
+                if not consent_app_id or len(token_id) > 100:
+                    raise BrokerLoginRefused(broker)
+                from broker.dhan.api.auth_api import consume_consent
 
-                # Handle both old format (2 values) and new format (3 values)
-                if len(auth_result) == 3:
-                    auth_token, user_id, error_message = auth_result
-                else:
-                    auth_token, error_message = auth_result
-                    user_id = None
+                auth_token, details = consume_consent(token_id)
+                if not auth_token or not isinstance(details, dict):
+                    return handle_auth_failure(
+                        details if isinstance(details, str) else "Authentication failed",
+                        forward_url="broker.html",
+                    )
+                user_id = details.get("dhan_client_id")
+                mismatch = _dhan_account_mismatch(keys, user_id)
+                if mismatch:
+                    return mismatch
 
                 # Validate authentication by testing funds API before proceeding
-                if auth_token:
-                    # Import the funds function to test authentication
-                    from broker.dhan.api.funds import test_auth_token
+                from broker.dhan.api.funds import test_auth_token
 
-                    is_valid, validation_error = test_auth_token(auth_token)
-
-                    if not is_valid:
-                        logger.error(f"Dhan authentication validation failed: {validation_error}")
-                        return handle_auth_failure(
-                            f"Authentication validation failed: {validation_error}",
-                            forward_url="broker.html",
-                        )
-
-                    logger.info("Dhan authentication validation successful")
-                    # Set forward_url for successful authentication
-                    forward_url = "broker.html"
-                    # The auth_token will be handled by the common success flow below
-                else:
-                    # Authentication failed
+                is_valid, validation_error = test_auth_token(auth_token)
+                if not is_valid:
+                    logger.error(f"Dhan authentication validation failed: {validation_error}")
                     return handle_auth_failure(
-                        error_message or "Authentication failed", forward_url="broker.html"
+                        f"Authentication validation failed: {validation_error}",
+                        forward_url="broker.html",
                     )
+                logger.info("Dhan authentication validation successful")
+                # The auth_token will be handled by the common success flow below
             else:
                 # First time coming from broker.html - redirect to initiate OAuth
                 # This avoids showing the form and directly starts OAuth if we have a stored client ID
@@ -404,6 +662,12 @@ def broker_callback(broker, para=None):
                     is_valid, validation_error = test_auth_token(auth_token)
 
                     if is_valid:
+                        from broker.dhan.api.funds import get_client_id
+
+                        user_id = get_client_id(auth_token)
+                        mismatch = _dhan_account_mismatch(keys, user_id)
+                        if mismatch:
+                            return mismatch
                         logger.info("Dhan direct token authentication successful")
                         forward_url = "broker.html"
                         # The auth_token will be handled by the common success flow below
@@ -428,61 +692,149 @@ def broker_callback(broker, para=None):
                     }
                 ), 400
     elif broker == "indmoney":
-        code = "indmoney"
-        logger.debug(f"IndMoney broker - The code is {code}")
-        auth_token, error_message = auth_function(code)
+        # Two credential shapes are supported (docs 04-authentication-users):
+        #   BROKER_API_SECRET set -> a manually generated 24h access token; use
+        #     it directly. This keeps existing installations working unchanged.
+        #   BROKER_API_SECRET blank -> TOTP flow. BROKER_API_KEY holds the
+        #     static Client ID (sent as x-api-key); the user supplies MPIN and a
+        #     live TOTP code, and POST /generate/token mints a fresh token.
+        # Detected from the credentials themselves rather than a new env flag.
+        manual_token = (get_broker_api_secret() or "").strip()
+        indmoney_client_id = (get_broker_api_key() or "").strip()
 
-        forward_url = "broker.html"
+        if request.method == "GET":
+            if manual_token:
+                # auth_function validates the token against /user/profile first,
+                # so a placeholder or an expired paste cannot be stored as if it
+                # were a working session.
+                logger.debug("IndMoney broker - trying access token from BROKER_API_SECRET")
+                auth_token, error_message = auth_function("indmoney")
+                forward_url = "broker.html"
+
+                if not auth_token and indmoney_client_id:
+                    logger.warning(
+                        "IndMoney: BROKER_API_SECRET is not a usable access token "
+                        f"({error_message}); falling back to MPIN + TOTP login"
+                    )
+                    return redirect("/broker/indmoney/totp")
+
+            elif indmoney_client_id:
+                # Redirect to React TOTP page
+                return redirect("/broker/indmoney/totp")
+
+            else:
+                return handle_auth_failure(
+                    "IndMoney is not configured. Set BROKER_API_KEY to the Client ID from "
+                    "indstocks.com > API Trading > Access Tokens, and leave BROKER_API_SECRET "
+                    "blank to log in with MPIN + TOTP.",
+                    forward_url="broker.html",
+                )
+
+        elif request.method == "POST":
+            from broker.indmoney.api.auth_api import authenticate_broker_totp
+
+            mpin = request.form.get("mpin")
+            totp_code = request.form.get("totp")
+
+            if not mpin or not totp_code:
+                return jsonify(
+                    {"status": "error", "message": "Please provide both MPIN and TOTP code"}
+                ), 400
+
+            logger.info("IndMoney TOTP authentication initiated")
+            auth_token, error_message = authenticate_broker_totp(mpin, totp_code)
+            forward_url = "broker.html"
+
+            if auth_token:
+                logger.info("IndMoney authentication successful, auth_token received")
+            else:
+                logger.error(f"IndMoney authentication failed: {error_message}")
 
     elif broker == "deltaexchange":
         code = "deltaexchange"
-        logger.debug(f"DeltaExchange broker - code: {code}")
+        logger.debug("DeltaExchange broker - authentication initiated")
         auth_token, error_message = auth_function(code)
         forward_url = "broker.html"
 
     elif broker == "dhan_sandbox":
         code = "dhan_sandbox"
-        logger.debug(f"Dhan Sandbox broker - The code is {code}")
+        logger.debug("Dhan Sandbox broker - authentication initiated")
         auth_token, error_message = auth_function(code)
         forward_url = "broker.html"
 
     elif broker == "groww":
         code = "groww"
-        logger.debug(f"Groww broker - The code is {code}")
+        logger.debug("Groww broker - authentication initiated")
         auth_token, error_message = auth_function(code)
+        forward_url = "broker.html"
+
+    elif broker == "sahi":
+        if request.method == "GET":
+            # The login card asks for the TOTP code of a TOTP key; a Regular
+            # key leaves it blank. The key and secret come from the keys.
+            return redirect("/broker/sahi/totp")
+
+        elif request.method == "POST":
+            auth_token, error_message = auth_function("sahi", totp=request.form.get("totp"))
+
+            if auth_token:
+                return _complete_login(auth_token, session["user"], broker)
+            else:
+                return jsonify({"status": "error", "message": error_message}), 401
+
         forward_url = "broker.html"
 
     elif broker == "wisdom":
         code = "wisdom"
-        logger.debug(f"Wisdom broker - The code is {code}")
+        logger.debug("Wisdom broker - authentication initiated")
         auth_token, feed_token, user_id, error_message = auth_function(code)
         forward_url = "broker.html"
 
     elif broker == "zebu":
-        if request.method == "GET":
-            # Redirect to React TOTP page
-            return redirect("/broker/zebu/totp")
-
-        elif request.method == "POST":
-            userid = request.form.get("userid")
-            password = request.form.get("password")
-            totp_code = request.form.get("totp")
-
-            auth_token, error_message = auth_function(userid, password, totp_code)
+        code = request.args.get("code")
+        if code:
+            logger.debug("Zebu broker - OAuth code present: %s", bool(code))
+            auth_token, error_message = auth_function(code)
             forward_url = "broker.html"
+        else:
+            # Initial visit — redirect to Zebu OAuth login page
+            logger.info("Redirecting to Zebu OAuth login page")
+            # BROKER_API_KEY format: userid:::client_id
+            full_api_key = os.getenv("BROKER_API_KEY")
+            if not full_api_key:
+                return handle_auth_failure(
+                    "BROKER_API_KEY not configured in environment",
+                    forward_url="broker.html",
+                )
+            client_id = full_api_key.split(":::")[1]  # OAuth client_id
+            zebu_login_url = f"https://go.mynt.in/OAuthlogin/authorize/oauth?client_id={client_id}"
+            return redirect(zebu_login_url)
 
     elif broker == "shoonya":
-        if request.method == "GET":
-            # Redirect to React TOTP page
-            return redirect("/broker/shoonya/totp")
-
-        elif request.method == "POST":
-            userid = request.form.get("userid")
-            password = request.form.get("password")
-            totp_code = request.form.get("totp")
-
-            auth_token, error_message = auth_function(userid, password, totp_code)
+        code = request.args.get("code")
+        if code:
+            logger.debug("Shoonya broker - OAuth callback received")
+            auth_token, error_message = auth_function(code)
             forward_url = "broker.html"
+        else:
+            # Initial visit — redirect to Shoonya OAuth login page
+            logger.info("Redirecting to Shoonya OAuth login page")
+            # BROKER_API_KEY format: userid:::client_id
+            full_api_key = os.getenv("BROKER_API_KEY")
+            if not full_api_key:
+                return handle_auth_failure(
+                    "BROKER_API_KEY not configured in environment",
+                    forward_url="broker.html",
+                )
+            parts = full_api_key.split(":::", 1)
+            if len(parts) != 2 or not parts[1]:
+                return handle_auth_failure(
+                    "BROKER_API_KEY must be in format userid:::client_id",
+                    forward_url="broker.html",
+                )
+            client_id = parts[1]  # OAuth client_id
+            shoonya_login_url = f"https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id={client_id}"
+            return redirect(shoonya_login_url)
 
     elif broker == "firstock":
         if request.method == "GET":
@@ -498,28 +850,51 @@ def broker_callback(broker, para=None):
             forward_url = "broker.html"
 
     elif broker == "nubra":
+        # Nubra logs in with a phone OTP, which is a two-step exchange: the GET
+        # dispatches the OTP and mints a temp_token, the POST redeems that token
+        # together with the code the user received. The temp_token is held in
+        # the Flask session between the two -- a signed (not encrypted) cookie,
+        # so nothing beyond this single-use, ~30s token belongs in it.
         if request.method == "GET":
-            # Redirect to React TOTP page
+            from broker.nubra.api.auth_api import request_login_otp
+
+            temp_token, masked_phone, error_message = request_login_otp()
+            if error_message:
+                return handle_auth_failure(error_message, forward_url="broker.html")
+
+            session["nubra_temp_token"] = temp_token
+            session["nubra_masked_phone"] = masked_phone
+            logger.info(f"Nubra login OTP dispatched to {masked_phone}")
+
+            # Redirect to the React OTP page. Reloading that page does NOT
+            # resend -- only this GET dispatches an OTP, so a new code means
+            # starting the Nubra login again from the broker page.
             return redirect("/broker/nubra/totp")
 
         elif request.method == "POST":
-            totp_code = request.form.get("totp")
+            # The shared React login component posts the code as "totp"
+            otp_code = request.form.get("otp") or request.form.get("totp")
 
-            if not totp_code:
-                return jsonify({"status": "error", "message": "TOTP code is required."}), 400
+            if not otp_code:
+                return jsonify({"status": "error", "message": "OTP is required."}), 400
 
-            auth_token, feed_token, error_message = auth_function(totp_code)
+            # Single-use: drop the token so a failed attempt cannot silently
+            # replay a stale one -- the user reloads to get a fresh OTP.
+            temp_token = session.pop("nubra_temp_token", None)
+            session.pop("nubra_masked_phone", None)
+
+            auth_token, feed_token, error_message = auth_function(otp_code, temp_token)
             forward_url = "broker.html"
 
     elif broker == "samco":
         if request.method == "GET":
-            # Redirect to React TOTP page
-            return redirect("/broker/samco/totp")
+            # Connect page: exchanges the configured API key/secret for a session
+            # token, then verifies the static IP via /ip/whoami
+            return redirect("/broker/samco/auth")
 
         elif request.method == "POST":
-            yob = request.form.get("yob")
-
-            auth_token, error_message = auth_function(yob)
+            # Daily login: POST /session/token with the OAuth app's apiKey + apiSecret
+            auth_token, error_message = auth_function()
             forward_url = "broker.html"
 
     elif broker == "motilal":
@@ -533,6 +908,9 @@ def broker_callback(broker, para=None):
             totp_code = request.form.get("totp")
             date_of_birth = request.form.get("dob")
 
+            # to store user_id (Motilal client code) in the DB - the market data
+            # feed authenticates with it and dealer calls send it as clientcode
+            user_id = userid
             auth_token, feed_token, error_message = auth_function(
                 userid, password, totp_code, date_of_birth
             )
@@ -541,9 +919,55 @@ def broker_callback(broker, para=None):
     elif broker == "flattrade":
         code = request.args.get("code")
         client = request.args.get("client")  # Flattrade returns client ID as well
-        logger.debug(f"Flattrade broker - The code is {code} for client {client}")
+        logger.debug(
+            "Flattrade broker - OAuth code present: %s, client present: %s",
+            bool(code),
+            bool(client),
+        )
         auth_token, error_message = auth_function(code)  # Only pass the code parameter
         forward_url = "broker.html"
+
+    elif broker == "tradesmart":
+        # TradeSmart (Noren v2) OAuth — mirrors shoonya/zebu. BROKER_API_KEY
+        # format is userid:::client_id.
+        code = (
+            request.args.get("code")
+            or request.args.get("request_token")
+            or request.args.get("request-token")
+        )
+        # Manual fallback: paste a pre-minted access_token directly (bypasses
+        # GenAcsTok). Use when the OAuth redirect is unavailable — navigate to
+        #   /tradesmart/callback?access_token=<TOKEN>&uid=<CLIENT_ID>
+        manual_token = request.args.get("access_token") or request.form.get("access_token")
+        if manual_token:
+            from broker.tradesmart.api.baseurl import resolve_uid
+
+            manual_uid = request.args.get("uid") or request.form.get("uid") or resolve_uid()
+            auth_token = f"{manual_uid}:::{manual_token}" if manual_uid else manual_token
+            error_message = None
+            logger.info("TradeSmart broker - manual access_token accepted")
+            forward_url = "broker.html"
+        elif code:
+            # OAuth callback: exchange code (+checksum) for an access token.
+            logger.debug("TradeSmart broker - OAuth callback received")
+            auth_token, error_message = auth_function(code)
+            forward_url = "broker.html"
+        else:
+            # Initial visit — redirect to the TradeSmart OAuth login page.
+            logger.info("Redirecting to TradeSmart OAuth login page")
+            full_api_key = os.getenv("BROKER_API_KEY")
+            if not full_api_key:
+                return handle_auth_failure(
+                    "BROKER_API_KEY not configured in environment",
+                    forward_url="broker.html",
+                )
+            parts = full_api_key.split(":::", 1)
+            client_id = parts[1] if len(parts) == 2 and parts[1] else parts[0]
+            tradesmart_login_url = (
+                "https://v2api.tradesmartonline.in/OAuthlogin/authorize/oauth"
+                f"?client_id={client_id}"
+            )
+            return redirect(tradesmart_login_url)
 
     elif broker == "kotak":
         logger.debug(f"Kotak broker - The Broker is {broker}")
@@ -575,31 +999,37 @@ def broker_callback(broker, para=None):
 
     elif broker == "paytm":
         request_token = request.args.get("requestToken")
-        logger.debug(f"Paytm broker - The request token is {request_token}")
+        logger.debug("Paytm broker - request token present: %s", bool(request_token))
         auth_token, feed_token, error_message = auth_function(request_token)
         forward_url = "broker.html"
 
     elif broker == "pocketful":
-        # Handle the OAuth2 authorization code from the callback
+        # OAuth 2.0 code (RFC 6749 4.1.2). The state was matched to this
+        # browser's login above and is used up when the login is stored.
+        from broker.pocketful.api.auth_api import MISSING_CODE, callback_refusal
+
         auth_code = request.args.get("code")
         state = request.args.get("state")
         error = request.args.get("error")
-        error_description = request.args.get("error_description")
 
-        # Check if there was an error in the OAuth process
+        # Pocketful sent the sign-in back with an error instead of a code. The
+        # broker's own words go to the log; the trader reads a sentence.
         if error:
-            error_msg = f"OAuth error: {error}. {error_description if error_description else ''}"
-            logger.error(error_msg)
-            return handle_auth_failure(error_msg, forward_url="broker.html")
+            message = callback_refusal(error, request.args.get("error_description"))
+            return handle_auth_failure(message, forward_url="broker.html")
 
-        # Check if authorization code was provided
         if not auth_code:
-            error_msg = "Authorization code not provided"
-            logger.error(error_msg)
-            return handle_auth_failure(error_msg, forward_url="broker.html")
+            logger.warning("Pocketful callback arrived without a login code")
+            return handle_auth_failure(MISSING_CODE, forward_url="broker.html")
 
-        logger.debug(f"Pocketful broker - Received authorization code: {auth_code}")
-        # Exchange auth code for access token and fetch client_id
+        logger.debug(
+            "Pocketful broker - authorization code present: %s, state present: %s",
+            bool(auth_code),
+            bool(state),
+        )
+        # The code for a session, and the trading account it belongs to: the
+        # token comes back as <client_id>:::<access_token> and the account is
+        # stored as the session's user id.
         auth_token, feed_token, user_id, error_message = auth_function(auth_code, state)
         forward_url = "broker.html"
 
@@ -623,7 +1053,15 @@ def broker_callback(broker, para=None):
                     return redirect("/broker/definedge/totp")
                 else:
                     error_msg = "Failed to send OTP. Please check your API credentials."
-                    logger.error(f"Definedge OTP generation failed: {step1_response}")
+                    response_keys = (
+                        sorted(step1_response.keys())
+                        if isinstance(step1_response, dict)
+                        else []
+                    )
+                    logger.error(
+                        "Definedge OTP generation failed; response keys: %s",
+                        response_keys,
+                    )
                     return jsonify({"status": "error", "message": error_msg}), 500
             except Exception as e:
                 error_msg = f"Error sending OTP: {str(e)}"
@@ -724,30 +1162,51 @@ def broker_callback(broker, para=None):
                     logger.error(f"RMoney callback - No token in session. Keys: {list(session_json.keys())}")
                     return jsonify({"error": "No token found in session data"}), 400
 
-                logger.info(f"RMoney OAuth authentication successful for user: {user_id}")
+                # The session arrives from RMoney's site, and the userID beside
+                # the token is only a label. RMoney itself names the token's
+                # account, and that account is the one compared and stored.
+                from broker.rmoney.api.auth_api import get_feed_token, session_account
+
+                user_id = session_account(auth_token)
+                if not user_id:
+                    logger.warning("Refused an RMoney login: RMoney did not confirm the account")
+                    return _refuse_login(
+                        "account_unverified",
+                        "RMoney did not confirm which account this login is for, so it was "
+                        "not stored. Log in again.",
+                        status=409,
+                    )
+
+                logger.info("RMoney OAuth authentication successful")
 
                 # Get feed token for market data
-                from broker.rmoney.api.auth_api import get_feed_token
-
                 feed_token, feed_user_id, feed_error = get_feed_token()
                 if feed_error:
                     logger.warning(f"RMoney feed token error: {feed_error}")
                     feed_token = None
-                if not user_id:
-                    user_id = feed_user_id
+                mismatch = _xts_account_mismatch(broker, user_id, feed_user_id)
+                if mismatch:
+                    return mismatch
 
                 error_message = None
                 forward_url = "broker.html"
             else:
                 # No session data - initial request, redirect to RMoney OAuth login
-                from broker.rmoney.baseurl import INTERACTIVE_URL as RMONEY_INTERACTIVE_URL
+                from utils.broker_login import state_for, xts_login_url
 
-                BROKER_API_KEY_LOCAL = os.getenv("BROKER_API_KEY")
-                callback_url = url_for(
-                    "brlogin.broker_callback", broker="rmoney", _external=True
+                # Built from HOST_SERVER, not the request Host header: this URL
+                # is handed to the broker as the OAuth return address, so a
+                # poisoned Host would send the callback (and its credentials)
+                # to an attacker-controlled origin. The state on it is what the
+                # post-back is checked against (it arrives without the cookie).
+                callback_url = build_external_url(
+                    url_for("brlogin.broker_callback", broker="rmoney")
                 )
-                oauth_url = f"{RMONEY_INTERACTIVE_URL}/thirdparty?appKey={BROKER_API_KEY_LOCAL}&returnURL={callback_url}"
-                return redirect(oauth_url)
+                return redirect(
+                    xts_login_url(
+                        "rmoney", os.getenv("BROKER_API_KEY") or "", callback_url, state_for("rmoney")
+                    )
+                )
 
         except json.JSONDecodeError as e:
             return jsonify({"error": f"Invalid session data format: {str(e)}"}), 400
@@ -755,25 +1214,93 @@ def broker_callback(broker, para=None):
             logger.exception(f"RMoney callback error: {e}")
             return jsonify({"error": f"Error processing request: {str(e)}"}), 500
 
+    elif broker == "arrow":
+        # Arrow redirects back with `request-token` (hyphen, per its docs). The
+        # generic branch below only checks `request_token`/`code`, so handle the
+        # hyphenated spelling (and other plausible variants) explicitly so the
+        # request token is never silently dropped.
+        code = (
+            request.args.get("request-token")
+            or request.args.get("request_token")
+            or request.args.get("requestToken")
+            or request.args.get("code")
+        )
+        logger.debug(f"Arrow broker - request token present: {bool(code)}")
+        auth_token, error_message = auth_function(code)
+        forward_url = "broker.html"
+
+    elif broker == "nuvama":
+        # Nuvama's login page returns to the redirect URL with `request_id`
+        # (its User Login Flow page); the session also reports the account.
+        code = (
+            request.args.get("request_id")
+            or request.args.get("requestId")
+            or request.args.get("reqId")
+        )
+        logger.debug(f"Nuvama broker - request id present: {bool(code)}")
+        auth_token, feed_token, user_id, error_message = auth_function(code)
+        forward_url = "broker.html"
+
+    elif broker == "rupeezy":
+        # Rupeezy Vortex SSO redirects back with the auth code in `auth`
+        # (https://vortex.rupeezy.in/docs/latest/authentication/), which the
+        # generic branch below would drop.
+        code = request.args.get("auth") or request.args.get("code")
+        logger.debug(f"Rupeezy broker - auth code present: {bool(code)}")
+        auth_token, error_message = auth_function(code)
+        forward_url = "broker.html"
+
+    elif broker == "hdfcsky":
+        # HDFC Sky's docs describe the redirect only as carrying "a Request
+        # Token" without naming the query parameter, so accept every plausible
+        # spelling rather than silently dropping the token.
+        code = (
+            request.args.get("request_token")
+            or request.args.get("requestToken")
+            or request.args.get("request-token")
+            or request.args.get("code")
+        )
+        logger.debug(f"HDFC Sky broker - request token present: {bool(code)}")
+        auth_token, error_message = auth_function(code)
+        forward_url = "broker.html"
+
+    elif broker == "hdfcsecurities":
+        # InvestRight's docs describe the redirect only as carrying "a Request
+        # Token" without naming the query parameter, so accept every plausible
+        # spelling rather than silently dropping the token.
+        code = (
+            request.args.get("request_token")
+            or request.args.get("requestToken")
+            or request.args.get("request-token")
+            or request.args.get("code")
+        )
+        logger.debug(f"HDFC Securities broker - request token present: {bool(code)}")
+        auth_token, error_message = auth_function(code)
+        forward_url = "broker.html"
+
     else:
         code = request.args.get("code") or request.args.get("request_token")
-        logger.debug(f"Generic broker - The code is {code}")
+        logger.debug("Generic broker - callback code present: %s", bool(code))
         auth_token, error_message = auth_function(code)
         forward_url = "broker.html"
 
     if auth_token:
+        # A broker's answer (a GET, or a post from the broker's own site)
+        # completes a login only when this browser started it from OpenAlgo.
+        # Before session["user"] is set for the brokers that answer without it.
+        _claim_login(broker)
         # Store broker in session
         session["broker"] = broker
         logger.info(f"Successfully connected broker: {broker}")
         if broker == "zerodha":
-            auth_token = f"{BROKER_API_KEY}:{auth_token}"
+            auth_token = f"{keys.api_key}:{auth_token}"
         if broker == "dhan":
             auth_token = f"{auth_token}"
 
         # For brokers that have user_id and feed_token from authenticate_broker
-        if broker in ["angel", "compositedge", "pocketful", "definedge", "dhan", "rmoney"]:
+        if broker in ["angel", "compositedge", "pocketful", "definedge", "dhan", "motilal", "rmoney", "iiflcapital", "nuvama"]:
             # For OAuth brokers, handle missing session user
-            if broker in ("compositedge", "rmoney") and "user" not in session:
+            if broker in ("compositedge", "rmoney", "iiflcapital") and "user" not in session:
                 # Get the admin user from the database
                 from database.user_db import find_user_by_username
 
@@ -790,15 +1317,15 @@ def broker_callback(broker, para=None):
                     )
 
             # Pass the feed token and user_id to handle_auth_success
-            return handle_auth_success(
+            return _complete_login(
                 auth_token, session["user"], broker, feed_token=feed_token, user_id=user_id
             )
         elif broker == "paytm":
             # Paytm has feed_token (public_access_token) but no user_id
-            return handle_auth_success(auth_token, session["user"], broker, feed_token=feed_token)
+            return _complete_login(auth_token, session["user"], broker, feed_token=feed_token)
         else:
             # Pass just the feed token to handle_auth_success (other brokers don't have feed_token or user_id)
-            return handle_auth_success(auth_token, session["user"], broker, feed_token=feed_token)
+            return _complete_login(auth_token, session["user"], broker, feed_token=feed_token)
     else:
         return handle_auth_failure(error_message, forward_url=forward_url)
 
@@ -808,23 +1335,46 @@ def broker_callback(broker, para=None):
 @limiter.limit(LOGIN_RATE_LIMIT_HOUR)
 def dhan_initiate_oauth():
     """Handle Dhan OAuth initiation"""
+    try:
+        return _dhan_initiate_oauth()
+    finally:
+        _end_login_request()
+
+
+def _dhan_initiate_oauth():
     # Check if user is not in session first
     if "user" not in session:
         return redirect(url_for("auth.login"))
 
-    # Get client_id from .env BROKER_API_KEY (format: client_id:::api_key)
-    BROKER_API_KEY = os.getenv("BROKER_API_KEY")
+    # Only for a login started from the broker login page: a link from another
+    # site must not make OpenAlgo ask Dhan for a consent.
+    if not has_pending_login("dhan"):
+        return _refuse_login(
+            LOGIN_NOT_STARTED,
+            "This broker login was not started from OpenAlgo, or it took longer than "
+            "10 minutes. Start the broker login again.",
+        )
+    try:
+        _begin_login_request("dhan")
+    except BrokerKeysRefused as exc:
+        return _refuse_login("broker_unavailable", str(exc), status=409)
+
+    # Get client_id from BROKER_API_KEY (format: client_id:::api_key)
+    BROKER_API_KEY = os.getenv("BROKER_API_KEY") or ""
     client_id = None
 
     if ":::" in BROKER_API_KEY:
         client_id, _ = BROKER_API_KEY.split(":::")
 
     if not client_id:
-        error_message = "Client ID not found in BROKER_API_KEY. Please configure BROKER_API_KEY as 'client_id:::api_key' in .env"
+        error_message = (
+            "Client ID not found in the Dhan API key. Save it as 'client_id:::api_key' "
+            "on Broker Configuration (or in .env when .env sets Dhan)."
+        )
         logger.error(error_message)
         return handle_auth_failure(error_message, forward_url="broker.html")
 
-    logger.info(f"Initiating Dhan OAuth flow with client ID from .env: {client_id}")
+    logger.info("Initiating Dhan OAuth flow with the configured client ID")
 
     # Import the required functions
     from broker.dhan.api.auth_api import generate_consent, get_login_url
@@ -839,7 +1389,9 @@ def dhan_initiate_oauth():
         # Get the login URL
         login_url = get_login_url(consent_app_id)
         if login_url:
-            logger.info(f"Redirecting to Dhan OAuth login URL: {login_url}")
+            # ``consentAppId`` in the URL is a single-use OAuth credential.
+            # The browser needs the URL below, but application logs do not.
+            logger.info("Redirecting to Dhan OAuth login URL (consent credential redacted)")
             # Return a page that will redirect via JavaScript
             # This ensures the browser properly redirects to the external URL
             return f'''
@@ -875,3 +1427,103 @@ def dhan_initiate_oauth():
 # def broker_loginflow(broker):
 #     # This function is no longer used for Kotak TOTP authentication
 #     pass
+
+
+# ============================================================
+# Samco Routes
+# ============================================================
+
+
+@brlogin_bp.route("/samco/ip-status", methods=["GET"])
+@limiter.limit(LOGIN_RATE_LIMIT_MIN)
+@limiter.limit(LOGIN_RATE_LIMIT_HOUR)
+def samco_ip_status():
+    """Report the source IP Samco sees for this host vs the registered static IPs.
+
+    Backed by Samco's GET /ip/whoami diagnostic. There is deliberately no
+    /samco/update-ip counterpart: the password-based /ip/ipRegistration and
+    /ip/ipUpdate endpoints are deprecated in Trade API v3.2, and static IPs are
+    now registered through the Samco Web Dashboard.
+    """
+    if "user" not in session:
+        return jsonify({"status": "error", "message": "Not logged in"}), 401
+
+    from broker.samco.api.auth_api import DASHBOARD_URL, get_whoami
+    from database.auth_db import get_auth_token
+
+    session_token = get_auth_token(session["user"])
+    if not session_token:
+        return jsonify({
+            "status": "error",
+            "message": "Not connected to Samco. Log in to the broker first.",
+        }), 400
+
+    data, error = get_whoami(session_token)
+    if error:
+        return jsonify({"status": "error", "message": error}), 400
+
+    return jsonify({
+        "status": "success",
+        "src_ip": data.get("srcIp") or "",
+        "primary_ip": data.get("primaryIp") or "",
+        "secondary_ip": data.get("secondaryIp") or "",
+        "matches": bool(data.get("matches")),
+        "matched_as": data.get("matchedAs"),
+        "message": data.get("statusMessage", ""),
+        "dashboard_url": DASHBOARD_URL,
+    })
+
+
+@brlogin_bp.route("/nubra/ip-status", methods=["GET"])
+@limiter.limit(LOGIN_RATE_LIMIT_MIN)
+@limiter.limit(LOGIN_RATE_LIMIT_HOUR)
+def nubra_ip_status():
+    """Get static IP validation status for Nubra.
+
+    Mirrors the read half of /samco/ip-status. There is deliberately no
+    /nubra/update-ip counterpart: Nubra's REST V3 API exposes only
+    GET /ipaddress/validate, with no endpoint to register or change the
+    static IPs -- that is done through Nubra directly.
+    """
+    if "user" not in session:
+        return jsonify({"status": "error", "message": "Not logged in"}), 401
+
+    from broker.nubra.api.auth_api import validate_static_ip
+    from database.auth_db import get_auth_token
+
+    session_token = get_auth_token(session["user"])
+    if not session_token:
+        return jsonify({
+            "status": "error",
+            "message": "Not connected to Nubra. Log in to the broker first.",
+        }), 400
+
+    payload, error = validate_static_ip(session_token)
+
+    if error:
+        # "No IP addresses registered for user" is the expected answer for an
+        # account without static IP access, not a failure to report.
+        registered = "no ip addresses registered" not in error.lower()
+        return jsonify({
+            "status": "error",
+            "message": error,
+            "registered": registered,
+            "editable": False,
+        }), 200 if not registered else 400
+
+    return jsonify({
+        "status": "success",
+        "registered": True,
+        "is_matched": payload.get("is_matched", False),
+        "current_ip": payload.get("current_ip_address", ""),
+        "primary_ip": payload.get("primary_ip_address", ""),
+        "secondary_ip": payload.get("secondary_ip_address", ""),
+        # Nubra has no register/update IP API; changes go through Nubra.
+        "editable": False,
+        "message": (
+            "Current IP matches a registered static IP."
+            if payload.get("is_matched")
+            else "Current IP does NOT match the registered static IPs. "
+                 "Update them with Nubra to restore access."
+        ),
+    })

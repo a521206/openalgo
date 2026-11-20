@@ -18,6 +18,16 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/positionbook
 }
 ```
 
+## Sample cURL Request
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/v1/positionbook \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "apikey": "<your_app_apikey>"
+}'
+```
+
 ## Sample API Response
 
 ```json
@@ -79,6 +89,29 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/positionbook
 | average_price | string | Average entry price |
 | ltp | string | Last traded price |
 | pnl | string | Profit/Loss |
+| average_price_basis | string | Present only when `average_price` and `pnl` are **not** measured from what the position cost. See below. |
+
+## When the Entry Price Is Not Available
+
+`average_price` is the price the position was entered at, and `pnl` is measured
+from it. A broker that cannot supply that for a given position sets
+`average_price_basis` on the row to say what the numbers mean instead. The key
+is **absent** on every position whose average really is an entry price, so a
+caller that does not care can ignore it, and one that does can test a single
+field:
+
+```python
+for position in positionbook["data"]:
+    if position.get("average_price_basis"):
+        # average_price and pnl are not measured from entry - see the value
+        ...
+```
+
+| Value | Meaning |
+|-------|---------|
+| `carry_forward_valuation` | The position was carried over from a previous day, and the broker reports the overnight leg re-valued at the previous day's settlement price rather than at what it cost. `average_price` is that settlement price and `pnl` is the move since it, i.e. the day's profit and loss, not the position's. |
+
+Only **Kotak Neo** sets this today, when it cannot recover the cost of a carried position. OpenAlgo first uses Kotak's uploaded price (`upldPrc`), then the matching Holdings `averagePrice` for carried cash positions. Without a usable cost, it falls back to Kotak's carried amounts and marks the row. For carried F&O positions these can be settlement revaluations rather than entry cost; current-day order/trade history does not reconstruct an older entry. Same-day positions with a usable entry price are unaffected.
 
 ## Understanding Position Quantity
 
@@ -94,7 +127,7 @@ Custom Domain:  POST https://<your-custom-domain>/api/v1/positionbook
 - Closed positions show the **realized P&L** for the day
 - **average_price** is the weighted average entry price
 - **ltp** is the current market price
-- **pnl** = (LTP - Average Price) × Quantity (for long), reverse for short
+- A simple open-position mark-to-market is `(LTP - average_price) × signed quantity`; returned `pnl` is broker-normalized and can include realized day P&L. Check `average_price_basis` before treating it as return since entry
 - For F&O positions, ensure lot size alignment
 
 ## Use Cases

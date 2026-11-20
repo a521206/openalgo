@@ -21,6 +21,8 @@ from sqlalchemy.pool import NullPool
 from sqlalchemy.sql import func
 
 from database.settings_db import get_security_settings
+from utils.keyed_locks import KeyedLocks
+from utils.thread_safe_cache import MISSING, LockedTTLCache
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +31,16 @@ LOGS_DATABASE_URL = os.getenv("LOGS_DATABASE_URL", "sqlite:///db/logs.db")
 
 # Conditionally create engine based on DB type
 if LOGS_DATABASE_URL and "sqlite" in LOGS_DATABASE_URL:
-    # SQLite: Use NullPool to prevent connection pool exhaustion
+    # SQLite: Use NullPool — each checkout creates a fresh connection, and
+    # closing it returns the FD immediately.  Session cleanup (which prevents
+    # FD leaks) is handled by:
+    #   - app.py teardown_appcontext (removes all scoped sessions per request)
+    #   - traffic_logger.py (logs_session.remove() in finally block)
+    #   - security_middleware.py (logs_session.remove() for banned-IP path)
+    # StaticPool (single shared connection) must NOT be used here: concurrent
+    # requests on the same SQLite connection cause "bad parameter or other API
+    # misuse" and "cannot commit — SQL statements in progress" errors on all
+    # platforms (Windows, Mac, Linux).
     logs_engine = create_engine(
         LOGS_DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
     )
@@ -40,6 +51,24 @@ else:
 logs_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=logs_engine))
 LogBase = declarative_base()
 LogBase.query = logs_session.query_property()
+
+# Ban-status cache: SecurityMiddleware checks every request at the WSGI layer,
+# which with NullPool means a fresh SQLite connection per request. Cache the
+# verdict per IP; ban_ip/unban_ip invalidate so enforcement stays immediate
+# (bans are only mutated in-process — single-instance deployment).
+#
+# A LockedTTLCache filled with the generation read before the query: under the
+# gthread worker a ban committed while another request's check is in flight
+# would otherwise be overwritten by that check's "not banned" for the TTL.
+_ip_ban_cache = LockedTTLCache(maxsize=2048, ttl=60)
+
+# The abuse trackers read a counter, add one and write it back. Two requests
+# from one address at once (a scanner, under the gthread worker) would each
+# read the same count and lose an increment, and two first hits would each
+# insert a row. One lock per (tracker, address) serialises exactly those, and
+# nothing else: unrelated addresses never wait on each other. The locks are
+# stdlib ones (green under eventlet), because the holder does database I/O.
+_tracker_locks = KeyedLocks(name="abuse-trackers")
 
 
 class TrafficLog(LogBase):
@@ -141,25 +170,37 @@ class IPBan(LogBase):
     @staticmethod
     def is_ip_banned(ip_address):
         """Check if an IP is currently banned"""
+        cached = _ip_ban_cache.get(ip_address, MISSING)
+        if cached is not MISSING:
+            return cached
+
+        # Read before the query: a ban committed while this check is in flight
+        # invalidates the entry, and this verdict is then not cached over it.
+        generation = _ip_ban_cache.generation
         try:
             ban = IPBan.query.filter_by(ip_address=ip_address).first()
             if not ban:
+                _ip_ban_cache.fill(ip_address, False, generation)
                 return False
 
             # Check permanent ban
             if ban.is_permanent:
+                _ip_ban_cache.fill(ip_address, True, generation)
                 return True
 
             # Check temporary ban expiry
             if ban.expires_at:
                 if datetime.utcnow() < ban.expires_at.replace(tzinfo=None):
+                    _ip_ban_cache.fill(ip_address, True, generation)
                     return True
                 else:
                     # Ban expired, remove it
                     logs_session.delete(ban)
                     logs_session.commit()
+                    _ip_ban_cache.fill(ip_address, False, generation)
                     return False
 
+            _ip_ban_cache.fill(ip_address, False, generation)
             return False
         except Exception as e:
             logger.exception(f"Error checking IP ban status: {e}")
@@ -213,6 +254,7 @@ class IPBan(LogBase):
                 logs_session.add(ban)
 
             logs_session.commit()
+            _ip_ban_cache.invalidate(ip_address)
             logger.info(f"IP {ip_address} banned: {reason}")
             return True
         except Exception as e:
@@ -228,6 +270,7 @@ class IPBan(LogBase):
             if ban:
                 logs_session.delete(ban)
                 logs_session.commit()
+                _ip_ban_cache.invalidate(ip_address)
                 logger.info(f"IP {ip_address} unbanned")
                 return True
             return False
@@ -245,10 +288,13 @@ class IPBan(LogBase):
                 IPBan.is_permanent == False, IPBan.expires_at < datetime.utcnow()
             ).all()
 
+            expired_ips = [ban.ip_address for ban in expired]
             for ban in expired:
                 logs_session.delete(ban)
 
             logs_session.commit()
+            for ip_address in expired_ips:
+                _ip_ban_cache.invalidate(ip_address)
 
             # Return active bans
             return IPBan.query.all()
@@ -277,7 +323,16 @@ class Error404Tracker(LogBase):
 
     @staticmethod
     def track_404(ip_address, path):
-        """Track a 404 error for an IP"""
+        """Track a 404 error for an IP.
+
+        Serialised per address, so parallel 404s from one scanner each count.
+        """
+        with _tracker_locks.hold(("404", ip_address)):
+            return Error404Tracker._track_404_locked(ip_address, path)
+
+    @staticmethod
+    def _track_404_locked(ip_address, path):
+        """The read-modify-write behind track_404. Call with the address locked."""
         try:
             # Check if already banned
             if IPBan.is_ip_banned(ip_address):
@@ -310,21 +365,21 @@ class Error404Tracker(LogBase):
 
                 tracker.last_error_at = now
 
-                # Check if threshold reached (configurable, default 20 404s per day)
-                # AUTOMATED BAN DISABLED - Manual ban only via /security dashboard
-                # if tracker.error_count >= threshold_404:
-                #     # Don't ban localhost IPs
-                #     if ip_address not in ['127.0.0.1', '::1', 'localhost']:
-                #         # Ban the IP
-                #         IPBan.ban_ip(
-                #             ip_address=ip_address,
-                #             reason=f"Exceeded 404 threshold: {tracker.error_count} errors in 24 hours",
-                #             duration_hours=ban_duration_404,
-                #             created_by='404_detector'
-                #         )
-                #
-                #         # Clean up tracker entry
-                #         logs_session.delete(tracker)
+                # Auto-ban if enabled and threshold reached (configurable via Security Dashboard)
+                if security_settings.get("auto_ban_enabled", False) and tracker.error_count >= threshold_404:
+                    # Don't ban localhost IPs
+                    if ip_address not in ['127.0.0.1', '::1', 'localhost']:
+                        # Ban the IP (duration 0 = permanent)
+                        IPBan.ban_ip(
+                            ip_address=ip_address,
+                            reason=f"Exceeded 404 threshold: {tracker.error_count} errors in 24 hours",
+                            duration_hours=ban_duration_404,
+                            permanent=(ban_duration_404 == 0),
+                            created_by='404_detector'
+                        )
+
+                        # Clean up tracker entry
+                        logs_session.delete(tracker)
             else:
                 # Create new tracker
                 tracker = Error404Tracker(
@@ -390,7 +445,16 @@ class InvalidAPIKeyTracker(LogBase):
 
     @staticmethod
     def track_invalid_api_key(ip_address, api_key_hash=None):
-        """Track an invalid API key attempt"""
+        """Track an invalid API key attempt.
+
+        Serialised per address, so parallel attempts from one address each count.
+        """
+        with _tracker_locks.hold(("api", ip_address)):
+            return InvalidAPIKeyTracker._track_invalid_api_key_locked(ip_address, api_key_hash)
+
+    @staticmethod
+    def _track_invalid_api_key_locked(ip_address, api_key_hash=None):
+        """The read-modify-write behind track_invalid_api_key. Call with the address locked."""
         try:
             # Check if already banned
             if IPBan.is_ip_banned(ip_address):
@@ -426,22 +490,22 @@ class InvalidAPIKeyTracker(LogBase):
 
                 tracker.last_attempt_at = now
 
-                # Check if threshold reached (configurable, default 10 invalid API keys per day)
-                # AUTOMATED BAN DISABLED - Manual ban only via /security dashboard
-                # if tracker.attempt_count >= threshold_api:
-                #     # Don't ban localhost IPs but keep tracking
-                #     if ip_address not in ['127.0.0.1', '::1', 'localhost']:
-                #         # Ban the IP
-                #         success = IPBan.ban_ip(
-                #             ip_address=ip_address,
-                #             reason=f"Exceeded invalid API key threshold: {tracker.attempt_count} attempts in 24 hours",
-                #             duration_hours=ban_duration_api,  # Configurable hours for API abuse
-                #             created_by='api_key_detector'
-                #         )
-                #
-                #         # Only delete tracker if ban was successful
-                #         if success:
-                #             logs_session.delete(tracker)
+                # Auto-ban if enabled and threshold reached (configurable via Security Dashboard)
+                if security_settings.get("auto_ban_enabled", False) and tracker.attempt_count >= threshold_api:
+                    # Don't ban localhost IPs but keep tracking
+                    if ip_address not in ['127.0.0.1', '::1', 'localhost']:
+                        # Ban the IP (duration 0 = permanent)
+                        success = IPBan.ban_ip(
+                            ip_address=ip_address,
+                            reason=f"Exceeded invalid API key threshold: {tracker.attempt_count} attempts in 24 hours",
+                            duration_hours=ban_duration_api,
+                            permanent=(ban_duration_api == 0),
+                            created_by='api_key_detector'
+                        )
+
+                        # Only delete tracker if ban was successful
+                        if success:
+                            logs_session.delete(tracker)
             else:
                 # Create new tracker
                 tracker = InvalidAPIKeyTracker(
@@ -485,6 +549,42 @@ class InvalidAPIKeyTracker(LogBase):
         except Exception as e:
             logger.exception(f"Error getting suspicious API users: {e}")
             return []
+
+
+def purge_old_traffic_logs(days=None):
+    """Delete traffic log entries older than the retention window.
+
+    Without this, logs.db grows unbounded (every request ever made is kept)
+    and the traffic/security dashboards slow down over time. Called once at
+    startup from init_traffic_logging().
+
+    Args:
+        days: Retention in days. Defaults to TRAFFIC_LOG_RETENTION_DAYS
+            env var (30 if unset).
+
+    Returns:
+        Number of rows deleted.
+    """
+    if days is None:
+        days = int(os.getenv("TRAFFIC_LOG_RETENTION_DAYS", "30"))
+
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        deleted = (
+            logs_session.query(TrafficLog)
+            .filter(TrafficLog.timestamp < cutoff)
+            .delete(synchronize_session=False)
+        )
+        logs_session.commit()
+        if deleted:
+            logger.debug(f"Purged {deleted} traffic log entries older than {days} days")
+        return deleted
+    except Exception as e:
+        logger.exception(f"Error purging old traffic logs: {e}")
+        logs_session.rollback()
+        return 0
+    finally:
+        logs_session.remove()
 
 
 def init_logs_db():

@@ -7,10 +7,11 @@ from datetime import datetime
 
 import pandas as pd
 import requests
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from database.engine_factory import create_db_engine
 from extensions import socketio  # Import SocketIO
 from utils.logging import get_logger
 
@@ -19,7 +20,7 @@ logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
 
-engine = create_engine(DATABASE_URL)
+engine = create_db_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -157,6 +158,19 @@ def process_angel_json(path):
     # Assuming 'brsymbol' and 'brexchange' are not present in the JSON and are the same as 'symbol' and 'exchange'
     df["brsymbol"] = df["symbol"]
     df["brexchange"] = df["exchange"]
+
+    # Drop rows that are not tradable contracts and have nowhere to go (QA
+    # MC-03); Kite's and Dhan's masters carry neither.
+    # - CDS UNDIRC: the government bonds under the interest-rate derivatives.
+    #   Angel names some R-series rows without their R- prefix, so token 108
+    #   (R636GS2031) repeats token 107's symbol GOI6.36%2031. The bonds trade
+    #   on NSE as -GS rows, which stay.
+    # - NCDEX AMXIDX: indices, but OpenAlgo has no NCDEX index exchange, so
+    #   they would sit on NCDEX and AGRIDEX would clash with the spot row.
+    not_tradable = ((df["instrumenttype"] == "UNDIRC") & (df["exchange"] == "CDS")) | (
+        (df["instrumenttype"] == "AMXIDX") & (df["exchange"] == "NCDEX")
+    )
+    df = df[~not_tradable].copy()
 
     # Update exchange names based on the instrument type
     df.loc[(df["instrumenttype"] == "AMXIDX") & (df["exchange"] == "NSE"), "exchange"] = "NSE_INDEX"
@@ -310,6 +324,8 @@ def process_angel_json(path):
             "NIFTYMIDSELECT": "MIDCPNIFTY",
             "NIFTYMIDCAPSELECT": "MIDCPNIFTY",
             "SNSX50": "SENSEX50",
+            # BSE_INDEX symbols come from the name: "S&P BSE SENSEX 50"
+            "BSESENSEX50": "SENSEX50",
         }
     )
 
@@ -370,6 +386,10 @@ def process_angel_json(path):
     df.loc[df["instrumenttype"] == "FUTCUR", "instrumenttype"] = "FUT"
     df.loc[df["instrumenttype"] == "FUTIRC", "instrumenttype"] = "FUT"
     df.loc[df["instrumenttype"] == "FUTIRT", "instrumenttype"] = "FUT"
+
+    # Indices are typed EQ, as Kite types its INDICES segment; the *_INDEX
+    # exchange is what says the row is an index (QA MC-04).
+    df.loc[df["exchange"].isin(["NSE_INDEX", "BSE_INDEX", "MCX_INDEX"]), "instrumenttype"] = "EQ"
 
     # Return the processed DataFrame
     return df

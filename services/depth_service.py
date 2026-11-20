@@ -1,9 +1,9 @@
 import importlib
-import traceback
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from database.auth_db import Auth, db_session, get_auth_token_broker, verify_api_key
 from database.token_db import get_token
+from services.broker_busy import BrokerBusyError, broker_busy_result
 from utils.constants import VALID_EXCHANGES
 from utils.logging import get_logger
 
@@ -112,9 +112,10 @@ def get_depth_with_auth(
             return False, {"status": "error", "message": "Failed to fetch market depth"}, 500
 
         return True, {"status": "success", "data": depth}, 200
+    except BrokerBusyError as e:
+        return broker_busy_result(e, f"Depth request for {exchange}:{symbol}")
     except Exception as e:
-        logger.error(f"Error in broker_module.get_depth: {e}")
-        traceback.print_exc()
+        logger.exception(f"Error in broker_module.get_depth: {e}")
         return False, {"status": "error", "message": str(e)}, 500
 
 

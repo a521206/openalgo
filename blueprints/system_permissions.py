@@ -12,7 +12,7 @@ import stat
 from flask import Blueprint, jsonify
 
 from utils.logging import get_logger
-from utils.session import check_session_validity
+from utils.session import check_signed_in
 
 logger = get_logger(__name__)
 
@@ -42,6 +42,20 @@ def get_permission_checks():
     # Extract db directory from main database path
     db_dir = os.path.dirname(main_db) if main_db else "db"
 
+    # .env contains APP_KEY, API_KEY_PEPPER, FERNET_SALT, BROKER_API_SECRET —
+    # ALL secrets. Expected mode is 0o600 (rw for owner only) on every
+    # platform. The previous Docker-specific 0o644 expectation is a
+    # security regression: it makes the file world-readable and lets any
+    # local user on the host run `cat .env` to harvest credentials.
+    #
+    # The historical justification for 0o644 inside Docker (issue #960:
+    # ".env unreadable to container's appuser when host file is root-owned")
+    # is obsolete. Every official install script now does
+    # `chown 1000:1000 .env && chmod 600 .env`, and the Dockerfile pins
+    # appuser to UID 1000 so the bind-mounted file is owner-readable
+    # without needing world-read.
+    env_expected_mode = 0o600
+
     # Define expected permissions for each path
     # Format: (relative_path, expected_unix_mode, description, is_sensitive)
     return [
@@ -51,7 +65,7 @@ def get_permission_checks():
         (logs_db, 0o644, "Logs database file (SQLite)", False),
         (sandbox_db, 0o644, "Sandbox database file (SQLite)", False),
         (historify_db, 0o644, "Historical data database (DuckDB)", False),
-        (".env", 0o600, "Environment configuration (sensitive)", True),
+        (".env", env_expected_mode, "Environment configuration (sensitive)", True),
         ("log", 0o755, "Log directory", False),
         ("log/strategies", 0o755, "Strategy logs directory", False),
         ("keys", 0o700, "Encryption keys directory (sensitive)", True),
@@ -222,7 +236,7 @@ def check_permission(path: str, expected_mode: int, is_sensitive: bool) -> dict:
 
 
 @system_permissions_bp.route("/permissions", methods=["GET"])
-@check_session_validity
+@check_signed_in
 def get_permissions():
     """Get permission status for all monitored paths."""
     try:
@@ -258,7 +272,7 @@ def get_permissions():
 
 
 @system_permissions_bp.route("/permissions/fix", methods=["POST"])
-@check_session_validity
+@check_signed_in
 def fix_permissions():
     """
     Attempt to fix permission issues.

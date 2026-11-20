@@ -8,15 +8,17 @@ Uses OTM convention: CE IV for strikes >= ATM, PE IV for strikes < ATM.
 
 from typing import Any
 
+from database.token_db_enhanced import fno_search_symbols
 from services.option_greeks_service import calculate_greeks, parse_option_symbol
 from services.option_symbol_service import (
+    NO_SPOT_EXCHANGES,
     construct_crypto_option_symbol,
     construct_option_symbol,
     find_atm_strike_from_actual,
     get_available_strikes,
     get_option_exchange,
+    resolve_underlying_quote,
 )
-from database.token_db_enhanced import fno_search_symbols
 from services.quotes_service import get_multiquotes, get_quotes
 from utils.constants import CRYPTO_EXCHANGES, INSTRUMENT_PERPFUT
 from utils.logging import get_logger
@@ -79,10 +81,10 @@ def get_vol_surface_data(
         base_symbol = underlying.upper()
         quote_exchange = _get_quote_exchange(base_symbol, exchange)
         options_exchange = get_option_exchange(quote_exchange)
-        # CRYPTO: look up the canonical perpetual symbol from DB (e.g. BTC → BTCUSD.P)
+        # CRYPTO: look up the canonical perpetual symbol from cache (e.g. BTC → BTCUSDFUT)
         if exchange.upper() in CRYPTO_EXCHANGES:
             _perp = fno_search_symbols(
-                underlying=base_symbol, exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
+                query=f"{base_symbol}USDFUT", exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
             )
             if not _perp:
                 return (
@@ -91,6 +93,24 @@ def get_vol_surface_data(
                     404,
                 )
             underlying_quote_symbol = _perp[0]["symbol"]
+        elif exchange.upper() in NO_SPOT_EXCHANGES:
+            # MCX and the currency segments have no tradable spot: the near-month
+            # future is the pricing reference. Without this the quote is fetched
+            # for a symbol that does not exist and the tool renders empty.
+            _resolved = resolve_underlying_quote(base_symbol, exchange.upper())
+            if _resolved is None:
+                return (
+                    False,
+                    {
+                        "status": "error",
+                        "message": (
+                            f"No unexpired futures found for {base_symbol} on "
+                            f"{exchange.upper()}"
+                        ),
+                    },
+                    404,
+                )
+            underlying_quote_symbol, quote_exchange = _resolved
         else:
             underlying_quote_symbol = base_symbol
         # Symbol builder: CRYPTO canonical format vs Indian FNO suffix format

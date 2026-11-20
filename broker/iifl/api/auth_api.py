@@ -31,7 +31,7 @@ def authenticate_broker(request_token):
             result = response.json()
             if result.get("type") == "success":
                 token = result["result"]["token"]
-                logger.info(f"Auth Token: {token}")
+                logger.info("Auth token received")
 
                 # Call get_feed_token() after successful authentication
                 feed_token, user_id, feed_error = get_feed_token()
@@ -85,7 +85,7 @@ def get_feed_token():
             if feed_result.get("type") == "success":
                 feed_token = feed_result["result"].get("token")
                 user_id = feed_result["result"].get("userID")
-                logger.info(f"Feed Token: {feed_token}")
+                logger.info("Feed token received")
             else:
                 return None, None, "Feed token request failed. Please check the response."
         else:

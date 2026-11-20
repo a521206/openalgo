@@ -1,8 +1,8 @@
 import importlib
-import traceback
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from database.auth_db import get_auth_token_broker
+from services.broker_busy import BrokerBusyError, broker_busy_result
 from utils.logging import get_logger
 
 # Initialize logger
@@ -31,7 +31,7 @@ def format_trade_data(trade_data):
     if isinstance(trade_data, list):
         return [
             {
-                key: int(value)
+                key: (int(value) if value == int(value) else value)
                 if (key.lower() in quantity_fields and isinstance(value, (int, float)))
                 else (format_decimal(value) if isinstance(value, (int, float)) else value)
                 for key, value in item.items()
@@ -130,9 +130,10 @@ def get_tradebook_with_auth(
         formatted_trades = format_trade_data(trade_data)
 
         return True, {"status": "success", "data": formatted_trades}, 200
+    except BrokerBusyError as e:
+        return broker_busy_result(e, "Trade book request")
     except Exception as e:
-        logger.error(f"Error processing trade data: {e}")
-        traceback.print_exc()
+        logger.exception(f"Error processing trade data: {e}")
         return False, {"status": "error", "message": str(e)}, 500
 
 

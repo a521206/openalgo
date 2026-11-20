@@ -1,6 +1,7 @@
 # Mapping OpenAlgo API Request https://openalgo.in/docs
 # Mapping Zerodha Margin API https://kite.trade/docs/connect/v3/margins/
 
+from broker.zerodha.mapping.mcx_contract_size import McxQuantityError, to_kite_quantity
 from database.token_db import get_br_symbol
 from utils.logging import get_logger
 
@@ -51,7 +52,9 @@ def transform_margin_positions(positions):
                 "variety": "regular",  # Default variety for margin calculation
                 "product": map_product_type(position["product"]),
                 "order_type": map_order_type(position["pricetype"]),
-                "quantity": int(position["quantity"]),
+                # Kite prices MCX margin per contract, so this leaves in
+                # the same units the matching order will.
+                "quantity": int(to_kite_quantity(position["quantity"], symbol, exchange)),
                 "price": float(position.get("price", 0)),
                 "trigger_price": float(position.get("trigger_price", 0)),
             }
@@ -61,6 +64,12 @@ def transform_margin_positions(positions):
                 f"Successfully transformed position: {symbol} ({exchange}) -> {br_symbol_str}"
             )
 
+        except McxQuantityError:
+            # Deliberately ahead of the catch-and-skip below. A quantity that is
+            # not a whole number of contracts is the caller's mistake, not a row
+            # to drop: silently pricing a basket that is missing a leg and
+            # returning it as success is worse than refusing the request.
+            raise
         except Exception as e:
             logger.error(f"Error transforming position: {position}, Error: {e}")
             skipped_positions.append(f"{position.get('symbol', 'unknown')} - Error: {str(e)}")
@@ -122,15 +131,19 @@ def parse_margin_response(response_data):
     - orders[PE].span = 0 (hedged, no span required!)
     - initial.total = sum of optimized orders = 258,139
 
+    Whereas final.total = 191,119 is the fully-optimized basket margin that
+    matches what Kite's web UI displays for the basket. We surface final.total
+    as total_margin_required (see extraction below) because initial.total over-
+    states margin for defined-risk structures where only one leg is hedged.
+
     To get TRUE margin benefit (matching Zerodha's web UI):
     - TRUE individual total = Call each order separately and sum = 429,255
     - Basket final total = 191,119
     - TRUE margin benefit = 429,255 - 191,119 = 238,136
 
-    But basket API only provides:
+    Basket API only provides:
     - initial.total - final.total = 258,139 - 191,119 = 67,020 (option_premium)
 
-    This implementation uses basket API values (initial.total - final.total).
     For true individual margins, each position must be queried separately first.
 
     Args:
@@ -165,9 +178,15 @@ def parse_margin_response(response_data):
             initial = data.get("initial", {})
             final = data.get("final", {})
 
-            # Extract all margin components
-            # Use initial.total for total_margin_required as per requirement
-            total_margin_required = initial.get("total", 0)
+            # Extract all margin components.
+            # IMPORTANT: Use final.total (fully-optimized) — initial.total only
+            # applies partial optimization (hedged leg's SPAN drops to 0 but the
+            # short leg retains its full naked SPAN). For defined-risk
+            # strategies (verticals, iron condors, butterflies) the optimized
+            # final.total is what Kite web UI displays and is materially lower
+            # — e.g. a Bull Put Spread's initial.total of ~Rs.2.26L collapses
+            # to a fraction once the spread's capped max-loss is recognized.
+            total_margin_required = final.get("total", 0)
             span_margin = final.get("span", 0)
             exposure_margin = final.get("exposure", 0)
             option_premium = final.get("option_premium", 0)
@@ -218,10 +237,10 @@ def parse_margin_response(response_data):
             )
             logger.info("")
             logger.warning(
-                "⚠ IMPORTANT: Zerodha's basket initial.total is ALREADY partially optimized!"
+                "IMPORTANT: Zerodha's basket initial.total is ALREADY partially optimized!"
             )
             logger.warning(
-                "⚠ For TRUE margin benefit matching web UI, query each order separately first."
+                "For TRUE margin benefit matching web UI, query each order separately first."
             )
             logger.info("=" * 80)
 

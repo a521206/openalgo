@@ -15,8 +15,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
-import { showToast } from '@/utils/toast'
+import { Link, useNavigate } from 'react-router'
 import { pythonStrategyApi } from '@/api/python-strategy'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -40,7 +39,26 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { MasterContractStatus, PythonStrategy } from '@/types/python-strategy'
-import { SCHEDULE_DAYS, STATUS_COLORS, STATUS_LABELS } from '@/types/python-strategy'
+import {
+  CRYPTO_EXCHANGE_VALUE,
+  SCHEDULE_DAYS,
+  STATUS_COLORS,
+  STATUS_LABELS,
+} from '@/types/python-strategy'
+import { showToast } from '@/utils/toast'
+
+/**
+ * The schedule as a trader reads it. A strategy saved with no stop time is a
+ * crypto strategy running around the clock; filling in a stop time it does
+ * not have would say it stops when it never does.
+ */
+function scheduleWindow(strategy: PythonStrategy): string {
+  const start = strategy.schedule_start_time || '09:00'
+  if (strategy.schedule_stop_time) return `${start} - ${strategy.schedule_stop_time}`
+  const everyDay = new Set(strategy.schedule_days ?? []).size === 7
+  if (strategy.exchange === CRYPTO_EXCHANGE_VALUE && everyDay && start === '00:00') return '24/7'
+  return `From ${start}, no stop time`
+}
 
 export default function PythonStrategyIndex() {
   const navigate = useNavigate()
@@ -61,13 +79,14 @@ export default function PythonStrategyIndex() {
       ])
       setStrategies(strategiesData)
       setMasterStatus(statusData)
-    } catch (error) {
+    } catch (_error) {
       if (!silent) showToast.error('Failed to load strategies', 'pythonStrategy')
     } finally {
       if (!silent) setLoading(false)
     }
   }
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only init of the 1s timer and SSE subscription; adding fetchData would tear down and recreate the EventSource on every render
   useEffect(() => {
     fetchData()
     // Update current time every second
@@ -87,19 +106,17 @@ export default function PythonStrategyIndex() {
         if (data.strategy_id && data.status) {
           fetchData(true) // Silent refresh
         }
-      } catch (e) {
+      } catch (_e) {
         // Ignore parse errors (heartbeat messages)
       }
     }
 
-    eventSource.onerror = () => {
-    }
+    eventSource.onerror = () => {}
 
     return () => {
       clearInterval(timer)
       eventSource.close()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const handleStart = async (strategy: PythonStrategy) => {
@@ -134,7 +151,7 @@ export default function PythonStrategyIndex() {
       } else {
         showToast.error(response.message || 'Failed to stop strategy', 'pythonStrategy')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to stop strategy', 'pythonStrategy')
     } finally {
       setActionLoading(null)
@@ -151,7 +168,7 @@ export default function PythonStrategyIndex() {
       } else {
         showToast.error(response.message || 'Failed to clear error', 'pythonStrategy')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to clear error', 'pythonStrategy')
     } finally {
       setActionLoading(null)
@@ -169,7 +186,7 @@ export default function PythonStrategyIndex() {
       } else {
         showToast.error(response.message || 'Failed to delete strategy', 'pythonStrategy')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to delete strategy', 'pythonStrategy')
     } finally {
       setActionLoading(null)
@@ -190,7 +207,7 @@ export default function PythonStrategyIndex() {
       document.body.removeChild(a)
       URL.revokeObjectURL(url)
       showToast.success('Strategy exported', 'pythonStrategy')
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to export strategy', 'pythonStrategy')
     }
   }
@@ -206,7 +223,7 @@ export default function PythonStrategyIndex() {
       } else {
         showToast.error(response.message || 'Failed to check contracts', 'pythonStrategy')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to check contracts', 'pythonStrategy')
     } finally {
       setActionLoading(null)
@@ -374,19 +391,19 @@ export default function PythonStrategyIndex() {
               />
 
               <CardHeader className="pb-3">
-                <div className="flex items-start justify-between">
-                  <div className="space-y-1">
-                    <CardTitle className="text-lg">{strategy.name}</CardTitle>
-                    <CardDescription className="font-mono text-xs">
+                <div className="flex items-start justify-between gap-2 overflow-hidden">
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <CardTitle className="text-lg truncate">{strategy.name}</CardTitle>
+                    <CardDescription className="font-mono text-xs truncate">
                       {strategy.file_name}
                     </CardDescription>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1 shrink-0">
                     <Tooltip>
                       <TooltipTrigger>
                         <Badge
                           variant={strategy.status === 'running' ? 'default' : 'secondary'}
-                          className={STATUS_COLORS[strategy.status] || ''}
+                          className={`${STATUS_COLORS[strategy.status] || ''} whitespace-nowrap`}
                         >
                           {STATUS_LABELS[strategy.status] || strategy.status}
                         </Badge>
@@ -397,7 +414,7 @@ export default function PythonStrategyIndex() {
                     </Tooltip>
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon">
+                        <Button variant="ghost" size="icon" aria-label="Strategy actions menu">
                           <MoreVertical className="h-4 w-4" />
                         </Button>
                       </DropdownMenuTrigger>
@@ -429,14 +446,19 @@ export default function PythonStrategyIndex() {
                 <div className="text-sm p-2 rounded min-h-[52px] bg-blue-500/10 border border-blue-500/20">
                   <div className="flex items-center gap-2">
                     <Calendar className="h-4 w-4 text-blue-500" />
-                    <span>
-                      {strategy.schedule_start_time || '09:00'}
-                      {' - '}
-                      {strategy.schedule_stop_time || '16:00'}
-                    </span>
+                    <span>{scheduleWindow(strategy)}</span>
+                    {strategy.exchange && (
+                      <span className="ml-auto px-1.5 py-0.5 text-[10px] font-medium rounded bg-blue-500/20 text-blue-700 dark:text-blue-300">
+                        {strategy.exchange}
+                      </span>
+                    )}
                   </div>
                   <p className="text-xs text-muted-foreground mt-1">
-                    {formatScheduleDays(strategy.schedule_days?.length ? strategy.schedule_days : ['mon', 'tue', 'wed', 'thu', 'fri'])}
+                    {formatScheduleDays(
+                      strategy.schedule_days?.length
+                        ? strategy.schedule_days
+                        : ['mon', 'tue', 'wed', 'thu', 'fri']
+                    )}
                   </p>
                 </div>
 
@@ -487,7 +509,9 @@ export default function PythonStrategyIndex() {
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent>
-                        {strategy.status === 'running' ? 'Stop running strategy' : 'Cancel scheduled auto-start'}
+                        {strategy.status === 'running'
+                          ? 'Stop running strategy'
+                          : 'Cancel scheduled auto-start'}
                       </TooltipContent>
                     </Tooltip>
                   ) : (
@@ -524,9 +548,7 @@ export default function PythonStrategyIndex() {
                       </Button>
                     </TooltipTrigger>
                     <TooltipContent>
-                      {strategy.schedule_start_time && strategy.schedule_stop_time
-                        ? `${strategy.schedule_start_time} - ${strategy.schedule_stop_time}`
-                        : 'Edit schedule'}
+                      {strategy.schedule_start_time ? scheduleWindow(strategy) : 'Edit schedule'}
                     </TooltipContent>
                   </Tooltip>
 

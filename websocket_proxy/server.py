@@ -1,13 +1,11 @@
 import asyncio as aio
 import json
-import logging
 import os
 import signal
 import socket
 import threading
 import time
 from collections import defaultdict
-from typing import Any, Dict, Optional, Set, Tuple
 
 import websockets
 import zmq
@@ -21,43 +19,17 @@ from utils.logging import get_logger, highlight_url
 
 from .base_adapter import BaseBrokerWebSocketAdapter
 from .broker_factory import create_broker_adapter
+from .mode_utils import (
+    MODE_BY_UPPER_LABEL as _MODE_BY_UPPER_LABEL,
+)
+from .mode_utils import (
+    normalize_mode,
+    normalize_mode_or_none,
+)
 from .port_check import find_available_port, is_port_in_use
 
 # Initialize logger
 logger = get_logger("websocket_proxy")
-
-
-# Filter to suppress benign WebSocket handshake errors
-class WebSocketHandshakeFilter(logging.Filter):
-    """
-    Filter out benign WebSocket handshake errors that occur when:
-    - Health check probes connect and disconnect immediately
-    - Port scanners check if the port is open
-    - Browsers make speculative connections
-    - Network monitoring tools probe the service
-
-    These are normal and don't indicate a problem with the WebSocket server.
-    """
-
-    def filter(self, record):
-        # Ignore EOFError during handshake - typically health checks or port scans
-        if "opening handshake failed" in record.getMessage():
-            msg = record.getMessage()
-            if any(
-                phrase in msg
-                for phrase in [
-                    "EOFError",
-                    "connection closed while reading HTTP request line",
-                    "stream ends after 0 bytes",
-                ]
-            ):
-                return False  # Suppress this log message
-        return True  # Allow all other messages
-
-
-# Apply filter to websockets loggers to reduce noise from benign connection attempts
-logging.getLogger("websockets.server").addFilter(WebSocketHandshakeFilter())
-logging.getLogger("websockets").addFilter(WebSocketHandshakeFilter())
 
 
 class WebSocketProxy:
@@ -96,6 +68,7 @@ class WebSocketProxy:
         self.subscriptions = {}  # Maps client_id to set of subscriptions
         self.broker_adapters = {}  # Maps user_id to broker adapter
         self.user_mapping = {}  # Maps client_id to user_id
+        self._invalidated_clients = set()  # Sockets awaiting a credential-change close
         self.user_broker_mapping = {}  # Maps user_id to broker_name
         self.running = False
 
@@ -104,14 +77,34 @@ class WebSocketProxy:
         # This eliminates the need for nested loops in zmq_listener
         self.subscription_index: dict[tuple[str, str, int], set[int]] = defaultdict(set)
 
+        # Order-update subscribers: user_id -> set of client_ids that sent
+        # {"action": "subscribe_orders"}. Account-scoped (no symbol/mode),
+        # unlike market-data subscriptions above.
+        self.order_subscribers: dict[str, set[int]] = defaultdict(set)
+
         # PERFORMANCE OPTIMIZATION 2: Message throttling to avoid excessive updates
         # Maps (symbol, exchange, mode) -> last message timestamp
         # Prevents sending duplicate LTP updates faster than 50ms
         self.last_message_time: dict[tuple[str, str, int], float] = {}
         self.message_throttle_interval = 0.05  # 50ms minimum between messages
 
-        # PERFORMANCE OPTIMIZATION 3: Pre-compute mode mappings
-        self.MODE_MAP = {"LTP": 1, "QUOTE": 2, "DEPTH": 3}
+        # OBSERVABILITY: last time any tick was delivered to each user. Used to
+        # surface "adapter is connected but silent while subscribed" — the
+        # stale-feed symptom behind issues #1226/#1419/#1421. This is a
+        # diagnostic signal only: it is logged and exposed via get_adapter_health(),
+        # never used to auto-evict (a quiet market or illiquid symbol legitimately
+        # produces no ticks, so auto-eviction would churn healthy feeds). Actual
+        # eviction stays with the connected-state check in authenticate_client.
+        self.last_tick_time: dict[str, float] = {}  # user_id -> epoch seconds
+        self._last_stale_warn: dict[str, float] = {}  # user_id -> epoch of last warning
+        self._stale_tick_warn_seconds = int(os.getenv("WS_STALE_TICK_WARN_SECONDS", "120"))
+        self._last_stale_check = time.time()
+        self._stale_check_interval = 30  # evaluate stale-feed warnings at most every 30s
+
+        # MODE_MAP retained for any external consumers that imported it from
+        # this class. New code should call normalize_mode() / normalize_mode_or_none()
+        # at module level — those accept case-insensitive strings AND ints.
+        self.MODE_MAP = dict(_MODE_BY_UPPER_LABEL)
 
         # RESOURCE MONITORING: Track metrics for health checks
         self._stats_lock = aio.Lock() if hasattr(aio, 'Lock') else None
@@ -120,16 +113,26 @@ class WebSocketProxy:
         self._cleanup_interval = 300  # Clean stale entries every 5 minutes
         self._throttle_entry_max_age = 60  # Remove throttle entries older than 60 seconds
 
-        # ZeroMQ context for subscribing to broker adapters
+        # ZeroMQ bus for market data + cache-invalidation events.
         self.context = zmq.asyncio.Context()
         self.socket = self.context.socket(zmq.SUB)
-        # Connecting to ZMQ
+        # Fan-in topology: this SUB is the SINGLE binder on the ZMQ bus and every
+        # publisher CONNECTs to it — the broker market-data adapters (this process)
+        # and the cache-invalidation publisher (the Flask/gunicorn process). The
+        # publishers used to bind and the SUB used to connect, which raced across
+        # those two processes once the proxy moved out-of-process (#1421): whoever
+        # bound the configured port first won, the loser silently slid to the next
+        # port (5556...), and the SUB — fixed on the configured port — heard nothing
+        # from it. Auth + subscribe succeeded but no ticks were delivered. Binding
+        # the SUB makes the rendezvous port deterministic regardless of process
+        # start order. Publisher side: base_adapter._connect_to_zmq_bus and
+        # connection_manager.SharedZmqPublisher.connect.
         ZMQ_HOST = os.getenv("ZMQ_HOST", "127.0.0.1")
-        ZMQ_PORT = os.getenv("ZMQ_PORT")
-        self.socket.connect(f"tcp://{ZMQ_HOST}:{ZMQ_PORT}")  # Connect to broker adapter publisher
+        ZMQ_PORT = os.getenv("ZMQ_PORT", "5555")
+        self.socket.bind(f"tcp://{ZMQ_HOST}:{ZMQ_PORT}")
 
-        # Set up ZeroMQ subscriber to receive all messages
-        self.socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all topics
+        # Receive all topics (market data + CACHE_INVALIDATE_*)
+        self.socket.setsockopt(zmq.SUBSCRIBE, b"")
 
     async def start(self):
         """Start the WebSocket server and ZeroMQ listener"""
@@ -143,7 +146,7 @@ class WebSocketProxy:
             loop = aio.get_running_loop()
 
             # Create the ZMQ listener task
-            zmq_task = loop.create_task(self.zmq_listener())
+            _zmq_task = loop.create_task(self.zmq_listener())
 
             # Start WebSocket server
             stop = aio.Future()  # Used to stop the server
@@ -155,6 +158,11 @@ class WebSocketProxy:
                 stop.set_result(None)
 
             monitor_task = aio.create_task(monitor_shutdown())
+
+            # Periodic stats snapshot for the Flask-side health monitor. The
+            # proxy runs in its own process, so utils/health_monitor.py cannot
+            # read the in-process pools; it falls back to this file (#1301).
+            stats_task = aio.create_task(self._stats_file_writer())
 
             # Handle graceful shutdown
             # Windows doesn't support add_signal_handler, so we'll use a simpler approach
@@ -183,6 +191,16 @@ class WebSocketProxy:
 
             # Try to start the WebSocket server with proper socket options for immediate port reuse
             try:
+                # max_queue caps per-client send buffer to absorb tick bursts
+                # without prematurely killing slow clients (default 32 was
+                # surfacing as "random disconnects" during NIFTY expiry-day
+                # storms). ping_interval/ping_timeout are set explicitly so
+                # the keepalive contract is locked into the codebase rather
+                # than relying on the websockets library defaults.
+                ws_max_queue = int(os.getenv("WS_MAX_QUEUE", "1024"))
+                ws_ping_interval = int(os.getenv("WS_PING_INTERVAL", "20"))
+                ws_ping_timeout = int(os.getenv("WS_PING_TIMEOUT", "20"))
+
                 # Start WebSocket server with socket reuse options
                 self.server = await websockets.serve(
                     self.handle_client,
@@ -190,6 +208,9 @@ class WebSocketProxy:
                     self.port,
                     # Enable socket reuse for immediate port availability after close
                     reuse_port=True if hasattr(socket, "SO_REUSEPORT") else False,
+                    max_queue=ws_max_queue,
+                    ping_interval=ws_ping_interval,
+                    ping_timeout=ws_ping_timeout,
                 )
 
                 highlighted_success_address = highlight_url(f"{self.host}:{self.port}")
@@ -203,6 +224,12 @@ class WebSocketProxy:
                 monitor_task.cancel()
                 try:
                     await monitor_task
+                except aio.CancelledError:
+                    pass
+
+                stats_task.cancel()
+                try:
+                    await stats_task
                 except aio.CancelledError:
                     pass
 
@@ -242,7 +269,7 @@ class WebSocketProxy:
                             # Force close the server without waiting
                             try:
                                 self.server.close()
-                            except:
+                            except Exception:
                                 pass
                         else:
                             raise
@@ -265,7 +292,7 @@ class WebSocketProxy:
                         aio.gather(*close_tasks, return_exceptions=True),
                         timeout=2.0,  # 2 second timeout
                     )
-                except aio.TimeoutError:
+                except TimeoutError:
                     logger.warning("Timeout waiting for client connections to close")
 
             # Disconnect all broker adapters
@@ -331,6 +358,39 @@ class WebSocketProxy:
             self._cleanup_zmq_sync()
         except Exception:
             pass  # Cannot raise in __del__
+
+    # Seconds between stats-file snapshots for the cross-process health monitor.
+    STATS_FILE_INTERVAL = 10
+
+    async def _stats_file_writer(self):
+        """Periodically write a compact stats snapshot for the Flask process.
+
+        The health monitor (utils/health_monitor.py) used to read the proxy's
+        connection pools in-process; since the proxy moved to its own process
+        that always reads empty, so the Health Monitor page showed no
+        WebSocket details (GitHub issue #1301). This file is its data source
+        now. Written atomically (tmp + os.replace) so readers never see a
+        partial file.
+        """
+        stats_path = os.getenv("WS_PROXY_STATS_FILE", os.path.join("log", "ws_proxy_stats.json"))
+        tmp_path = f"{stats_path}.tmp"
+        while self.running:
+            try:
+                health = self.get_health_stats()
+                snapshot = {
+                    "timestamp": time.time(),
+                    "total_connections": health["broker_adapters"]["active_count"],
+                    "total_symbols": health["subscriptions"]["unique_symbols"],
+                    "clients_connected": health["clients"]["connected_count"],
+                    "brokers": health["broker_adapters"]["brokers"],
+                }
+                with open(tmp_path, "w") as f:
+                    json.dump(snapshot, f)
+                os.replace(tmp_path, stats_path)
+            except Exception as e:
+                # Never let stats writing affect the feed path.
+                logger.debug(f"Stats snapshot write failed: {e}")
+            await aio.sleep(self.STATS_FILE_INTERVAL)
 
     def get_health_stats(self) -> dict:
         """
@@ -423,6 +483,88 @@ class WebSocketProxy:
                 f"{len(self.last_message_time)} throttle entries"
             )
 
+    def _users_with_active_subscriptions(self) -> set:
+        """Return the set of user_ids that currently have at least one client
+        subscribed to at least one symbol."""
+        active_users = set()
+        for client_set in self.subscription_index.values():
+            for client_id in client_set:
+                user_id = self.user_mapping.get(client_id)
+                if user_id:
+                    active_users.add(user_id)
+        return active_users
+
+    def _log_stale_adapters(self):
+        """Observability only: warn when a broker adapter reports connected but
+        has delivered no ticks for longer than the threshold while the user still
+        has active subscriptions. This surfaces the stale-feed symptom of issues
+        #1226/#1419/#1421 without auto-evicting (a quiet market legitimately has
+        no ticks). Actual recovery is handled by the connected-state eviction in
+        authenticate_client.
+        """
+        current_time = time.time()
+        if current_time - self._last_stale_check < self._stale_check_interval:
+            return
+        self._last_stale_check = current_time
+
+        threshold = self._stale_tick_warn_seconds
+        if threshold <= 0:
+            return
+
+        active_users = self._users_with_active_subscriptions()
+        for user_id, adapter in list(self.broker_adapters.items()):
+            if user_id not in active_users:
+                continue  # no subscriptions => no ticks expected
+            if not bool(getattr(adapter, "connected", False)):
+                continue  # disconnected adapters are handled on next auth
+            last_tick = self.last_tick_time.get(user_id)
+            if last_tick is None:
+                continue  # never delivered yet (just connected) — don't flag
+            silent_for = current_time - last_tick
+            if silent_for < threshold:
+                continue
+            # Throttle repeat warnings per user to once per threshold window
+            if current_time - self._last_stale_warn.get(user_id, 0) < threshold:
+                continue
+            self._last_stale_warn[user_id] = current_time
+            broker = self.user_broker_mapping.get(user_id, "unknown")
+            # Debug, not warning. A subscribed feed is legitimately silent every
+            # night, every weekend and every trading holiday, and this check
+            # cannot tell that apart from a dead socket without an
+            # exchange-aware calendar. Logging it at warning meant hours of
+            # identical lines whenever the market was simply shut, which buries
+            # the entries that do need attention. The signal is still available
+            # when it is wanted: get_adapter_health() reports seconds since the
+            # last tick per user, and raising the log level surfaces this again.
+            logger.debug(
+                f"Stale feed: {broker} adapter for user {user_id} reports connected "
+                f"but no ticks for {silent_for:.0f}s while subscribed. Expected "
+                f"outside market hours; if it persists during a session the "
+                f"broker WebSocket may be silently dead."
+            )
+
+    def get_adapter_health(self) -> dict:
+        """Per-user adapter health snapshot for diagnostics (#1432).
+
+        Returns connected state, seconds since last tick, and whether the user
+        has active subscriptions — enough to triage the stale-feed class of bug
+        from /admin/diagnostics without a code dive.
+        """
+        current_time = time.time()
+        active_users = self._users_with_active_subscriptions()
+        health = {}
+        for user_id, adapter in self.broker_adapters.items():
+            last_tick = self.last_tick_time.get(user_id)
+            health[user_id] = {
+                "broker": self.user_broker_mapping.get(user_id, "unknown"),
+                "connected": bool(getattr(adapter, "connected", False)),
+                "has_subscriptions": user_id in active_users,
+                "seconds_since_last_tick": (
+                    round(current_time - last_tick, 1) if last_tick is not None else None
+                ),
+            }
+        return health
+
     async def handle_client(self, websocket):
         """
         Handle a client connection
@@ -438,6 +580,28 @@ class WebSocketProxy:
         path = getattr(websocket, "path", "/unknown")
         logger.info(f"Client connected: {client_id} from path: {path}")
 
+        # Unauthenticated grace window: drop connections that don't complete auth
+        # within WS_AUTH_GRACE_SECONDS to prevent idle/holding-pattern resource
+        # exhaustion from unauthenticated clients on a public-facing port.
+        auth_grace_seconds = int(os.getenv("WS_AUTH_GRACE_SECONDS", "15"))
+
+        async def _enforce_auth_deadline():
+            try:
+                await aio.sleep(auth_grace_seconds)
+                if client_id not in self.user_mapping:
+                    logger.warning(
+                        f"Client {client_id} failed to authenticate within "
+                        f"{auth_grace_seconds}s — closing connection"
+                    )
+                    try:
+                        await websocket.close(code=4401, reason="auth timeout")
+                    except Exception:
+                        pass
+            except aio.CancelledError:
+                pass
+
+        auth_deadline_task = aio.ensure_future(_enforce_auth_deadline())
+
         try:
             # Process messages from the client
             async for message in websocket:
@@ -450,13 +614,14 @@ class WebSocketProxy:
                     # Send error to client but don't disconnect
                     try:
                         await self.send_error(client_id, "PROCESSING_ERROR", str(e))
-                    except:
+                    except Exception:
                         pass
         except websockets.exceptions.ConnectionClosed as e:
             logger.info(f"Client disconnected: {client_id}, code: {e.code}, reason: {e.reason}")
         except Exception as e:
             logger.exception(f"Unexpected error handling client {client_id}: {e}")
         finally:
+            auth_deadline_task.cancel()
             # Clean up when the client disconnects
             await self.cleanup_client(client_id)
 
@@ -467,87 +632,137 @@ class WebSocketProxy:
         Args:
             client_id: Client ID to clean up
         """
-        # Remove client from tracking
-        if client_id in self.clients:
-            del self.clients[client_id]
+        self.clients.pop(client_id, None)
+        invalidated_clients = getattr(self, "_invalidated_clients", None)
+        invalidated = invalidated_clients is not None and client_id in invalidated_clients
+        if invalidated_clients is not None:
+            invalidated_clients.discard(client_id)
+        user_id = self.user_mapping.get(client_id)
+        # A replacement adapter may already exist for this user. The old socket
+        # never owned subscriptions on that adapter.
+        adapter = self.broker_adapters.get(user_id) if user_id and not invalidated else None
+        release_failed = False
 
-        # Clean up subscriptions
-        if client_id in self.subscriptions:
-            subscriptions = self.subscriptions[client_id]
-            # Unsubscribe from all subscriptions
-            for sub_json in subscriptions:
-                try:
-                    # Parse the JSON string to get the subscription info
-                    sub_info = json.loads(sub_json)
-                    symbol = sub_info.get("symbol")
-                    exchange = sub_info.get("exchange")
-                    mode = sub_info.get("mode")
-
-                    # OPTIMIZATION: Remove from subscription index
-                    sub_key = (symbol, exchange, mode)
-                    should_unsubscribe_from_adapter = False
-                    if sub_key in self.subscription_index:
-                        self.subscription_index[sub_key].discard(client_id)
-                        # Clean up empty entries and mark for adapter unsubscription
-                        if not self.subscription_index[sub_key]:
-                            del self.subscription_index[sub_key]
-                            # Only unsubscribe from adapter when last client unsubscribes
-                            should_unsubscribe_from_adapter = True
-
-                    # Get the user's broker adapter
-                    # Only unsubscribe from adapter if this was the last client for this symbol
-                    user_id = self.user_mapping.get(client_id)
-                    if (
-                        should_unsubscribe_from_adapter
-                        and user_id
-                        and user_id in self.broker_adapters
-                    ):
-                        adapter = self.broker_adapters[user_id]
-                        adapter.unsubscribe(symbol, exchange, mode)
-                        logger.debug(
-                            f"Last client unsubscribed from {symbol}:{exchange}, unsubscribing from adapter"
-                        )
-                except json.JSONDecodeError as e:
-                    logger.exception(f"Error parsing subscription: {sub_json}, Error: {e}")
-                except Exception as e:
-                    logger.exception(f"Error processing subscription: {e}")
+        parsed_subscriptions, rows_by_key = self._indexed_client_subscriptions(client_id)
+        processed_keys = set()
+        processed_count = 0
+        for _sub_info, sub_key, _mode_label, mode_error in parsed_subscriptions:
+            try:
+                if mode_error is not None or sub_key is None or sub_key in processed_keys:
                     continue
-
-            del self.subscriptions[client_id]
-
-        # Remove from user mapping
-        if client_id in self.user_mapping:
-            user_id = self.user_mapping[client_id]
-
-            # Check if this was the last client for this user
-            is_last_client = True
-            for other_client_id, other_user_id in self.user_mapping.items():
-                if other_client_id != client_id and other_user_id == user_id:
-                    is_last_client = False
-                    break
-
-            # If this was the last client for this user, handle the adapter state
-            if is_last_client and user_id in self.broker_adapters:
-                adapter = self.broker_adapters[user_id]
-                broker_name = self.user_broker_mapping.get(user_id)
-
-                # For Flattrade and Shoonya, keep the connection alive and just unsubscribe from data
-                if broker_name in ["flattrade", "shoonya"] and hasattr(adapter, "unsubscribe_all"):
-                    logger.info(
-                        f"{broker_name.title()} adapter for user {user_id}: last client disconnected. Unsubscribing all symbols instead of disconnecting."
+                processed_keys.add(sub_key)
+                symbol, exchange, mode = sub_key
+                stored_rows = rows_by_key[sub_key]
+                if adapter is None:
+                    self._drop_subscription_ownership(
+                        client_id, sub_key, stored_rows
                     )
-                    adapter.unsubscribe_all()
                 else:
-                    # For all other brokers, disconnect the adapter completely
-                    logger.info(
-                        f"Last client for user {user_id} disconnected. Disconnecting {broker_name or 'unknown broker'} adapter."
+                    ok, error = self._unsubscribe_owned_subscription(
+                        client_id,
+                        adapter,
+                        symbol,
+                        exchange,
+                        mode,
+                        stored_rows=stored_rows,
                     )
-                    adapter.disconnect()
-                    del self.broker_adapters[user_id]
-                    if user_id in self.user_broker_mapping:
-                        del self.user_broker_mapping[user_id]
+                    if not ok:
+                        release_failed = True
+                        logger.error(
+                            "Disconnect could not release %s:%s mode %s exactly: %s",
+                            symbol,
+                            exchange,
+                            mode,
+                            error,
+                        )
+            except Exception as e:
+                logger.exception(f"Error processing subscription: {e}")
+                release_failed = True
+            finally:
+                processed_count += 1
+                if processed_count % 128 == 0:
+                    # Keep the single event loop responsive during a maximum
+                    # 3,000-symbol teardown. No thread or executor is created.
+                    await aio.sleep(0)
 
-            del self.user_mapping[client_id]
+        if user_id in self.order_subscribers:
+            self.order_subscribers[user_id].discard(client_id)
+            if not self.order_subscribers[user_id]:
+                del self.order_subscribers[user_id]
+
+        has_other_live_client = bool(
+            user_id
+            and any(
+                other_client_id in self.clients
+                and other_user_id == user_id
+                for other_client_id, other_user_id in self.user_mapping.items()
+                if other_client_id != client_id
+            )
+        )
+
+        if user_id and adapter is not None and not has_other_live_client:
+            broker_name = self.user_broker_mapping.get(user_id)
+            keep_special_adapter = False
+            if broker_name in ["flattrade", "shoonya"] and hasattr(
+                adapter, "unsubscribe_all"
+            ):
+                logger.info(
+                    "%s adapter for user %s: last client disconnected. "
+                    "Unsubscribing all symbols instead of disconnecting.",
+                    broker_name.title(),
+                    user_id,
+                )
+                try:
+                    response = adapter.unsubscribe_all()
+                    keep_special_adapter = bool(
+                        isinstance(response, dict)
+                        and response.get("status") == "success"
+                    )
+                    if not keep_special_adapter:
+                        logger.error(
+                            "%s unsubscribe_all was not acknowledged for user %s: %r",
+                            broker_name.title(),
+                            user_id,
+                            response,
+                        )
+                except Exception:
+                    logger.exception(
+                        "%s unsubscribe_all raised for user %s",
+                        broker_name.title(),
+                        user_id,
+                    )
+
+            if not keep_special_adapter:
+                logger.info(
+                    "Last client for user %s disconnected. Disconnecting %s adapter.",
+                    user_id,
+                    broker_name or "unknown broker",
+                )
+                try:
+                    adapter.disconnect()
+                except Exception:
+                    logger.exception(
+                        "Error disconnecting %s adapter for user %s",
+                        broker_name or "unknown broker",
+                        user_id,
+                    )
+                finally:
+                    self.broker_adapters.pop(user_id, None)
+                    self.user_broker_mapping.pop(user_id, None)
+
+        elif release_failed:
+            # Another live client still owns this user's shared adapter.  The
+            # broker-side row remains bounded by that adapter's symbol limit
+            # and is reclaimed by the authoritative last-client teardown.  A
+            # disconnected client must never remain as a registry owner.
+            logger.error(
+                "Dropping failed exact-release ownership for disconnected client %s; "
+                "the shared adapter will reclaim it at last-client teardown",
+                client_id,
+            )
+
+        self._purge_client_subscription_ownership(client_id)
+        self.user_mapping.pop(client_id, None)
 
     async def process_client_message(self, client_id, message):
         """
@@ -574,6 +789,10 @@ class WebSocketProxy:
                 await self.subscribe_client(client_id, data)
             elif action in ["unsubscribe", "unsubscribe_all"]:
                 await self.unsubscribe_client(client_id, data)
+            elif action == "subscribe_orders":
+                await self.subscribe_orders_client(client_id, data)
+            elif action == "unsubscribe_orders":
+                await self.unsubscribe_orders_client(client_id, data)
             elif action == "get_broker_info":
                 await self.get_broker_info(client_id)
             elif action == "get_supported_brokers":
@@ -601,23 +820,12 @@ class WebSocketProxy:
             dict: Broker configuration containing broker_name and credentials
         """
         try:
-            from sqlalchemy import text
+            from database.auth_db import Auth
 
-            from database.auth_db import get_broker_name
+            auth_obj = Auth.query.filter_by(name=user_id).first()
 
-            # Get user's connected broker from database
-            # This queries the auth_token table to find the user's active broker
-            query = text("""
-                SELECT broker FROM auth_token 
-                WHERE user_id = :user_id 
-                ORDER BY id DESC 
-                LIMIT 1
-            """)
-
-            result = db.session.execute(query, {"user_id": user_id}).fetchone()
-
-            if result and result.broker:
-                broker_name = result.broker
+            if auth_obj and not auth_obj.is_revoked and auth_obj.broker:
+                broker_name = auth_obj.broker
                 logger.info(f"Found broker '{broker_name}' for user {user_id} from database")
             else:
                 # Fallback to environment variable
@@ -697,8 +905,46 @@ class WebSocketProxy:
             )
             return
 
+        previous_broker_name = self.user_broker_mapping.get(user_id)
+
         # Store the broker mapping for this user
         self.user_broker_mapping[user_id] = broker_name
+
+        # A successful API-key auth is not enough: the cached broker adapter/pool
+        # can be disconnected or still hold a previous day's broker token. Evict
+        # it before the normal create/connect path runs so the fresh DB token is
+        # used immediately after broker re-login.
+        if user_id in self.broker_adapters:
+            cached_adapter = self.broker_adapters[user_id]
+            cached_connected = bool(getattr(cached_adapter, "connected", False))
+            broker_changed = bool(previous_broker_name and previous_broker_name != broker_name)
+
+            if broker_changed or not cached_connected:
+                reason = (
+                    f"broker changed {previous_broker_name}->{broker_name}"
+                    if broker_changed
+                    else "cached adapter disconnected"
+                )
+                logger.info(
+                    f"Cached {broker_name} adapter for user {user_id} is stale ({reason}) - "
+                    "evicting to rebuild with fresh credentials"
+                )
+                try:
+                    cached_adapter.disconnect()
+                except Exception as adapter_error:
+                    logger.warning(
+                        f"Error disconnecting stale adapter for user {user_id}: {adapter_error}"
+                    )
+                self.broker_adapters.pop(user_id, None)
+
+                try:
+                    from .broker_factory import cleanup_pools_for_user
+
+                    cleanup_pools_for_user(user_id, broker_name=previous_broker_name or broker_name)
+                except Exception as pool_error:
+                    logger.warning(
+                        f"Error cleaning stale connection pools for user {user_id}: {pool_error}"
+                    )
 
         # Create or reuse broker adapter
         if user_id not in self.broker_adapters:
@@ -744,7 +990,7 @@ class WebSocketProxy:
                 # - ConnectionPool format: {"success": False, "error": "..."}
                 is_error = (
                     (connect_result and connect_result.get("status") == "error") or
-                    (connect_result and connect_result.get("success") == False)
+                    (connect_result and connect_result.get("success") is False)
                 )
                 if is_error:
                     error_msg = connect_result.get("message", connect_result.get("error", "Failed to connect to broker"))
@@ -778,7 +1024,7 @@ class WebSocketProxy:
                         # Handle both response formats
                         init_is_error = (
                             (init_retry_result and init_retry_result.get("status") == "error") or
-                            (init_retry_result and init_retry_result.get("success") == False)
+                            (init_retry_result and init_retry_result.get("success") is False)
                         )
                         if init_is_error:
                             error_msg = init_retry_result.get("message", init_retry_result.get("error", "Failed to re-initialize"))
@@ -792,7 +1038,7 @@ class WebSocketProxy:
                         # Handle both response formats
                         connect_is_error = (
                             (connect_result and connect_result.get("status") == "error") or
-                            (connect_result and connect_result.get("success") == False)
+                            (connect_result and connect_result.get("success") is False)
                         )
                         if connect_is_error:
                             error_msg = connect_result.get("message", connect_result.get("error", "Failed to connect after retry"))
@@ -834,14 +1080,14 @@ class WebSocketProxy:
                             # Handle both response formats
                             init_is_error = (
                                 (initialization_result and initialization_result.get("status") == "error") or
-                                (initialization_result and initialization_result.get("success") == False)
+                                (initialization_result and initialization_result.get("success") is False)
                             )
                             if not init_is_error:
                                 connect_result = adapter.connect()
                                 # Handle both response formats
                                 connect_is_error = (
                                     (connect_result and connect_result.get("status") == "error") or
-                                    (connect_result and connect_result.get("success") == False)
+                                    (connect_result and connect_result.get("success") is False)
                                 )
                                 if not connect_is_error:
                                     self.broker_adapters[user_id] = adapter
@@ -863,8 +1109,7 @@ class WebSocketProxy:
                         await self.send_error(client_id, "BROKER_ERROR", str(retry_error))
                         return
                 else:
-                    import traceback
-                    logger.exception(traceback.format_exc())
+                    logger.exception(f"Broker error for {broker_name}: {error_str}")
                     await self.send_error(client_id, "BROKER_ERROR", error_str)
                     return
 
@@ -978,19 +1223,39 @@ class WebSocketProxy:
         """
         # Check if the client is authenticated
         if client_id not in self.user_mapping:
-            await self.send_error(client_id, "NOT_AUTHENTICATED", "You must authenticate first")
+            await self.send_error(
+                client_id, "NOT_AUTHENTICATED", "You must authenticate first", request_id=data.get("request_id")
+            )
             return
 
         # Get subscription parameters
         symbols = data.get("symbols") or []  # Handle array of symbols
-        mode_str = data.get("mode", "Quote")  # Get mode as string (LTP, Quote, Depth)
-        depth_level = data.get("depth", 5)  # Default to 5 levels
+        raw_mode = data.get("mode", "Quote")  # Accepts 1/2/3 or LTP/Quote/Depth (any case)
+        # The chart library sent the level as "depth_level" through 2.0.0 and
+        # the proxy never read it, so accept either key before defaulting to 5.
+        depth_level = data.get("depth")
+        if depth_level is None:
+            depth_level = data.get("depth_level")
+        if depth_level is None:
+            depth_level = 5
+        # Optional request_id (issue #1376): when the client supplies one, we
+        # echo it back in the response so the client can correlate this ack
+        # with the originating request and learn per-symbol success/failure
+        # rather than guessing from tick activity.
+        request_id = data.get("request_id")
 
-        # Map string mode to numeric mode
-        mode_mapping = {"LTP": 1, "Quote": 2, "Depth": 3}
-
-        # Convert string mode to numeric if needed
-        mode = mode_mapping.get(mode_str, mode_str) if isinstance(mode_str, str) else mode_str
+        # Normalize mode through the single source of truth. Previously the
+        # in-handler mapping was Title-Case-only and silently passed through
+        # unknown strings (e.g. documented "QUOTE") — broker adapters then
+        # received the raw string instead of a numeric mode. See issue #1375.
+        try:
+            mode, mode_label = normalize_mode(raw_mode)
+        except (ValueError, TypeError) as e:
+            await self.send_error(
+                client_id, "INVALID_MODE", str(e), request_id=data.get("request_id")
+            )
+            return
+        mode_str = mode_label  # Canonical label echoed back in subscribe response
 
         # Handle case where a single symbol is passed directly instead of as an array
         if not symbols and (data.get("symbol") and data.get("exchange")):
@@ -998,14 +1263,16 @@ class WebSocketProxy:
 
         if not symbols:
             await self.send_error(
-                client_id, "INVALID_PARAMETERS", "At least one symbol must be specified"
+                client_id, "INVALID_PARAMETERS", "At least one symbol must be specified", request_id=data.get("request_id")
             )
             return
 
         # Get the user's broker adapter
         user_id = self.user_mapping[client_id]
         if user_id not in self.broker_adapters:
-            await self.send_error(client_id, "BROKER_ERROR", "Broker adapter not found")
+            await self.send_error(
+                client_id, "BROKER_ERROR", "Broker adapter not found", request_id=data.get("request_id")
+            )
             return
 
         adapter = self.broker_adapters[user_id]
@@ -1069,16 +1336,136 @@ class WebSocketProxy:
                 )
 
         # Send combined response
-        await self.send_message(
-            client_id,
-            {
-                "type": "subscribe",
-                "status": "success" if subscription_success else "partial",
-                "subscriptions": subscription_responses,
-                "message": "Subscription processing complete",
-                "broker": broker_name,
-            },
+        response = {
+            "type": "subscribe",
+            "status": "success" if subscription_success else "partial",
+            "subscriptions": subscription_responses,
+            "message": "Subscription processing complete",
+            "broker": broker_name,
+        }
+        if request_id is not None:
+            response["request_id"] = request_id
+        await self.send_message(client_id, response)
+
+    def _matching_client_subscriptions(self, client_id, sub_key):
+        """Stored JSON rows owned by one client for an exact subscription key."""
+        matches = []
+        for sub_json in self.subscriptions.get(client_id, ()):
+            try:
+                sub_data = json.loads(sub_json)
+            except json.JSONDecodeError:
+                continue
+            if (
+                sub_data.get("symbol"),
+                sub_data.get("exchange"),
+                sub_data.get("mode"),
+            ) == sub_key:
+                matches.append(sub_json)
+        return matches
+
+    def _indexed_client_subscriptions(self, client_id):
+        """Parse one client's stored rows once and index them by exact key."""
+        parsed = []
+        rows_by_key = defaultdict(list)
+        for sub_json in self.subscriptions.get(client_id, ()):
+            try:
+                sub_data = json.loads(sub_json)
+            except json.JSONDecodeError as exc:
+                logger.error("Failed to parse subscription %r: %s", sub_json, exc)
+                continue
+
+            try:
+                mode, mode_label = normalize_mode(sub_data.get("mode"))
+                mode_error = None
+            except (ValueError, TypeError) as exc:
+                mode = None
+                mode_label = None
+                mode_error = str(exc)
+
+            symbol = sub_data.get("symbol")
+            exchange = sub_data.get("exchange")
+            sub_key = (symbol, exchange, mode) if symbol and exchange and mode is not None else None
+            parsed.append((sub_data, sub_key, mode_label, mode_error))
+            if sub_key is not None:
+                rows_by_key[sub_key].append(sub_json)
+        return parsed, rows_by_key
+
+    def _drop_subscription_ownership(self, client_id, sub_key, stored_rows):
+        """Commit an acknowledged local ownership release."""
+        owners = self.subscription_index.get(sub_key)
+        if owners is not None:
+            owners.discard(client_id)
+            if not owners:
+                del self.subscription_index[sub_key]
+        client_subscriptions = self.subscriptions.get(client_id)
+        if client_subscriptions is not None:
+            for sub_json in stored_rows:
+                client_subscriptions.discard(sub_json)
+
+    def _purge_client_subscription_ownership(self, client_id):
+        """Remove every local registry reference to a disconnected client."""
+        for sub_key, owners in list(self.subscription_index.items()):
+            owners.discard(client_id)
+            if not owners:
+                del self.subscription_index[sub_key]
+        self.subscriptions.pop(client_id, None)
+
+    def _unsubscribe_owned_subscription(
+        self,
+        client_id,
+        adapter,
+        symbol,
+        exchange,
+        mode,
+        *,
+        stored_rows=None,
+    ):
+        """Release one exact owner, committing only after the broker ack.
+
+        When another client still owns the same broker subscription there is
+        no broker call to acknowledge: removing this caller is a local commit.
+        For the final owner, both registries remain intact until the adapter
+        explicitly answers success.  That retained ownership is what makes a
+        retry or disconnect able to release a feed the broker still holds.
+        """
+        sub_key = (symbol, exchange, mode)
+        if stored_rows is None:
+            stored_rows = self._matching_client_subscriptions(client_id, sub_key)
+        owners = self.subscription_index.get(sub_key, set())
+        owns_subscription = bool(stored_rows) or client_id in owners
+        if not owns_subscription:
+            return True, None
+
+        if owners - {client_id}:
+            self._drop_subscription_ownership(client_id, sub_key, stored_rows)
+            return True, None
+
+        try:
+            response = adapter.unsubscribe(symbol, exchange, mode)
+        except Exception as exc:
+            logger.exception(
+                "Broker unsubscribe raised for %s:%s mode %s",
+                symbol,
+                exchange,
+                mode,
+            )
+            return False, str(exc) or "Unsubscription failed"
+
+        if not isinstance(response, dict) or response.get("status") != "success":
+            message = (
+                response.get("message")
+                if isinstance(response, dict)
+                else "Invalid response from broker"
+            )
+            return False, message or "Unsubscription failed"
+
+        self._drop_subscription_ownership(client_id, sub_key, stored_rows)
+        logger.debug(
+            "Last client unsubscribed from %s:%s, unsubscribing from adapter",
+            symbol,
+            exchange,
         )
+        return True, None
 
     async def unsubscribe_client(self, client_id, data):
         """
@@ -1090,7 +1477,9 @@ class WebSocketProxy:
         """
         # Check if the client is authenticated
         if client_id not in self.user_mapping:
-            await self.send_error(client_id, "NOT_AUTHENTICATED", "You must authenticate first")
+            await self.send_error(
+                client_id, "NOT_AUTHENTICATED", "You must authenticate first", request_id=data.get("request_id")
+            )
             return
 
         # Check if this is an unsubscribe_all request
@@ -1100,28 +1489,40 @@ class WebSocketProxy:
 
         # Get unsubscription parameters for specific symbols
         symbols = data.get("symbols") or []
+        # Optional request_id (issue #1376) — echoed in the response so callers
+        # can correlate this ack with the originating unsubscribe request.
+        request_id = data.get("request_id")
 
         # Handle single symbol format
         if not symbols and not is_unsubscribe_all and (data.get("symbol") and data.get("exchange")):
+            try:
+                _mode_int, _ = normalize_mode(data.get("mode", 2))
+            except (ValueError, TypeError) as e:
+                await self.send_error(
+                client_id, "INVALID_MODE", str(e), request_id=data.get("request_id")
+            )
+                return
             symbols = [
                 {
                     "symbol": data.get("symbol"),
                     "exchange": data.get("exchange"),
-                    "mode": data.get("mode", 2),  # Default to Quote mode
+                    "mode": _mode_int,
                 }
             ]
 
         # If no symbols provided and not unsubscribe_all, return error
         if not symbols and not is_unsubscribe_all:
             await self.send_error(
-                client_id, "INVALID_PARAMETERS", "Either symbols or unsubscribe_all is required"
+                client_id, "INVALID_PARAMETERS", "Either symbols or unsubscribe_all is required", request_id=data.get("request_id")
             )
             return
 
         # Get the user's broker adapter
         user_id = self.user_mapping[client_id]
         if user_id not in self.broker_adapters:
-            await self.send_error(client_id, "BROKER_ERROR", "Broker adapter not found")
+            await self.send_error(
+                client_id, "BROKER_ERROR", "Broker adapter not found", request_id=data.get("request_id")
+            )
             return
 
         adapter = self.broker_adapters[user_id]
@@ -1133,126 +1534,119 @@ class WebSocketProxy:
 
         # Handle unsubscribe_all case
         if is_unsubscribe_all:
-            # Get all current subscriptions
             if client_id in self.subscriptions:
-                # Convert all stored subscription strings back to dictionaries
-                all_subscriptions = []
-                for sub_json in self.subscriptions[client_id]:
-                    try:
-                        sub_dict = json.loads(sub_json)
-                        all_subscriptions.append(sub_dict)
-                    except json.JSONDecodeError:
-                        logger.error(f"Failed to parse subscription: {sub_json}")
-
-                # Unsubscribe from each subscription
-                for sub in all_subscriptions:
+                parsed_subscriptions, rows_by_key = self._indexed_client_subscriptions(client_id)
+                processed_keys = set()
+                for index, (sub, sub_key, mode_label, mode_error) in enumerate(
+                    parsed_subscriptions,
+                    start=1,
+                ):
                     symbol = sub.get("symbol")
                     exchange = sub.get("exchange")
-                    mode = sub.get("mode")
-
-                    if symbol and exchange:
-                        # Remove from subscription index and check if we should unsubscribe from adapter
-                        sub_key = (symbol, exchange, mode)
-                        should_unsubscribe_from_adapter = False
-                        if sub_key in self.subscription_index:
-                            self.subscription_index[sub_key].discard(client_id)
-                            # Only unsubscribe from adapter when last client unsubscribes
-                            if not self.subscription_index[sub_key]:
-                                del self.subscription_index[sub_key]
-                                should_unsubscribe_from_adapter = True
-
-                        # Only call adapter.unsubscribe if this was the last client for this symbol
-                        if should_unsubscribe_from_adapter:
-                            response = adapter.unsubscribe(symbol, exchange, mode)
-                            logger.debug(
-                                f"Last client unsubscribed from {symbol}:{exchange}, unsubscribing from adapter"
-                            )
-
-                            if response.get("status") != "success":
-                                failed_unsubscriptions.append(
-                                    {
-                                        "symbol": symbol,
-                                        "exchange": exchange,
-                                        "status": "error",
-                                        "message": response.get("message", "Unsubscription failed"),
-                                        "broker": broker_name,
-                                    }
-                                )
-                                continue
-
-                        successful_unsubscriptions.append(
-                            {
-                                "symbol": symbol,
-                                "exchange": exchange,
-                                "status": "success",
-                                "broker": broker_name,
-                            }
-                        )
-
-                # Clear all subscriptions for this client
-                self.subscriptions[client_id].clear()
-        else:
-            # Process specific symbols
-            for symbol_info in symbols:
-                symbol = symbol_info.get("symbol")
-                exchange = symbol_info.get("exchange")
-                mode = symbol_info.get("mode", 2)  # Default to Quote mode
-
-                if not symbol or not exchange:
-                    continue  # Skip invalid symbols
-
-                # Remove from subscription index and check if we should unsubscribe from adapter
-                sub_key = (symbol, exchange, mode)
-                should_unsubscribe_from_adapter = False
-                if sub_key in self.subscription_index:
-                    self.subscription_index[sub_key].discard(client_id)
-                    # Only unsubscribe from adapter when last client unsubscribes
-                    if not self.subscription_index[sub_key]:
-                        del self.subscription_index[sub_key]
-                        should_unsubscribe_from_adapter = True
-
-                # Remove from client's subscription list
-                if client_id in self.subscriptions:
-                    # Remove any matching subscription (with or without broker info)
-                    subscriptions_to_remove = []
-                    for sub_json in self.subscriptions[client_id]:
-                        try:
-                            sub_data = json.loads(sub_json)
-                            if (
-                                sub_data.get("symbol") == symbol
-                                and sub_data.get("exchange") == exchange
-                                and sub_data.get("mode") == mode
-                            ):
-                                subscriptions_to_remove.append(sub_json)
-                        except json.JSONDecodeError:
-                            continue
-
-                    for sub_json in subscriptions_to_remove:
-                        self.subscriptions[client_id].discard(sub_json)
-
-                # Only call adapter.unsubscribe if this was the last client for this symbol
-                if should_unsubscribe_from_adapter:
-                    response = adapter.unsubscribe(symbol, exchange, mode)
-                    logger.debug(
-                        f"Last client unsubscribed from {symbol}:{exchange}, unsubscribing from adapter"
-                    )
-
-                    if response.get("status") != "success":
+                    if index % 128 == 0:
+                        await aio.sleep(0)
+                    if mode_error is not None:
                         failed_unsubscriptions.append(
                             {
                                 "symbol": symbol,
                                 "exchange": exchange,
+                                "mode": None,
                                 "status": "error",
-                                "message": response.get("message", "Unsubscription failed"),
+                                "message": mode_error,
                                 "broker": broker_name,
                             }
                         )
                         continue
 
+                    if sub_key is not None and sub_key not in processed_keys:
+                        processed_keys.add(sub_key)
+                        mode = sub_key[2]
+                        ok, error = self._unsubscribe_owned_subscription(
+                            client_id,
+                            adapter,
+                            symbol,
+                            exchange,
+                            mode,
+                            stored_rows=rows_by_key[sub_key],
+                        )
+                        if not ok:
+                            failed_unsubscriptions.append(
+                                {
+                                    "symbol": symbol,
+                                    "exchange": exchange,
+                                    "mode": mode_label,
+                                    "status": "error",
+                                    "message": error,
+                                    "broker": broker_name,
+                                }
+                            )
+                            continue
+
+                        successful_unsubscriptions.append(
+                            {
+                                "symbol": symbol,
+                                "exchange": exchange,
+                                "mode": mode_label,
+                                "status": "success",
+                                "broker": broker_name,
+                            }
+                        )
+        else:
+            # Process specific symbols
+            for symbol_info in symbols:
+                symbol = symbol_info.get("symbol")
+                exchange = symbol_info.get("exchange")
+                # Normalize mode (accepts 1/2/3 or LTP/Quote/Depth case-insensitive).
+                # A per-symbol mode is the most specific value.  Array-form
+                # requests historically ignored their documented top-level
+                # mode and silently defaulted every item to Quote, which could
+                # answer success while leaving an LTP/Depth subscription live.
+                # Fall back to the request mode, then Quote only when neither
+                # spelling supplied one.
+                try:
+                    raw_mode = (
+                        symbol_info["mode"]
+                        if "mode" in symbol_info
+                        else data.get("mode", 2)
+                    )
+                    mode, mode_label = normalize_mode(raw_mode)
+                except (ValueError, TypeError) as e:
+                    failed_unsubscriptions.append(
+                        {
+                            "symbol": symbol,
+                            "exchange": exchange,
+                            "mode": None,
+                            "status": "error",
+                            "message": str(e),
+                            "broker": broker_name,
+                        }
+                    )
+                    continue
+
+                if not symbol or not exchange:
+                    continue  # Skip invalid symbols
+
+                ok, error = self._unsubscribe_owned_subscription(
+                    client_id, adapter, symbol, exchange, mode
+                )
+                if not ok:
+                    failed_unsubscriptions.append(
+                        {
+                            "symbol": symbol,
+                            "exchange": exchange,
+                            "mode": mode_label,
+                            "status": "error",
+                            "message": error,
+                            "broker": broker_name,
+                        }
+                    )
+                    continue
+
                 successful_unsubscriptions.append(
                     {
                         "symbol": symbol,
                         "exchange": exchange,
+                        "mode": mode_label,
                         "status": "success",
                         "broker": broker_name,
                     }
@@ -1265,17 +1659,81 @@ class WebSocketProxy:
         elif len(failed_unsubscriptions) > 0 and len(successful_unsubscriptions) == 0:
             status = "error"
 
-        await self.send_message(
-            client_id,
-            {
-                "type": "unsubscribe",
-                "status": status,
-                "message": "Unsubscription processing complete",
-                "successful": successful_unsubscriptions,
-                "failed": failed_unsubscriptions,
-                "broker": broker_name,
-            },
-        )
+        unsub_response = {
+            "type": "unsubscribe",
+            "status": status,
+            "message": "Unsubscription processing complete",
+            "successful": successful_unsubscriptions,
+            "failed": failed_unsubscriptions,
+            "broker": broker_name,
+        }
+        if request_id is not None:
+            unsub_response["request_id"] = request_id
+        await self.send_message(client_id, unsub_response)
+
+    async def subscribe_orders_client(self, client_id, data):
+        """
+        Subscribe a client to real-time order updates for their account.
+
+        Account-scoped (no symbol/exchange/mode) — every order-status change
+        for the authenticated user's broker session is delivered, sourced
+        from the order.update event bus topic (broker postback/order-WS
+        adapters or the sandbox engine) via subscribers/wsproxy_subscriber.py.
+
+        Args:
+            client_id: ID of the client
+            data: Subscription data (optional request_id)
+        """
+        if client_id not in self.user_mapping:
+            await self.send_error(
+                client_id, "NOT_AUTHENTICATED", "You must authenticate first", request_id=data.get("request_id")
+            )
+            return
+
+        user_id = self.user_mapping[client_id]
+        request_id = data.get("request_id")
+
+        self.order_subscribers[user_id].add(client_id)
+
+        response = {
+            "type": "subscribe_orders",
+            "status": "success",
+            "message": "Subscribed to order updates",
+        }
+        if request_id is not None:
+            response["request_id"] = request_id
+        await self.send_message(client_id, response)
+
+    async def unsubscribe_orders_client(self, client_id, data):
+        """
+        Unsubscribe a client from real-time order updates.
+
+        Args:
+            client_id: ID of the client
+            data: Unsubscription data (optional request_id)
+        """
+        if client_id not in self.user_mapping:
+            await self.send_error(
+                client_id, "NOT_AUTHENTICATED", "You must authenticate first", request_id=data.get("request_id")
+            )
+            return
+
+        user_id = self.user_mapping[client_id]
+        request_id = data.get("request_id")
+
+        if user_id in self.order_subscribers:
+            self.order_subscribers[user_id].discard(client_id)
+            if not self.order_subscribers[user_id]:
+                del self.order_subscribers[user_id]
+
+        response = {
+            "type": "unsubscribe_orders",
+            "status": "success",
+            "message": "Unsubscribed from order updates",
+        }
+        if request_id is not None:
+            response["request_id"] = request_id
+        await self.send_message(client_id, response)
 
     async def send_message(self, client_id, message):
         """
@@ -1292,7 +1750,7 @@ class WebSocketProxy:
             except websockets.exceptions.ConnectionClosed:
                 logger.info(f"Connection closed while sending message to client {client_id}")
 
-    async def send_error(self, client_id, code, message):
+    async def send_error(self, client_id, code, message, request_id=None):
         """
         Send an error message to a client
 
@@ -1300,8 +1758,17 @@ class WebSocketProxy:
             client_id: ID of the client
             code: Error code
             message: Error message
+            request_id: The request this error answers, when it answers one.
+                Success responses have echoed it since issue #1376 so a caller
+                can correlate an ack; errors did not, so a client awaiting an
+                ack had nothing to match it against and waited out its own
+                timeout for a reply that had already arrived. Always pass it
+                from a handler that was given one.
         """
-        await self.send_message(client_id, {"status": "error", "code": code, "message": message})
+        payload = {"status": "error", "code": code, "message": message}
+        if request_id is not None:
+            payload["request_id"] = request_id
+        await self.send_message(client_id, payload)
 
     def _handle_cache_invalidation(self, topic_str: str, data_str: str):
         """
@@ -1379,10 +1846,71 @@ class WebSocketProxy:
                 except Exception as adapter_error:
                     logger.warning(f"Error disconnecting adapter for user {user_id}: {adapter_error}")
 
+            # broker_adapters only tracks the wrapper currently attached to a
+            # client. The global connection-pool registry may still contain an
+            # old per-user pool after logout/re-login, especially when the
+            # invalidation races with a dashboard reconnect. Purge it too.
+            try:
+                from .broker_factory import cleanup_pools_for_user
+
+                removed_pools = cleanup_pools_for_user(user_id)
+                if removed_pools:
+                    logger.info(
+                        f"Disconnected {removed_pools} cached connection pool(s) for user {user_id}"
+                    )
+            except Exception as pool_error:
+                logger.warning(
+                    f"Error cleaning connection pools for user {user_id}: {pool_error}"
+                )
+
+            # Existing sockets still consider themselves authenticated, but their
+            # broker adapter has just been removed. Close them so clients can
+            # authenticate again with the new broker credentials.
+            for client_id, websocket in list(self.clients.items()):
+                if self.user_mapping.get(client_id) == user_id:
+                    self._invalidated_clients.add(client_id)
+                    aio.create_task(self._close_invalidated_client(client_id, websocket))
+
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse cache invalidation message: {e}")
         except Exception as e:
             logger.exception(f"Error processing cache invalidation: {e}")
+
+    async def _close_invalidated_client(self, client_id, websocket):
+        try:
+            await websocket.close(code=1012, reason="Broker credentials changed")
+        except Exception:
+            logger.exception("Error closing invalidated client %s", client_id)
+
+    async def _handle_order_update(self, data_str: str):
+        """
+        Relay an order-update message (published by
+        subscribers/wsproxy_subscriber.py onto the "{BROKER}_{USER_ID}_orders"
+        / "ANALYZE_{USER_ID}_orders" ZMQ topics) to every WS client that sent
+        {"action": "subscribe_orders"} for that user.
+
+        Args:
+            data_str: JSON string — the payload built in
+                subscribers/wsproxy_subscriber.py::on_order_update, already
+                shaped as the client-facing {"type": "order_update", ...} message.
+        """
+        message = json.loads(data_str)
+        user_id = message.get("user_id")
+        if not user_id:
+            logger.warning("Order update message missing user_id")
+            return
+
+        client_ids = self.order_subscribers.get(user_id)
+        if not client_ids:
+            return  # no WS clients currently subscribed for this user
+
+        send_tasks = [
+            self.send_message(client_id, message)
+            for client_id in list(client_ids)
+            if client_id in self.clients
+        ]
+        if send_tasks:
+            await aio.gather(*send_tasks, return_exceptions=True)
 
     def _is_auth_error_exception(self, error_message: str) -> bool:
         """
@@ -1426,24 +1954,13 @@ class WebSocketProxy:
             user_id: The user's ID
         """
         try:
-            from database.auth_db import (
-                auth_cache,
-                broker_cache,
-                feed_token_cache,
-            )
+            from database.auth_db import broker_cache, invalidate_user_auth_cache
 
             cache_key_auth = f"auth-{user_id}"
-            cache_key_feed = f"feed-{user_id}"
 
-            caches_cleared = []
-            if cache_key_auth in auth_cache:
-                del auth_cache[cache_key_auth]
-                caches_cleared.append("auth_cache")
-            if cache_key_feed in feed_token_cache:
-                del feed_token_cache[cache_key_feed]
-                caches_cleared.append("feed_token_cache")
-            if cache_key_auth in broker_cache:
-                del broker_cache[cache_key_auth]
+            # One call per cache, never a membership test then a delete.
+            caches_cleared = invalidate_user_auth_cache(user_id)
+            if broker_cache.pop(cache_key_auth, None) is not None:
                 caches_cleared.append("broker_cache")
 
             if caches_cleared:
@@ -1477,6 +1994,9 @@ class WebSocketProxy:
                 # RESOURCE CLEANUP: Periodically clean stale throttle entries
                 self._cleanup_stale_throttle_entries()
 
+                # OBSERVABILITY: periodically warn on connected-but-silent feeds
+                self._log_stale_adapters()
+
                 # OPTIMIZATION 1: Increased timeout to reduce busy-waiting
                 try:
                     [topic, data] = await aio.wait_for(
@@ -1501,72 +2021,84 @@ class WebSocketProxy:
                         logger.exception(f"Error handling cache invalidation: {e}")
                     continue  # Skip market data processing for cache messages
 
-                # Skip private account-level event topics (orders, positions, margins).
+                # Order-update relay: published by subscribers/wsproxy_subscriber.py
+                # (topic "{BROKER}_{USER_ID}_orders" or "ANALYZE_{USER_ID}_orders").
+                # user_id comes from the JSON payload, not topic-string parsing —
+                # usernames may contain underscores, same reasoning as the
+                # CACHE_INVALIDATE_* handling below.
+                if topic_str.endswith("_orders"):
+                    try:
+                        await self._handle_order_update(data_str)
+                    except Exception as e:
+                        logger.exception(f"Error handling order update: {e}")
+                    continue
+
+                # Skip other private account-level event topics (positions, margins).
                 # These are published by broker adapters on the shared ZMQ socket but
                 # do not follow the BROKER_EXCHANGE_SYMBOL_MODE market-data format.
-                if topic_str.endswith(("_orders", "_positions", "_margins")):
+                if topic_str.endswith(("_positions", "_margins")):
                     logger.debug(f"Skipping private event topic: {topic_str}")
                     continue
 
                 market_data = json.loads(data_str)
 
-                # Extract topic components
-                # Support both formats:
-                # New format: BROKER_EXCHANGE_SYMBOL_MODE (with broker name)
-                # Old format: EXCHANGE_SYMBOL_MODE (without broker name)
-                # Special case: NSE_INDEX_SYMBOL_MODE (exchange contains underscore)
+                # Extract topic components from ZMQ topic string.
+                # All adapters publish: EXCHANGE_SYMBOL_MODE
+                # Mode (LTP/QUOTE/DEPTH) is always the LAST segment.
+                # Exchange is the first segment (NSE, BSE, NFO, MCX, CRYPTO, …)
+                #   except NSE_INDEX / BSE_INDEX which span two segments.
+                # Symbol is everything between exchange and mode — may contain
+                # underscores for crypto spot pairs (e.g. CRYPTO_SOL_INR_LTP).
                 parts = topic_str.split("_")
 
-                # Special case handling for NSE_INDEX and BSE_INDEX
-                if len(parts) >= 4 and parts[0] == "NSE" and parts[1] == "INDEX":
-                    broker_name = "unknown"
-                    exchange = "NSE_INDEX"
-                    symbol = parts[2]
-                    mode_str = parts[3]
-                elif len(parts) >= 4 and parts[0] == "BSE" and parts[1] == "INDEX":
-                    broker_name = "unknown"
-                    exchange = "BSE_INDEX"
-                    symbol = parts[2]
-                    mode_str = parts[3]
-                elif len(parts) >= 5 and parts[1] == "INDEX":  # BROKER_NSE_INDEX_SYMBOL_MODE format
-                    broker_name = parts[0]
-                    exchange = f"{parts[1]}_{parts[2]}"
-                    symbol = parts[3]
-                    mode_str = parts[4]
-                elif len(parts) >= 4:
-                    # Standard format with broker name
-                    broker_name = parts[0]
-                    exchange = parts[1]
-                    symbol = parts[2]
-                    mode_str = parts[3]
-                elif len(parts) >= 3:
-                    # Old format without broker name
-                    broker_name = "unknown"
-                    exchange = parts[0]
-                    symbol = parts[1]
-                    mode_str = parts[2]
-                else:
+                if len(parts) < 3:
                     logger.warning(f"Invalid topic format: {topic_str}")
                     continue
 
-                # OPTIMIZATION: Use pre-computed mode map
-                mode = self.MODE_MAP.get(mode_str)
+                broker_name = "unknown"
 
-                if not mode:
-                    logger.warning(f"Invalid mode in topic: {mode_str}")
+                # Mode is always the last segment
+                mode_str = parts[-1]
+                remaining = parts[:-1]  # everything except mode
+
+                # Detect two-segment exchange prefixes (NSE_INDEX, BSE_INDEX,
+                # MCX_INDEX, GLOBAL_INDEX, NSEIX_INDEX). Add new index/multi-segment
+                # exchanges here when introducing them.
+                _MULTI_SEGMENT_EXCHANGE_PREFIXES = (
+                    ("NSE", "INDEX"),
+                    ("BSE", "INDEX"),
+                    ("MCX", "INDEX"),
+                    ("GLOBAL", "INDEX"),
+                )
+                if len(remaining) >= 2 and (remaining[0], remaining[1]) in _MULTI_SEGMENT_EXCHANGE_PREFIXES:
+                    exchange = f"{remaining[0]}_{remaining[1]}"
+                    symbol = "_".join(remaining[2:])
+                else:
+                    exchange = remaining[0]
+                    symbol = "_".join(remaining[1:])
+
+                if not symbol:
+                    logger.warning(f"Invalid topic format (no symbol): {topic_str}")
                     continue
 
-                # OPTIMIZATION: Message throttling for high-frequency updates
-                # Skip if we sent the same message too recently (reduces CPU on fast updates)
+                # Route through the single normalizer so topic parsing stays
+                # consistent with client-side mode handling.
+                normalized = normalize_mode_or_none(mode_str)
+                if normalized is None:
+                    logger.warning(f"Invalid mode in topic: {mode_str}")
+                    continue
+                mode, _ = normalized
+
+                # No server-side LTP throttling: the previous time-based
+                # throttle dropped intra-window ticks instead of coalescing
+                # them, so clients could miss the latest price during bursts
+                # (e.g. NIFTY expiry, circuit triggers). With the O(1)
+                # subscription_index, fan-out is cheap enough to forward every
+                # tick. If CPU pressure ever returns, replace this with a
+                # trailing-edge coalescer that emits the latest pending tick.
                 sub_key = (symbol, exchange, mode)
                 current_time = time.time()
-
-                # Only throttle LTP mode (mode 1), not Quote/Depth
-                if mode == 1:  # LTP mode
-                    last_time = self.last_message_time.get(sub_key, 0)
-                    if current_time - last_time < self.message_throttle_interval:
-                        continue  # Skip this update, too soon
-                    self.last_message_time[sub_key] = current_time
+                self.last_message_time[sub_key] = current_time
 
                 # Feed market data to MarketDataService for backend consumers
                 # (sandbox execution engine, position MTM, RMS, etc.)
@@ -1619,6 +2151,11 @@ class WebSocketProxy:
                     if not user_id:
                         continue
 
+                    # OBSERVABILITY: record that this user's feed is live (a tick
+                    # was delivered). Cheap dict write; lets _log_stale_adapters()
+                    # detect connected-but-silent adapters.
+                    self.last_tick_time[user_id] = current_time
+
                     # Check broker match (important for multi-broker setups)
                     client_broker = self.user_broker_mapping.get(user_id)
                     if broker_name != "unknown" and client_broker and client_broker != broker_name:
@@ -1645,10 +2182,54 @@ class WebSocketProxy:
                 await aio.sleep(1)
 
 
+#: Set by the app when it starts this process as a supervised child (gthread
+#: worker only): the pid of the worker that owns it.
+PARENT_PID_ENV = "OPENALGO_PROXY_PARENT_PID"
+ORPHAN_CHECK_SECONDS = 1.0
+
+
+def _expected_parent_pid() -> int | None:
+    """The owning worker's pid, when this child should exit once orphaned."""
+    if os.name != "posix":
+        return None
+    raw = os.environ.get(PARENT_PID_ENV, "").strip()
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+async def _exit_when_orphaned(proxy, parent_pid: int) -> None:
+    """Stop the proxy once the worker that started it has gone.
+
+    A worker killed hard (a worker timeout, or SIGKILL after the graceful
+    window) never runs its exit handlers, so nothing terminates this child.
+    Left running it would keep the WebSocket and ZeroMQ ports, and the next
+    worker's child would fail to bind them. When the parent dies the child is
+    re-parented, so a changed parent pid means it is time to go.
+    """
+    warned = False
+    while True:
+        await aio.sleep(ORPHAN_CHECK_SECONDS)
+        if os.getppid() == parent_pid:
+            continue
+        if not warned:
+            warned = True
+            logger.warning(
+                "The OpenAlgo web server that started live market data has "
+                "stopped; stopping this copy so the next one can start."
+            )
+        # Every check, not once: start() sets the flag when it begins, so a
+        # parent that died before that would otherwise be missed.
+        proxy.running = False
+
+
 # Entry point for running the server standalone
 async def main():
     """Main entry point for running the WebSocket proxy server"""
     proxy = None
+    orphan_watch = None
 
     try:
         # Load environment variables
@@ -1660,6 +2241,10 @@ async def main():
 
         # Create and start the WebSocket proxy
         proxy = WebSocketProxy(host=ws_host, port=ws_port)
+
+        parent_pid = _expected_parent_pid()
+        if parent_pid is not None:
+            orphan_watch = aio.create_task(_exit_when_orphaned(proxy, parent_pid))
 
         await proxy.start()
 
@@ -1676,12 +2261,11 @@ async def main():
             logger.error(f"Runtime error: {e}")
             raise
     except Exception as e:
-        import traceback
-
-        error_details = traceback.format_exc()
-        logger.exception(f"Server error: {e}\n{error_details}")
+        logger.exception(f"Server error: {e}")
         raise
     finally:
+        if orphan_watch is not None:
+            orphan_watch.cancel()
         # Always clean up resources
         if proxy:
             try:

@@ -1,8 +1,8 @@
 import json
-from turtle import position
 
 from database.token_db import get_oa_symbol, get_symbol
 from utils.logging import get_logger
+from utils.xts_order_data import exact_order_id, position_rows, traded_average_price
 
 logger = get_logger(__name__)
 
@@ -156,7 +156,7 @@ def transform_order_data(orders):
             "trigger_price": order.get("OrderStopPrice", 0.0),
             "pricetype": mapped_order_type,
             "product": order.get("ProductType", ""),
-            "orderid": str(int(float(order.get("AppOrderID", 0) or 0))),
+            "orderid": exact_order_id(order.get("AppOrderID")),
             "order_status": mapped_order_status,
             "timestamp": order.get("LastUpdateDateTime", ""),
         }
@@ -240,7 +240,7 @@ def transform_tradebook_data(tradebook_data):
             "quantity": quantity,
             "average_price": average_price,
             "trade_value": quantity * average_price,
-            "orderid": str(int(float(trade.get("AppOrderID", 0) or 0))),
+            "orderid": exact_order_id(trade.get("AppOrderID")),
             "timestamp": trade.get("OrderGeneratedDateTime", ""),
         }
         transformed_data.append(transformed_trade)
@@ -248,26 +248,12 @@ def transform_tradebook_data(tradebook_data):
 
 
 def map_position_data(position_data):
+    """The position container transform_positions_data reads.
+
+    An XTS error answer raises a sentence for the trader instead of reading
+    as an empty book (utils/xts_order_data.py, issue #633).
     """
-    Processes and modifies a list of order dictionaries based on specific conditions.
-
-    Parameters:
-    - order_data: A list of dictionaries, where each dictionary represents an order.
-
-    Returns:
-    - The modified order_data with updated 'tradingsymbol' and 'product' fields.
-    """
-    # Check if 'data' is None
-    # logger.info(f"position_data: {position_data}")
-    if "result" not in position_data or not position_data["result"]:
-        logger.info("No data available.")
-        return []  # Return an empty list if no orders are available
-
-    position_data = position_data["result"]
-
-    # logger.info(f"position_data: {position_data}")
-
-    return position_data
+    return position_rows(position_data, "rmoney")
 
 
 def transform_positions_data(positions_data):
@@ -293,7 +279,7 @@ def transform_positions_data(positions_data):
         if not isinstance(position, dict):  # Ensure it's a dictionary
             logger.info(f"Skipping invalid position: {position}")
             continue
-        symboltoken = position.get("ExchangeInstrumentId")
+        symboltoken = position.get("ExchangeInstrumentID", position.get("ExchangeInstrumentId"))
 
         exchange = position.get("ExchangeSegment", "")
         mapped_exchange = exchange_mapping.get(exchange, exchange)
@@ -304,12 +290,9 @@ def transform_positions_data(positions_data):
             position["TradingSymbol"] = symbol_from_db
 
         netqty = float(position.get("Quantity", 0))
-        if netqty > 0:
-            net_amount = float(position.get("BuyAveragePrice", 0))
-        elif netqty < 0:
-            net_amount = float(position.get("SellAveragePrice", 0))
-        else:
-            net_amount = 0
+        # The traded average, not the previous close a carried position is
+        # marked to (utils/xts_order_data.py, issue #2462).
+        net_amount = traded_average_price(position, netqty)
 
         average_price = net_amount
         # Ensure average_price is treated as a float, then format to a string with 2 decimal places
@@ -364,10 +347,10 @@ def transform_holdings_data(holdings_data):
 def map_portfolio_data(portfolio_data):
     logger.info(f"portfolio_data: {portfolio_data}")
     """
-    Processes and modifies portfolio data from FivePaisaXTS API.
-    
+    Processes and modifies portfolio data from RMoney XTS API.
+
     Parameters:
-    - portfolio_data: A dictionary containing the portfolio/holdings information from FivePaisaXTS API.
+    - portfolio_data: A dictionary containing the portfolio/holdings information from RMoney XTS API.
     
     Returns:
     - A dictionary with 'holdings' and 'totalholding' keys structured for the OpenAlgoXTS system.

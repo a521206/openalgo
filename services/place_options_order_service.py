@@ -12,38 +12,22 @@ Supports both live trading and sandbox (analyze) mode, just like place_order_ser
 import copy
 import os
 import time
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
-from database.analyzer_db import async_log_analyzer
-from database.apilog_db import async_log_order
-from database.apilog_db import executor as log_executor
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
-from extensions import socketio
-from services.liquidity_fallback_service import (
-    LiquidityResult,
-    get_liquidity_fallback_service,
-    is_liquidity_fallback_enabled,
-)
-from services.option_symbol_service import (
-    get_option_symbol,
-)
+from events import AnalyzerErrorEvent, OptionsOrderCompletedEvent
+from services.option_symbol_service import get_option_symbol
 from services.place_order_service import place_order
-from services.quotes_service import get_multiquotes, get_quotes
-from services.telegram_alert_service import telegram_alert_service
-from utils.config import get_execution_buffer_options
+from utils.broker_backpressure import BrokerBusyError
+from utils.event_bus import bus
 from utils.logging import get_logger
-from utils.price_utils import round_price_to_tick_size
 
 # Initialize logger
 logger = get_logger(__name__)
 
 # Maximum number of split orders allowed
 MAX_SPLIT_ORDERS = 100
-
-# Maximum adjustment limits for price discovery
-MAX_ADJUSTMENT_PERCENT = 10.0
-MAX_ADJUSTMENT_ABSOLUTE = 10.0
 
 
 # Get rate limit from environment (default: 10 per second)
@@ -213,7 +197,6 @@ def place_options_order(
             offset=offset,
             option_type=option_type,
             api_key=symbol_api_key,
-            underlying_ltp=options_data.get("underlying_ltp"),
         )
 
         if not success:
@@ -225,7 +208,6 @@ def place_options_order(
         resolved_symbol = symbol_response.get("symbol")
         resolved_exchange = symbol_response.get("exchange")
         underlying_ltp = symbol_response.get("underlying_ltp")
-        tick_size = symbol_response.get("tick_size", 0.05)  # Get tick_size with fallback
 
         if not resolved_symbol or not resolved_exchange:
             return (
@@ -239,232 +221,8 @@ def place_options_order(
 
         logger.info(
             f"Resolved option symbol: {resolved_symbol} on {resolved_exchange}, "
-            f"Underlying LTP: {underlying_ltp}, Tick Size: {tick_size}"
+            f"Underlying LTP: {underlying_ltp}"
         )
-
-        # Price Discovery: If pricetype is LIMIT and price is 0.0, fetch option LTP
-        pricetype = options_data.get("pricetype", "MARKET")
-        price = options_data.get("price", 0.0)
-        action = options_data.get("action", "BUY").upper()
-        fallback_result = LiquidityResult()
-
-        # Validate and round price to tick size for LIMIT orders
-        if pricetype == "LIMIT" and price > 0 and tick_size and tick_size > 0:
-            # Use utility function for price rounding
-            price = round_price_to_tick_size(price, tick_size)
-            options_data["price"] = price
-
-        if pricetype == "LIMIT" and price == 0.0:
-            logger.info(f"Price discovery triggered for {resolved_symbol}")
-
-            # Fetch option quotes (includes LTP, bid, ask)
-            success, quote_response, status_code = get_quotes(
-                symbol=resolved_symbol, exchange=resolved_exchange, api_key=symbol_api_key
-            )
-
-            if not success:
-                error_msg = quote_response.get("message", "Unknown error")
-                logger.error(f"Price discovery failed for {resolved_symbol}: {error_msg}")
-                return (
-                    False,
-                    {
-                        "status": "error",
-                        "message": f"Failed to fetch option price for {resolved_symbol}. {error_msg}",
-                    },
-                    status_code,
-                )
-
-            # Extract quote data
-            option_ltp = quote_response.get("data", {}).get("ltp")
-            option_bid = quote_response.get("data", {}).get("bid", 0)
-            option_ask = quote_response.get("data", {}).get("ask", 0)
-
-            # Log quote data for audit trail
-            logger.info(
-                f"PRICE_DISCOVERY_QUOTES: symbol={resolved_symbol}, "
-                f"ltp={option_ltp}, bid={option_bid}, ask={option_ask}, action={action}"
-            )
-
-            # Liquidity fallback: auto-select best liquid strike if configured
-            liquidity_service = get_liquidity_fallback_service()
-            fallback_result = LiquidityResult()
-
-            if is_liquidity_fallback_enabled():
-                should_fallback, reason = liquidity_service.should_fallback(
-                    offset, option_bid, option_ask
-                )
-
-                if should_fallback:
-                    logger.info(
-                        f"Liquidity fallback triggered for {resolved_symbol} "
-                        f"(reason={reason}, bid={option_bid}, ask={option_ask})"
-                    )
-
-                    eval_result = liquidity_service.evaluate(
-                        underlying=underlying,
-                        exchange=exchange,
-                        expiry_date=expiry_date,
-                        option_type=option_type,
-                        api_key=symbol_api_key,
-                        offset=offset,
-                        underlying_ltp=underlying_ltp,
-                        options_exchange=resolved_exchange,
-                    )
-
-                    if eval_result.selected:
-                        fallback_result.applied = True
-                        fallback_result.original_symbol = resolved_symbol
-                        fallback_result.selected_symbol = eval_result.selected.symbol
-                        fallback_result.reason = reason
-                        if eval_result.degraded:
-                            fallback_result.reason = f"{reason};degraded:{eval_result.degradation_reason}"
-                        fallback_result.evaluated_strikes = eval_result.evaluated
-
-                        resolved_symbol = eval_result.selected.symbol
-                        resolved_exchange = eval_result.selected.exchange
-                        tick_size = eval_result.selected.tick_size
-
-                        option_ltp = eval_result.selected.ltp or option_ltp
-                        option_bid = eval_result.selected.bid
-                        option_ask = eval_result.selected.ask
-
-                        logger.info(
-                            f"Liquidity fallback: selected {resolved_symbol} (was {fallback_result.original_symbol})"
-                        )
-                    else:
-                        if option_bid <= 0 or option_ask <= 0:
-                            return (
-                                False,
-                                {
-                                    "status": "error",
-                                    "message": f"No liquidity available for {resolved_symbol} and no suitable alternative found",
-                                },
-                                400,
-                            )
-
-            # Determine base price based on action with configurable execution buffer
-            # BUY: Use ask + buffer% (what sellers are asking)
-            # SELL: Use bid - buffer% (what buyers are bidding)
-            execution_buffer = get_execution_buffer_options()
-            buffer_pct = round(execution_buffer * 100, 1)
-            auto_discovery_requested = price == 0  # True when price=0 triggers auto-discovery
-            if action == "BUY":
-                if option_ask and option_ask > 0:
-                    base_price = option_ask * (1 + execution_buffer)
-                    price_source = f"ask+{buffer_pct}%"
-                else:
-                    base_price = option_ltp
-                    price_source = "ltp_fallback"
-            else:  # SELL
-                if option_bid and option_bid > 0:
-                    base_price = option_bid * (1 - execution_buffer)
-                    price_source = f"bid-{buffer_pct}%"
-                else:
-                    base_price = option_ltp
-                    price_source = "ltp_fallback"
-
-            if not base_price or base_price <= 0:
-                logger.error(f"Invalid base price for {resolved_symbol}: {base_price}")
-                return (
-                    False,
-                    {"status": "error", "message": f"Invalid option price received: {base_price}"},
-                    400,
-                )
-
-            # Get adjustment parameters
-            adjustment_type = options_data.get("price_adjustment_type")
-            adjustment_value = options_data.get("price_adjustment_value", 0.0)
-
-            # Validate adjustment limits
-            if adjustment_type == "percentage":
-                if adjustment_value > MAX_ADJUSTMENT_PERCENT:
-                    return (
-                        False,
-                        {
-                            "status": "error",
-                            "message": f"Adjustment value {adjustment_value}% exceeds maximum allowed {MAX_ADJUSTMENT_PERCENT}%",
-                        },
-                        400,
-                    )
-            elif adjustment_type == "absolute":
-                if adjustment_value > MAX_ADJUSTMENT_ABSOLUTE:
-                    return (
-                        False,
-                        {
-                            "status": "error",
-                            "message": f"Absolute adjustment value {adjustment_value} exceeds maximum allowed {MAX_ADJUSTMENT_ABSOLUTE}",
-                        },
-                        400,
-                    )
-
-            # Log adjustment parameters for audit trail
-            logger.info(
-                f"PRICE_DISCOVERY_ADJUSTMENT: symbol={resolved_symbol}, "
-                f"adjustment_type={adjustment_type}, adjustment_value={adjustment_value}, "
-                f"execution_buffer={execution_buffer}, base_price={base_price}, price_source={price_source}"
-            )
-
-            # Apply adjustment to base price
-            # IMPORTANT: Skip adjustments when auto-discovery was requested (price=0) to prevent
-            # double application of execution buffer. The buffer was already applied in base_price calculation.
-            if auto_discovery_requested:
-                logger.debug(
-                    f"Skipping price adjustments for auto-discovered price to prevent double buffer application. "
-                    f"Base price already includes {buffer_pct}% execution buffer."
-                )
-                adjustment_type = None
-                adjustment_value = 0
-
-            if adjustment_type == "percentage":
-                # BUY: Add premium (pay more), SELL: Reduce price (receive less)
-                if action == "BUY":
-                    discovered_price = base_price * (1 + adjustment_value / 100)
-                else:  # SELL
-                    discovered_price = base_price * (1 - adjustment_value / 100)
-            elif adjustment_type == "absolute":
-                # BUY: Add amount, SELL: Subtract amount
-                if action == "BUY":
-                    discovered_price = base_price + adjustment_value
-                else:  # SELL
-                    discovered_price = base_price - adjustment_value
-            else:
-                # No adjustment
-                discovered_price = base_price
-
-            # Round to tick size from database using utility function
-            discovered_price = round_price_to_tick_size(discovered_price, tick_size)
-
-            # Validate final price
-            if discovered_price <= 0:
-                logger.error(
-                    f"Invalid discovered price for {resolved_symbol}: {discovered_price} "
-                    f"(Base: {base_price}, Action: {action}, Adjustment: {adjustment_type}:{adjustment_value})"
-                )
-                return (
-                    False,
-                    {
-                        "status": "error",
-                        "message": f"Invalid discovered price: {discovered_price}. "
-                        f"Adjustment too large for {action} order.",
-                    },
-                    400,
-                )
-
-            # Override price parameter with discovered price
-            options_data["price"] = discovered_price
-
-            # Log final result for audit trail
-            logger.info(
-                f"PRICE_DISCOVERY_COMPLETE: symbol={resolved_symbol}, action={action}, "
-                f"base_price={base_price}, price_source={price_source}, "
-                f"adjustment_type={adjustment_type}, adjustment_value={adjustment_value}, "
-                f"tick_size={tick_size}, final_price={discovered_price}"
-            )
-        else:
-            logger.debug(
-                f"Price discovery not needed: pricetype={pricetype}, price={price} "
-                f"(discovery only for LIMIT orders with price=0.0)"
-            )
 
         # Check if split order is requested
         splitsize = options_data.get("splitsize", 0) or 0
@@ -548,58 +306,33 @@ def place_options_order(
             }
 
             # Add mode if in analyze mode
+            mode = "analyze" if get_analyze_mode() else "live"
             if get_analyze_mode():
                 response_data["mode"] = "analyze"
 
-            # Add liquidity fallback info if applied
-            if fallback_result.applied:
-                response_data["original_symbol"] = fallback_result.original_symbol
-                response_data["liquidity_fallback"] = True
-                response_data["fallback_reason"] = fallback_result.reason
-
-            # Emit toast notification for split orders
-            mode = "analyze" if get_analyze_mode() else "live"
-            successful_orders = sum(1 for r in results if r.get("status") == "success")
-            socketio.start_background_task(
-                socketio.emit,
-                "order_event",
-                {
-                    "symbol": resolved_symbol,
-                    "action": options_data.get("action"),
-                    "orderid": f"{successful_orders}/{len(results)} orders",
-                    "exchange": resolved_exchange,
-                    "price_type": options_data.get("pricetype", "MARKET"),
-                    "product_type": options_data.get("product", "MIS"),
-                    "mode": mode,
-                    "batch_order": True,
-                    "is_last_order": True,
-                },
-            )
-
-            # Log the split order
+            # Prepare request data for logging (without apikey)
             request_log = original_data.copy()
             if "apikey" in request_log:
                 del request_log["apikey"]
+            request_log["api_type"] = "optionsorder"
 
-            if get_analyze_mode():
-                request_log["api_type"] = "optionsorder"
-                log_executor.submit(async_log_analyzer, request_log, response_data, "optionsorder")
-                socketio.start_background_task(
-                    socketio.emit,
-                    "analyzer_update",
-                    {"request": request_log, "response": response_data},
-                )
-            else:
-                log_executor.submit(async_log_order, "optionsorder", request_log, response_data)
-
-            # Send Telegram alert in background task (non-blocking)
-            socketio.start_background_task(
-                telegram_alert_service.send_order_alert,
-                "optionsorder",
-                options_data,
-                response_data,
-                api_key,
-            )
+            successful_orders = sum(1 for r in results if r.get("status") == "success")
+            bus.publish(OptionsOrderCompletedEvent(
+                mode=mode,
+                api_type="optionsorder",
+                strategy=options_data.get("strategy", ""),
+                symbol=resolved_symbol,
+                exchange=resolved_exchange,
+                action=options_data.get("action", ""),
+                pricetype=options_data.get("pricetype", "MARKET"),
+                product=options_data.get("product", "MIS"),
+                results=results,
+                successful=successful_orders,
+                total=len(results),
+                request_data=request_log,
+                response_data=response_data,
+                api_key=api_key or "",
+            ))
 
             logger.info(
                 f"Split options order completed: {successful_orders}/{len(results)} successful"
@@ -646,12 +379,6 @@ def place_options_order(
             if "mode" in order_response:
                 enhanced_response["mode"] = order_response["mode"]
 
-            # Add liquidity fallback info if applied
-            if fallback_result.applied:
-                enhanced_response["original_symbol"] = fallback_result.original_symbol
-                enhanced_response["liquidity_fallback"] = True
-                enhanced_response["fallback_reason"] = fallback_result.reason
-
             logger.info(f"Options order placed successfully: {enhanced_response.get('orderid')}")
             return True, enhanced_response, status_code
         else:
@@ -659,6 +386,12 @@ def place_options_order(
             logger.error(f"Failed to place options order: {order_response.get('message')}")
             return False, order_response, status_code
 
+    except BrokerBusyError as e:
+        # Refused before it was sent: the broker's request queue was longer
+        # than a caller may wait under the gthread worker. Never raised under
+        # eventlet or the development server.
+        logger.warning(f"Options order not sent, broker busy: {e}")
+        return False, {"status": "error", "message": str(e)}, 429
     except Exception as e:
         logger.exception(f"Error in place_options_order: {e}")
         return (

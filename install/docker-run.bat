@@ -15,7 +15,7 @@ REM   logs     - View container logs (live)
 REM   pull     - Pull latest image from Docker Hub
 REM   status   - Show container status
 REM   shell    - Open bash shell in container
-REM   setup    - Re-run setup (regenerate keys, edit .env)
+REM   setup    - Create .env if there is none yet (an existing .env is kept)
 REM   help     - Show this help
 REM
 REM Prerequisites:
@@ -35,12 +35,6 @@ set OPENALGO_DIR=%~dp0
 REM Remove trailing backslash
 if "%OPENALGO_DIR:~-1%"=="\" set OPENALGO_DIR=%OPENALGO_DIR:~0,-1%
 set SETUP_FAILED=0
-
-REM XTS Brokers that require market data credentials
-set XTS_BROKERS=fivepaisaxts,compositedge,ibulls,iifl,jainamxts,wisdom
-
-REM Valid brokers list
-set VALID_BROKERS=fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha
 
 REM Banner
 echo.
@@ -95,14 +89,18 @@ if not exist "%OPENALGO_DIR%\db\" (
     )
 )
 
-REM Check if .env already exists
+REM Docker creates a folder named .env when the file is missing at container start
+if exist "%OPENALGO_DIR%\%ENV_FILE%\" (
+    echo [ERROR] .env is a folder, not a file. Docker created it because the .env file was missing.
+    echo Delete the empty .env folder in !OPENALGO_DIR!, then run docker-run.bat again to create the file.
+    set SETUP_FAILED=1
+    goto setup_end
+)
+
+REM An existing .env is never replaced: its keys protect the saved data.
 if exist "%OPENALGO_DIR%\%ENV_FILE%" (
-    echo [WARNING] .env file already exists at %OPENALGO_DIR%\%ENV_FILE%
-    set /p OVERWRITE="Do you want to overwrite it? (y/n): "
-    if /i not "!OVERWRITE!"=="y" (
-        echo [INFO] Setup cancelled. Using existing .env file.
-        goto setup_end
-    )
+    echo [OK] Kept the existing .env and its keys. It was not changed.
+    goto setup_end
 )
 
 REM Download sample.env from GitHub using curl.exe (not PowerShell alias)
@@ -145,113 +143,30 @@ if errorlevel 1 (
 
 REM Update .env file with generated keys
 echo [INFO] Updating configuration with secure keys...
-powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace '3daa0403ce2501ee7432b75bf100048e3cf510d63d2754f952e93d88bf07ea84', '%APP_KEY%' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
-powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'a25d94718479b170c16278e321ea6c989358bf499a658fd20c90033cef8ce772', '%API_KEY_PEPPER%' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
+powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'OPENALGO_PLACEHOLDER_APP_KEY_REGENERATE_BEFORE_USE', '%APP_KEY%' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
+powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'OPENALGO_PLACEHOLDER_API_KEY_PEPPER_REGENERATE_BEFORE_USE', '%API_KEY_PEPPER%' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
+REM No broker in .env: the trader adds broker keys in OpenAlgo after signing in
+REM (Broker Configuration). VALID_BROKERS keeps the full list of brokers keys can be saved for.
+powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'BROKER_API_KEY = ''YOUR_BROKER_API_KEY''', 'BROKER_API_KEY = ''''' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
+powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'BROKER_API_SECRET = ''YOUR_BROKER_API_SECRET''', 'BROKER_API_SECRET = ''''' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
+powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'BROKER_API_KEY_MARKET = ''YOUR_BROKER_MARKET_API_KEY''', 'BROKER_API_KEY_MARKET = ''''' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
+powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'BROKER_API_SECRET_MARKET = ''YOUR_BROKER_MARKET_API_SECRET''', 'BROKER_API_SECRET_MARKET = ''''' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
+powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'REDIRECT_URL = ''http://127.0.0.1:5000/<broker>/callback''', 'REDIRECT_URL = ''''' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
 echo [OK] Secure keys generated and saved.
-
-REM Get broker configuration
-echo.
-echo   ========================================
-echo   Broker Configuration
-echo   ========================================
-echo.
-echo   Valid brokers:
-echo   fivepaisa, fivepaisaxts, aliceblue, angel, compositedge,
-echo   definedge, deltaexchange, dhan, dhan_sandbox, firstock, flattrade, fyers,
-echo   groww, ibulls, iifl, indmoney, jainamxts, kotak, motilal,
-echo   mstock, nubra, paytm, pocketful, samco, shoonya, tradejini,
-echo   upstox, wisdom, zebu, zerodha
-echo.
-
-:get_broker
-set /p BROKER_NAME="Enter broker name (e.g., zerodha, fyers, angel): "
-
-REM Validate broker name
-echo,%VALID_BROKERS%, | findstr /i /c:",%BROKER_NAME%," >nul
-if errorlevel 1 (
-    echo [ERROR] Invalid broker: %BROKER_NAME%
-    echo Please enter a valid broker name from the list above.
-    goto get_broker
-)
-
-echo [OK] Broker: %BROKER_NAME%
-
-REM Get broker API credentials
-echo.
-set /p BROKER_API_KEY="Enter your %BROKER_NAME% API Key: "
-set /p BROKER_API_SECRET="Enter your %BROKER_NAME% API Secret: "
-
-if "%BROKER_API_KEY%"=="" (
-    echo [ERROR] API Key is required!
-    set SETUP_FAILED=1
-    goto setup_end
-)
-
-if "%BROKER_API_SECRET%"=="" (
-    echo [ERROR] API Secret is required!
-    set SETUP_FAILED=1
-    goto setup_end
-)
-
-REM Check if XTS broker (requires market data credentials)
-set IS_XTS=0
-echo,%XTS_BROKERS%, | findstr /i /c:",%BROKER_NAME%," >nul
-if not errorlevel 1 (
-    set IS_XTS=1
-    echo.
-    echo [INFO] %BROKER_NAME% is an XTS-based broker.
-    echo        Additional market data credentials are required.
-    echo.
-    set /p BROKER_API_KEY_MARKET="Enter Market Data API Key: "
-    set /p BROKER_API_SECRET_MARKET="Enter Market Data API Secret: "
-
-    if "!BROKER_API_KEY_MARKET!"=="" (
-        echo [ERROR] Market Data API Key is required for XTS brokers!
-        set SETUP_FAILED=1
-        goto setup_end
-    )
-    if "!BROKER_API_SECRET_MARKET!"=="" (
-        echo [ERROR] Market Data API Secret is required for XTS brokers!
-        set SETUP_FAILED=1
-        goto setup_end
-    )
-)
-
-REM Update .env with broker configuration
-echo.
-echo [INFO] Updating broker configuration...
-
-REM Update broker credentials
-powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'BROKER_API_KEY = ''YOUR_BROKER_API_KEY''', 'BROKER_API_KEY = ''%BROKER_API_KEY%''' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
-powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'BROKER_API_SECRET = ''YOUR_BROKER_API_SECRET''', 'BROKER_API_SECRET = ''%BROKER_API_SECRET%''' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
-
-REM Update redirect URL with broker name (replace <broker> placeholder)
-powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace '<broker>', '%BROKER_NAME%' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
-
-REM Update XTS market data credentials if applicable
-if "%IS_XTS%"=="1" (
-    powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'BROKER_API_KEY_MARKET = ''YOUR_BROKER_MARKET_API_KEY''', 'BROKER_API_KEY_MARKET = ''!BROKER_API_KEY_MARKET!''' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
-    powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'BROKER_API_SECRET_MARKET = ''YOUR_BROKER_MARKET_API_SECRET''', 'BROKER_API_SECRET_MARKET = ''!BROKER_API_SECRET_MARKET!''' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
-)
-
-echo [OK] Broker configuration saved.
 echo.
 echo   ========================================
 echo   Setup Complete!
 echo   ========================================
 echo.
-echo   Broker:         %BROKER_NAME%
-if "%IS_XTS%"=="1" (
-    echo   Type:           XTS API [with market data]
-)
 echo   Data directory: %OPENALGO_DIR%
 echo   Config file:    %OPENALGO_DIR%\%ENV_FILE%
 echo   Database:       %OPENALGO_DIR%\db\
 echo   Strategies:     %OPENALGO_DIR%\strategies\
 echo   Logs:           %OPENALGO_DIR%\log\
 echo.
-echo   Redirect URL for broker portal:
-echo   http://127.0.0.1:5000/%BROKER_NAME%/callback
+echo   Next step: once OpenAlgo is running, sign in, open Broker Configuration and add
+echo   your broker's keys. The page shows the redirect URL to register in
+echo   your broker's developer console.
 echo.
 echo   Documentation: https://docs.openalgo.in
 echo.
@@ -268,6 +183,13 @@ exit /b %SETUP_FAILED%
 :start
 echo [INFO] Starting OpenAlgo...
 echo.
+
+REM Docker creates a folder named .env when the file is missing at container start
+if exist "%OPENALGO_DIR%\%ENV_FILE%\" (
+    echo [ERROR] .env is a folder, not a file. Docker created it because the .env file was missing.
+    echo Delete the empty .env folder in !OPENALGO_DIR!, then run docker-run.bat again to create the file.
+    goto end
+)
 
 REM Check if setup is needed
 if not exist "%OPENALGO_DIR%\%ENV_FILE%" (
@@ -318,16 +240,34 @@ if errorlevel 1 (
 )
 
 REM Stop and remove existing container if exists
-docker stop %CONTAINER% >nul 2>&1
+docker stop -t 45 %CONTAINER% >nul 2>&1
 docker rm %CONTAINER% >nul 2>&1
 
-REM Calculate dynamic resource limits based on available RAM
-for /f "tokens=2 delims==" %%i in ('wmic computersystem get TotalPhysicalMemory /value ^| findstr TotalPhysicalMemory') do set TOTAL_RAM_BYTES=%%i
-set /a TOTAL_RAM_MB=%TOTAL_RAM_BYTES:~0,-6%
+REM Calculate dynamic resource limits based on available RAM.
+REM WMIC is absent from Windows 11 24H2 and later, so read both values from
+REM PowerShell. It also returns megabytes directly, which keeps the byte count
+REM out of set /a, where a machine with 4GB or more overflows 32-bit signed math.
+REM Each value is checked for being all digits, because a variable left empty
+REM here reaches set /a as text and evaluates to -1, which silently selects the
+REM most restrictive tier on every machine.
+set "TOTAL_RAM_MB="
+for /f "delims=" %%i in ('powershell -NoProfile -Command "[int]((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1MB)" 2^>nul') do set "TOTAL_RAM_MB=%%i"
+if defined TOTAL_RAM_MB for /f "delims=0123456789" %%x in ("!TOTAL_RAM_MB!") do set "TOTAL_RAM_MB="
 
-REM Get CPU cores
-for /f "tokens=2 delims==" %%i in ('wmic cpu get NumberOfCores /value ^| findstr NumberOfCores') do set CPU_CORES=%%i
-if "%CPU_CORES%"=="" set CPU_CORES=2
+REM Get CPU cores, summed over every socket
+set "CPU_CORES="
+for /f "delims=" %%i in ('powershell -NoProfile -Command "(Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum" 2^>nul') do set "CPU_CORES=%%i"
+if defined CPU_CORES for /f "delims=0123456789" %%x in ("!CPU_CORES!") do set "CPU_CORES="
+if not defined CPU_CORES set "CPU_CORES=2"
+
+if not defined TOTAL_RAM_MB (
+    echo [NOTE] Could not read how much memory this machine has, so OpenAlgo is
+    echo        starting with cautious limits: one compute thread and a 256MB
+    echo        strategy memory cap. The container will run, just more slowly than
+    echo        this machine allows. Windows PowerShell is what reads the memory
+    echo        size, so making it available restores the full limits.
+    set "TOTAL_RAM_MB=0"
+)
 
 REM shm_size: 25% of RAM (min 256MB, max 2GB)
 set /a SHM_SIZE_MB=%TOTAL_RAM_MB% / 4
@@ -366,6 +306,7 @@ REM Run container
 echo [INFO] Starting container...
 docker run -d ^
     --name %CONTAINER% ^
+    --stop-timeout 45 ^
     --shm-size=%SHM_SIZE_MB%m ^
     -p 5000:5000 ^
     -p 8765:8765 ^
@@ -381,7 +322,7 @@ docker run -d ^
     -v "%OPENALGO_DIR%\log:/app/log" ^
     -v "%OPENALGO_DIR%\keys:/app/keys" ^
     -v "%OPENALGO_DIR%\tmp:/app/tmp" ^
-    -v "%OPENALGO_DIR%\.env:/app/.env:ro" ^
+    -v "%OPENALGO_DIR%\.env:/app/.env" ^
     --restart unless-stopped ^
     %IMAGE%
 
@@ -416,14 +357,14 @@ goto end
 
 :stop
 echo [INFO] Stopping OpenAlgo...
-docker stop %CONTAINER% >nul 2>&1
+docker stop -t 45 %CONTAINER% >nul 2>&1
 docker rm %CONTAINER% >nul 2>&1
 echo [OK] OpenAlgo stopped.
 goto end
 
 :restart
 echo [INFO] Restarting OpenAlgo...
-docker stop %CONTAINER% >nul 2>&1
+docker stop -t 45 %CONTAINER% >nul 2>&1
 docker rm %CONTAINER% >nul 2>&1
 echo [OK] OpenAlgo stopped.
 echo.
@@ -474,6 +415,7 @@ echo [INFO] Running database migrations...
 docker exec -it %CONTAINER% /app/.venv/bin/python /app/upgrade/migrate_all.py
 if errorlevel 1 (
     echo [WARNING] Some migrations may have had issues. Check the output above.
+    exit /b 1
 ) else (
     echo [OK] Migrations completed successfully.
 )
@@ -492,7 +434,7 @@ echo   pull     Pull latest image from Docker Hub
 echo   status   Show container status
 echo   shell    Open bash shell in container
 echo   migrate  Run database migrations manually
-echo   setup    Re-run setup (regenerate keys, edit .env)
+echo   setup    Create .env if there is none yet (an existing .env is kept)
 echo   help     Show this help
 echo.
 echo Quick Start:
@@ -508,7 +450,7 @@ echo   - Strategies: %OPENALGO_DIR%\strategies\
 echo   - Logs:       %OPENALGO_DIR%\log\
 echo.
 echo XTS Brokers (require market data credentials):
-echo   fivepaisaxts, compositedge, ibulls, iifl, jainamxts, wisdom
+echo   fivepaisaxts, compositedge, ibulls, iifl, jainamxts, rmoney, wisdom
 echo.
 goto end
 

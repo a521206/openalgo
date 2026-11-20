@@ -9,61 +9,99 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 
-def get_broker_api_key():
+def get_broker_api_key() -> str | None:
+    """
+    Retrieve the configured broker API key.
+
+    Returns:
+        str | None: The broker API key from environment variables, or None if not set.
+    """
     return os.getenv("BROKER_API_KEY")
 
 
-def get_broker_api_secret():
+def get_broker_api_secret() -> str | None:
+    """
+    Retrieve the configured broker API secret.
+
+    Returns:
+        str | None: The broker API secret from environment variables, or None if not set.
+    """
     return os.getenv("BROKER_API_SECRET")
 
 
-def get_login_rate_limit_min():
+def get_login_rate_limit_min() -> str:
+    """
+    Retrieve the rate limit for logins per minute.
+
+    Returns:
+        str: The rate limit string (e.g., '5 per minute').
+    """
     return os.getenv("LOGIN_RATE_LIMIT_MIN", "5 per minute")
 
 
-def get_login_rate_limit_hour():
+def get_login_rate_limit_hour() -> str:
+    """
+    Retrieve the rate limit for logins per hour.
+
+    Returns:
+        str: The rate limit string (e.g., '25 per hour').
+    """
     return os.getenv("LOGIN_RATE_LIMIT_HOUR", "25 per hour")
 
 
-def get_host_server():
+def get_host_server() -> str:
+    """
+    Retrieve the host server URL.
+
+    Returns:
+        str: The host server URL string.
+    """
     return os.getenv("HOST_SERVER", "http://127.0.0.1:5000")
 
 
 @functools.lru_cache(maxsize=None)
-def get_execution_buffer_options():
-    """Return the execution buffer for options as a validated float. Default: 5% (0.05)."""
+def get_execution_buffer_options() -> float:
     try:
-        value = os.getenv("EXECUTION_BUFFER_OPTIONS", "0.05")
-        buffer = float(value)
-        if buffer < 0 or buffer > 0.50:
-            return 0.05
-        return buffer
-    except (ValueError, TypeError):
+        value = float(os.getenv("EXECUTION_BUFFER_OPTIONS", "0.05"))
+        return value if 0 <= value <= 0.50 else 0.05
+    except (TypeError, ValueError):
         return 0.05
 
 
 @functools.lru_cache(maxsize=None)
-def get_execution_buffer_futures():
-    """Return the execution buffer for futures as a validated float. Default: 0.1% (0.001)."""
+def get_execution_buffer_futures() -> float:
     try:
-        value = os.getenv("EXECUTION_BUFFER_FUTURES", "0.001")
-        buffer = float(value)
-        if buffer < 0 or buffer > 0.50:
-            return 0.001
-        return buffer
-    except (ValueError, TypeError):
+        value = float(os.getenv("EXECUTION_BUFFER_FUTURES", "0.001"))
+        return value if 0 <= value <= 0.50 else 0.001
+    except (TypeError, ValueError):
         return 0.001
 
 
-def get_execution_buffer(instrument_type: str = None) -> float:
-    """Return the execution buffer as a validated float.
+def get_execution_buffer(instrument_type: str | None = None) -> float:
+    return get_execution_buffer_futures() if instrument_type == "FUT" else get_execution_buffer_options()
+
+
+def build_external_url(path: str) -> str:
+    """
+    Build an absolute URL for an outbound link, rooted at the configured HOST_SERVER.
+
+    Use this instead of ``url_for(..., _external=True)`` for any URL that leaves
+    the server - password reset emails, broker OAuth callbacks. Flask derives the
+    scheme and host for ``_external=True`` from the incoming request's ``Host``
+    header, which is attacker-controlled: a poisoned header rewrites the link to
+    an origin of the attacker's choosing, and whoever follows it (the account
+    owner reading their email, or the broker redirecting after OAuth) hands over
+    the token in the URL. HOST_SERVER is set by every official install script and
+    is not influenced by the request, so it cannot be poisoned this way.
 
     Args:
-        instrument_type: Optional instrument type ("FUT", "CE", "PE"). If None, defaults to options buffer.
+        path: Root-relative path, normally the return value of ``url_for()``
+            called without ``_external``. A leading slash is optional.
 
     Returns:
-        Buffer value based on instrument type.
+        str: Absolute URL rooted at HOST_SERVER.
     """
-    if instrument_type == "FUT":
-        return get_execution_buffer_futures()
-    return get_execution_buffer_options()
+    base = get_host_server().strip().rstrip("/")
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return f"{base}{path}"

@@ -11,11 +11,26 @@ and OpenAlgo's standard format.
 from datetime import UTC, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from broker.zerodha.mapping.mcx_contract_size import from_kite_quantity
+
+
+def _units(data, field):
+    """Kite order-stream quantity -> OpenAlgo units (MCX only, else unchanged)."""
+    return int(
+        from_kite_quantity(
+            data.get(field, 0), data.get("tradingsymbol", ""), data.get("exchange", "")
+        )
+    )
+
 
 class ZerodhaExchangeMapper:
     """Maps exchange codes between Zerodha and OpenAlgo formats"""
 
     # Map OpenAlgo exchange codes to Zerodha exchange codes
+    # NOTE: GLOBAL_INDEX is the OA umbrella for both Zerodha "GLOBAL" and "NSEIX"
+    # feeds. Forward direction picks GLOBAL as the canonical broker code; the
+    # NSEIX → GLOBAL_INDEX direction is handled below in _ZERODHA_TO_OA so the
+    # adapter can still recognise NSEIX ticks coming back from Zerodha.
     _OA_TO_ZERODHA = {
         "NSE": "NSE",
         "NFO": "NFO",
@@ -23,12 +38,17 @@ class ZerodhaExchangeMapper:
         "BSE": "BSE",
         "BFO": "BFO",
         "MCX": "MCX",
+        "NCO": "NCO",
         "NSE_INDEX": "NSE_INDEX",
         "BSE_INDEX": "BSE_INDEX",
+        "MCX_INDEX": "MCX_INDEX",
+        "GLOBAL_INDEX": "GLOBAL",
     }
 
     # Map Zerodha exchange codes to OpenAlgo exchange codes
     _ZERODHA_TO_OA = {v: k for k, v in _OA_TO_ZERODHA.items()}
+    # NSEIX rows fold into GLOBAL_INDEX on the OA side.
+    _ZERODHA_TO_OA["NSEIX"] = "GLOBAL_INDEX"
 
     @classmethod
     def to_zerodha_exchange(cls, oa_exchange: str) -> str:
@@ -234,9 +254,10 @@ class ZerodhaDataTransformer:
                 ),
                 "price": float(data.get("price", 0)),
                 "trigger_price": float(data.get("trigger_price", 0)),
-                "quantity": int(data.get("quantity", 0)),
-                "filled_quantity": int(data.get("filled_quantity", 0)),
-                "pending_quantity": int(data.get("pending_quantity", 0)),
+                # MCX arrives in contracts; normalise to OpenAlgo units.
+                "quantity": _units(data, "quantity"),
+                "filled_quantity": _units(data, "filled_quantity"),
+                "pending_quantity": _units(data, "pending_quantity"),
                 "average_price": float(data.get("average_price", 0)),
                 "order_timestamp": data.get("order_timestamp", ""),
                 "exchange_timestamp": data.get("exchange_timestamp", ""),

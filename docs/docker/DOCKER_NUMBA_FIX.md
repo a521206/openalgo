@@ -1,5 +1,7 @@
 # Docker Fix for Numba/LLVMLITE/SciPy Errors
 
+This is a historical January 2026 implementation/troubleshooting record. For current setup, writable `.env` mounts, resource defaults and worker selection, use [Docker Deployment](docker.md) and [Docker Build Guide](DOCKER_BUILD_GUIDE.md).
+
 ## Problem Summary
 
 When running OpenAlgo strategies in Docker that use numba/llvmlite (for indicators like Supertrend, EMA, TEMA), you may encounter these errors:
@@ -91,7 +93,7 @@ docker-compose build --no-cache
 docker-compose up -d
 
 # Verify the fix
-docker-compose exec openalgo python -c "import numba; import llvmlite; import scipy; print('✓ All imports successful')"
+docker-compose exec openalgo python -c "import numba; import llvmlite; import scipy; print('All imports successful')"
 ```
 
 ### Option 2: Using Docker Run
@@ -115,7 +117,7 @@ docker run -d \
   -v openalgo_log:/app/log \
   -v openalgo_strategies:/app/strategies \
   -v openalgo_keys:/app/keys \
-  -v "$(pwd)/.env:/app/.env:ro" \
+  -v "$(pwd)/.env:/app/.env" \
   --tmpfs /app/tmp:size=1g,mode=1777 \
   openalgo:latest
 ```
@@ -141,7 +143,7 @@ docker-compose up -d
 
 1. **Test Python imports:**
 ```bash
-docker-compose exec openalgo python -c "import numba; import llvmlite; import scipy; print('✓ Success')"
+docker-compose exec openalgo python -c "import numba; import llvmlite; import scipy; print('Success')"
 ```
 
 2. **Test numba JIT compilation:**
@@ -159,7 +161,7 @@ def sum_array(arr):
 
 arr = np.array([1, 2, 3, 4, 5])
 result = sum_array(arr)
-print(f'✓ Numba JIT works: sum={result}')
+print(f'Numba JIT works: sum={result}')
 "
 ```
 
@@ -167,7 +169,7 @@ print(f'✓ Numba JIT works: sum={result}')
 ```bash
 docker-compose exec openalgo python -c "
 from scipy import stats
-print('✓ SciPy works:', stats.norm.cdf(0))
+print('SciPy works:', stats.norm.cdf(0))
 "
 ```
 
@@ -242,14 +244,14 @@ These changes have minimal performance impact:
 ## Compatibility
 
 These changes are compatible with:
-- ✅ Python 3.12+ (required by pyproject.toml)
-- ✅ numba 0.63.1
-- ✅ llvmlite 0.46.0b1
-- ✅ scipy 1.17.0
-- ✅ All supported brokers
-- ✅ Railway, Render, and other cloud platforms
-- ✅ Local Docker installations
-- ✅ Windows (WSL2), macOS, and Linux
+- Python 3.12+ (required by pyproject.toml)
+- numba 0.63.1
+- llvmlite 0.46.0b1
+- scipy 1.17.0
+- All supported brokers
+- Railway, Render, and other cloud platforms
+- Local Docker installations
+- Windows (WSL2), macOS, and Linux
 
 ## References
 

@@ -20,7 +20,7 @@ A comprehensive GitHub Actions-based pipeline that:
 - Validates both backend (Python) and frontend (React) code
 - Scans for security vulnerabilities
 - Builds and validates Docker images
-- Provides fast feedback (< 5 minutes)
+- Runs independent jobs concurrently and uses dependency/build caches where configured
 
 ## Target Users
 
@@ -49,6 +49,7 @@ A comprehensive GitHub Actions-based pipeline that:
 | FR2.2 | Frontend Vitest unit tests | P0 |
 | FR2.3 | Frontend Playwright E2E tests | P1 |
 | FR2.4 | Coverage report generation | P1 |
+| FR2.5 | Real eventlet/gthread boot, fallback, source gates, complete migration suite and portable concurrency verification | P0 |
 
 ### FR3: Security
 
@@ -93,24 +94,25 @@ A comprehensive GitHub Actions-based pipeline that:
 │                    └──────────────┘                              │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
 │  │ backend-test │  │ frontend-    │  │    docker-build      │  │
-│  │   (pytest)   │  │    build     │  │   (Buildx + Trivy)   │  │
+│  │   (pytest)   │  │    build     │  │ (native multi-arch)  │  │
 │  └──────────────┘  │   (Vite)     │  └──────────────────────┘  │
 │                    └──────────────┘                              │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ root-css-    │  │ frontend-    │  │    frontend-e2e      │  │
-│  │    build     │  │    test      │  │    (Playwright)      │  │
+│  │ commit-dist  │  │ frontend-    │  │    frontend-e2e      │  │
+│  │ (main only)  │  │    test      │  │    (Playwright)      │  │
 │  └──────────────┘  │  (Vitest)    │  └──────────────────────┘  │
 │                    └──────────────┘                              │
-│                                                                  │
-│  All jobs run in PARALLEL (~3-4 minutes total)                  │
+│  docker-build: native amd64 + arm64; docker-manifest on main    │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+The current workflow also includes `gunicorn-boot`, `eventlet-fallback`, `gthread-gates`, `gthread-migration`, `gthread-platforms`, and `chart-indicator-skill`; see the [workflows reference](ci-cd-workflows.md) for their current scope. The diagram above summarizes the original application/build lanes rather than every job.
 
 ## Quick Start
 
 ```bash
 # Install pre-commit hooks (one-time setup)
-pip install pre-commit
+uv tool install pre-commit
 pre-commit install
 
 # Run all checks locally before committing
@@ -131,7 +133,7 @@ cd frontend && npm run e2e
 ```
 .github/
   workflows/
-    ci.yml              # Main CI workflow (9 parallel jobs)
+    ci.yml              # Main CI workflow and conditional publish jobs
     security.yml        # Weekly security scan
   dependabot.yml        # Automated dependency updates
 

@@ -3,20 +3,29 @@
 import base64
 import os
 
-from cachetools import TTLCache
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from sqlalchemy import Boolean, Column, Integer, MetaData, String, Text, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.pool import NullPool
 
+from database.auth_db import PEPPER
 from utils.logging import get_logger
+from utils.thread_safe_cache import MISSING, LockedTTLCache
 
 logger = get_logger(__name__)
 
 # Settings cache - 1 hour TTL (settings rarely change)
 # This cache significantly reduces DB queries since get_analyze_mode() is called on every request
-_settings_cache = TTLCache(maxsize=10, ttl=3600)  # 1 hour TTL
+#
+# get_analyze_mode() decides whether an order goes to the broker or to the
+# sandbox, so a stale entry is an order sent to the wrong place for up to the
+# TTL. Readers fill with the generation they read before their query, and
+# every writer invalidates after its commit, so a read that raced a toggle is
+# returned to its own caller but never cached (see utils/thread_safe_cache).
+_settings_cache = LockedTTLCache(maxsize=10, ttl=3600)  # 1 hour TTL
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -50,26 +59,12 @@ class Settings(Base):
     smtp_helo_hostname = Column(String(255), nullable=True)  # HELO/EHLO hostname
 
     # Security Settings
-    security_404_threshold = Column(Integer, default=20)  # 404 errors per day before ban
-    security_404_ban_duration = Column(Integer, default=24)  # Ban duration in hours
-    security_api_threshold = Column(Integer, default=10)  # Invalid API attempts before ban
-    security_api_ban_duration = Column(Integer, default=48)  # Ban duration in hours
-    security_repeat_offender_limit = Column(Integer, default=3)  # Bans before permanent ban
-
-    # Smart Trade Rules
-    smart_trade_enabled = Column(Boolean, default=True)  # Master switch for smart trade rules
-    prevent_duplicate_buy = Column(Boolean, default=True)  # Prevent BUY if position exists
-    prevent_duplicate_sell = Column(Boolean, default=True)  # Prevent SELL if no position exists
-    max_position_size = Column(
-        Integer, nullable=True
-    )  # Maximum position size per symbol (lots for F&O, qty for equity)
-    max_order_value = Column(Integer, nullable=True)  # Maximum order value in INR
-    allow_intraday_only = Column(Boolean, default=False)  # Only allow MIS orders
-    block_cnc_orders = Column(Boolean, default=False)  # Block CNC (delivery) orders
-    block_nrml_orders = Column(Boolean, default=False)  # Block NRML (carryforward) orders
-    liquidity_fallback = Column(
-        Boolean, default=True
-    )  # Auto-select best liquid strike for illiquid options
+    security_auto_ban_enabled = Column(Boolean, default=False)  # Auto-ban disabled by default
+    security_404_threshold = Column(Integer, default=100)  # 404 errors per day before ban
+    security_404_ban_duration = Column(Integer, default=0)  # 0 = permanent ban
+    security_api_threshold = Column(Integer, default=100)  # Invalid API attempts before ban
+    security_api_ban_duration = Column(Integer, default=0)  # 0 = permanent ban
+    security_repeat_offender_limit = Column(Integer, default=2)  # Bans before permanent ban
 
 
 def init_db():
@@ -90,15 +85,19 @@ def init_db():
         logger.debug(f"Settings DB: Default config may already exist (race condition): {e}")
 
 
-def get_analyze_mode() -> bool:
+def get_analyze_mode():
     """Get current analyze mode setting (cached for 1 hour)"""
     cache_key = "analyze_mode"
 
-    # Check cache first
-    if cache_key in _settings_cache:
-        return bool(_settings_cache[cache_key])
+    # Check cache first. One get, never a membership test then a subscript:
+    # the entry can go between the two, and the KeyError failed the order.
+    cached = _settings_cache.get(cache_key, MISSING)
+    if cached is not MISSING:
+        return cached
 
-    # Cache miss - query database
+    # Cache miss - query database. The generation is read first, so a toggle
+    # that commits while this read is in flight keeps its value in the cache.
+    generation = _settings_cache.generation
     settings = Settings.query.first()
     if not settings:
         settings = Settings(analyze_mode=False)  # Default to Live Mode
@@ -106,8 +105,9 @@ def get_analyze_mode() -> bool:
         db_session.commit()
 
     # Store in cache
-    _settings_cache[cache_key] = settings.analyze_mode
-    return bool(settings.analyze_mode)
+    mode = settings.analyze_mode
+    _settings_cache.fill(cache_key, mode, generation)
+    return mode
 
 
 def set_analyze_mode(mode: bool):
@@ -120,38 +120,64 @@ def set_analyze_mode(mode: bool):
         settings.analyze_mode = mode
     db_session.commit()
 
-    # Invalidate cache after update
-    if "analyze_mode" in _settings_cache:
-        del _settings_cache["analyze_mode"]
+    # Invalidate cache after update. After the commit, never before, and an
+    # invalidation rather than a delete: a reader that loaded the old mode
+    # before this commit is then refused when it tries to store it.
+    _settings_cache.invalidate("analyze_mode")
 
 
-def _get_encryption_key():
-    """Get or create encryption key for SMTP password"""
-    # Use API_KEY_PEPPER as the base for encryption key
-    pepper = os.getenv("API_KEY_PEPPER", "default-pepper-key")
-    # Create a stable key from the pepper
-    key = base64.urlsafe_b64encode(pepper.ljust(32)[:32].encode())
-    return key
+# SMTP password encryption.
+#
+# New ciphertext uses a strong PBKDF2-HMAC-SHA256 key derived from the
+# validated API_KEY_PEPPER (imported from auth_db, which fails fast if the
+# pepper is missing or too short) plus a dedicated salt -- the same KDF
+# discipline as database/telegram_db.py. Older installs stored the SMTP
+# password under a weak legacy key (the raw pepper, padded/truncated to 32
+# bytes with no KDF); _decrypt_password() transparently falls back to that
+# legacy key so existing values keep working, and re-saving SMTP settings
+# re-encrypts under the strong key, migrating it forward.
+SMTP_KEY_SALT = os.getenv("SMTP_KEY_SALT", "smtp-openalgo-salt").encode()
+
+
+def _get_smtp_fernet() -> Fernet:
+    """Strong Fernet for the SMTP password: PBKDF2(PEPPER, SMTP_KEY_SALT)."""
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=SMTP_KEY_SALT,
+        iterations=100000,
+    )
+    return Fernet(base64.urlsafe_b64encode(kdf.derive(PEPPER.encode())))
+
+
+def _legacy_smtp_fernet() -> Fernet:
+    """Legacy read-only key (raw pepper, no KDF). Used only to decrypt values
+    stored before the switch to _get_smtp_fernet(); never for new writes.
+    """
+    return Fernet(base64.urlsafe_b64encode(PEPPER.ljust(32)[:32].encode()))
+
+
+# Module-level cipher; PEPPER is fixed for the process lifetime.
+_smtp_fernet = _get_smtp_fernet()
 
 
 def _encrypt_password(password: str) -> str:
-    """Encrypt SMTP password"""
+    """Encrypt SMTP password with the strong per-install key."""
     if not password:
         return None
-    key = _get_encryption_key()
-    f = Fernet(key)
-    encrypted = f.encrypt(password.encode())
-    return encrypted.decode()
+    return _smtp_fernet.encrypt(password.encode()).decode()
 
 
 def _decrypt_password(encrypted_password: str) -> str:
-    """Decrypt SMTP password"""
+    """Decrypt SMTP password, falling back to the legacy key for values
+    written before the KDF upgrade."""
     if not encrypted_password:
         return None
-    key = _get_encryption_key()
-    f = Fernet(key)
-    decrypted = f.decrypt(encrypted_password.encode())
-    return decrypted.decode()
+    token = encrypted_password.encode()
+    try:
+        return _smtp_fernet.decrypt(token).decode()
+    except InvalidToken:
+        return _legacy_smtp_fernet().decrypt(token).decode()
 
 
 def get_smtp_settings():
@@ -212,38 +238,43 @@ def get_security_settings():
     cache_key = "security_settings"
 
     # Check cache first
-    if cache_key in _settings_cache:
-        return _settings_cache[cache_key]
+    cached = _settings_cache.get(cache_key, MISSING)
+    if cached is not MISSING:
+        return cached
 
     # Cache miss - query database
+    generation = _settings_cache.generation
     settings = Settings.query.first()
     if not settings:
         # Create with defaults
         settings = Settings(
             analyze_mode=False,
-            security_404_threshold=20,
-            security_404_ban_duration=24,
-            security_api_threshold=10,
-            security_api_ban_duration=48,
-            security_repeat_offender_limit=3,
+            security_auto_ban_enabled=False,
+            security_404_threshold=100,
+            security_404_ban_duration=0,
+            security_api_threshold=100,
+            security_api_ban_duration=0,
+            security_repeat_offender_limit=2,
         )
         db_session.add(settings)
         db_session.commit()
 
     result = {
-        "404_threshold": settings.security_404_threshold or 20,
-        "404_ban_duration": settings.security_404_ban_duration or 24,
-        "api_threshold": settings.security_api_threshold or 10,
-        "api_ban_duration": settings.security_api_ban_duration or 48,
-        "repeat_offender_limit": settings.security_repeat_offender_limit or 3,
+        "auto_ban_enabled": bool(settings.security_auto_ban_enabled) if settings.security_auto_ban_enabled is not None else False,
+        "404_threshold": settings.security_404_threshold or 100,
+        "404_ban_duration": settings.security_404_ban_duration if settings.security_404_ban_duration is not None else 0,
+        "api_threshold": settings.security_api_threshold or 100,
+        "api_ban_duration": settings.security_api_ban_duration if settings.security_api_ban_duration is not None else 0,
+        "repeat_offender_limit": settings.security_repeat_offender_limit or 2,
     }
 
     # Store in cache
-    _settings_cache[cache_key] = result
+    _settings_cache.fill(cache_key, result, generation)
     return result
 
 
 def set_security_settings(
+    auto_ban_enabled=None,
     threshold_404=None,
     ban_duration_404=None,
     threshold_api=None,
@@ -256,6 +287,8 @@ def set_security_settings(
         settings = Settings(analyze_mode=False)
         db_session.add(settings)
 
+    if auto_ban_enabled is not None:
+        settings.security_auto_ban_enabled = auto_ban_enabled
     if threshold_404 is not None:
         settings.security_404_threshold = threshold_404
     if ban_duration_404 is not None:
@@ -271,8 +304,7 @@ def set_security_settings(
     logger.info("Security settings updated successfully")
 
     # Invalidate cache after update
-    if "security_settings" in _settings_cache:
-        del _settings_cache["security_settings"]
+    _settings_cache.invalidate("security_settings")
 
 
 def clear_settings_cache():
@@ -280,84 +312,5 @@ def clear_settings_cache():
     Clear all settings caches.
     Called on logout/session expiry to ensure fresh data on next login.
     """
-    _settings_cache.clear()
+    _settings_cache.invalidate()
     logger.info("Settings cache cleared")
-
-
-def get_smart_trade_rules():
-    """Get smart trade rules configuration (cached for 1 hour)"""
-    cache_key = "smart_trade_rules"
-
-    # Check cache first
-    if cache_key in _settings_cache:
-        return _settings_cache[cache_key]
-
-    # Cache miss - query database
-    settings = Settings.query.first()
-    if not settings:
-        # Create with defaults
-        settings = Settings(analyze_mode=False)
-        db_session.add(settings)
-        db_session.commit()
-
-    result = {
-        "smart_trade_enabled": settings.smart_trade_enabled or False,
-        "prevent_duplicate_buy": settings.prevent_duplicate_buy or False,
-        "prevent_duplicate_sell": settings.prevent_duplicate_sell or False,
-        "max_position_size": settings.max_position_size,
-        "max_order_value": settings.max_order_value,
-        "allow_intraday_only": settings.allow_intraday_only or False,
-        "block_cnc_orders": settings.block_cnc_orders or False,
-        "block_nrml_orders": settings.block_nrml_orders or False,
-        "liquidity_fallback": settings.liquidity_fallback
-        if settings.liquidity_fallback is not None
-        else True,
-    }
-
-    # Store in cache
-    _settings_cache[cache_key] = result
-    return result
-
-
-def set_smart_trade_rules(
-    smart_trade_enabled=None,
-    prevent_duplicate_buy=None,
-    prevent_duplicate_sell=None,
-    max_position_size=None,
-    max_order_value=None,
-    allow_intraday_only=None,
-    block_cnc_orders=None,
-    block_nrml_orders=None,
-    liquidity_fallback=None,
-):
-    """Set smart trade rules configuration"""
-    settings = Settings.query.first()
-    if not settings:
-        settings = Settings(analyze_mode=False)
-        db_session.add(settings)
-
-    if smart_trade_enabled is not None:
-        settings.smart_trade_enabled = smart_trade_enabled
-    if prevent_duplicate_buy is not None:
-        settings.prevent_duplicate_buy = prevent_duplicate_buy
-    if prevent_duplicate_sell is not None:
-        settings.prevent_duplicate_sell = prevent_duplicate_sell
-    if max_position_size is not None:
-        settings.max_position_size = max_position_size if max_position_size > 0 else None
-    if max_order_value is not None:
-        settings.max_order_value = max_order_value if max_order_value > 0 else None
-    if allow_intraday_only is not None:
-        settings.allow_intraday_only = allow_intraday_only
-    if block_cnc_orders is not None:
-        settings.block_cnc_orders = block_cnc_orders
-    if block_nrml_orders is not None:
-        settings.block_nrml_orders = block_nrml_orders
-    if liquidity_fallback is not None:
-        settings.liquidity_fallback = liquidity_fallback
-
-    db_session.commit()
-    logger.info("Smart trade rules updated successfully")
-
-    # Invalidate cache after update
-    if "smart_trade_rules" in _settings_cache:
-        del _settings_cache["smart_trade_rules"]

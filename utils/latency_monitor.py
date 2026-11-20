@@ -1,20 +1,118 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 
 from flask import g, request
 from flask_restx import Resource
 
+from database.auth_db import db_session as auth_db_session
 from database.auth_db import get_broker_name
 from database.latency_db import OrderLatency, init_latency_db, latency_session, purge_old_data_logs
+from database.latency_groups import ORDER_TAGS, RETENTION_DAYS, TAG_FOR_NAMESPACE
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Shared single-worker executor: the latency record commit (SQLite fsync) runs
+# off the request thread so it never delays the order response. One worker
+# keeps writes serialized and bounds the scoped sessions to a single
+# long-lived thread.
+_latency_log_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="latency-log")
+
+#: Latency records with these tags are kept forever; every other record is a
+#: data query and is removed after a week. The list itself is
+#: ``database.latency_groups.ORDER_TAGS``, the orders group, which is also what
+#: ``database.latency_db.purge_old_data_logs`` leaves alone. There used to be a
+#: copy here and a copy there, each asking to be kept in step with the other.
+#:
+#: A GTT is an order instruction, not a data query. It can also rest for a year
+#: before firing, so purging its placement latency after a week would discard
+#: the record long before the order it describes exists.
+KEEP_FOREVER_TYPES = ORDER_TAGS
+
+
+def _log_latency_async(
+    api_key, order_id, user_id, symbol, order_type, latencies, status, error, broker=None
+):
+    """Resolve broker name and persist the latency record. Runs on the executor thread.
+
+    ``broker`` is resolved by the caller when the request carried no API key --
+    session-authenticated UI routes (the scalping terminal, the Positions close
+    buttons) authenticate by cookie and send none, and the Flask session is not
+    readable from this thread.
+    """
+    try:
+        broker_name = broker or (get_broker_name(api_key) if api_key else None)
+        OrderLatency.log_latency(
+            order_id=order_id,
+            user_id=user_id,
+            broker=broker_name,
+            symbol=symbol,
+            order_type=order_type,
+            latencies=latencies,
+            request_body=None,  # Not storing to save database space
+            response_body=None,  # Not storing to save database space
+            status=status,
+            error=error,
+        )
+    except Exception as e:
+        logger.exception(f"Error logging latency asynchronously: {e}")
+    finally:
+        # Both sessions must be removed on this thread: an unremoved scoped
+        # session keeps its read transaction (and SQLite lock) open.
+        latency_session.remove()
+        auth_db_session.remove()
+
+
+def _response_payload(response):
+    """The JSON body of a view's return value, as a dict.
+
+    Flask views may return any of these, and all of them turn up here:
+
+      - ``make_response(jsonify(d), code)`` -> a Response          (RESTX)
+      - ``jsonify(d), code``                -> (Response, int)  (blueprints)
+      - ``d, code``                         -> (dict, int)
+      - ``send_file(...)``                  -> a Response with no JSON body
+
+    Only the first and third were understood before, so blueprint routes -- the
+    scalping terminal's order endpoints and the Positions close buttons -- had
+    their payload read as ``{}`` and every record logged an order id of "unknown".
+    A file download has a ``.json`` property that resolves to None rather than
+    raising, so it still falls through to ``{}``.
+    """
+    if isinstance(response, tuple):
+        response = response[0] if response else None
+
+    if isinstance(response, dict):
+        return response
+
+    payload = getattr(response, "json", None)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _session_broker():
+    """The logged-in broker, for requests that carry no API key.
+
+    Session-authenticated UI routes have no ``apikey`` in the body, so the record
+    would otherwise land with an empty broker and never group under the broker it
+    was actually sent to. Read here, on the request thread -- the executor thread
+    that writes the record has no session.
+    """
+    try:
+        from flask import session
+
+        return session.get("broker")
+    except Exception:  # outside a request context, or no session configured
+        return None
 
 
 class LatencyTracker:
     """Helper class to track latencies across different stages of order execution"""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """
+        Initialize the LatencyTracker instance.
+        """
         self.start_time = time.time()
         self.stage_times = {}
         self.current_stage = None
@@ -59,8 +157,27 @@ def track_latency(api_type):
     """Decorator to track latency for API endpoints"""
 
     def decorator(f):
+        """
+        The actual decorator that wraps the target function.
+
+        Args:
+            f (callable): The function to be decorated.
+
+        Returns:
+            callable: The wrapped function.
+        """
         @wraps(f)
         def wrapped(*args, **kwargs):
+            """
+            The wrapped function that instruments execution time and context.
+
+            Args:
+                *args: Positional arguments passed to the original function.
+                **kwargs: Keyword arguments passed to the original function.
+
+            Returns:
+                Any: The response from the original function.
+            """
             # Initialize latency tracker
             tracker = LatencyTracker()
             g.latency_tracker = tracker
@@ -92,43 +209,10 @@ def track_latency(api_type):
                 # Start response processing stage
                 tracker.start_stage("broker_response")
 
-                # Get response data
-                # Check if response is a Flask Response object (including TextResponse)
-                if hasattr(response, "json"):
-                    json_attr = response.json
-                    # Check if json is a method (callable) or a property
-                    if callable(json_attr):
-                        try:
-                            response_data = json_attr()
-                        except Exception:
-                            response_data = {}
-                    else:
-                        # json is a property - use it if it's a dict
-                        response_data = json_attr if isinstance(json_attr, dict) else {}
-                elif isinstance(response, tuple) and len(response) > 0:
-                    first_element = response[0]
-                    # Check if the first element is a Flask Response object
-                    if hasattr(first_element, "json"):
-                        json_attr = first_element.json
-                        if callable(json_attr):
-                            try:
-                                response_data = json_attr()
-                            except Exception:
-                                response_data = {}
-                        else:
-                            # json is a property - use it if it's a dict
-                            response_data = json_attr if isinstance(json_attr, dict) else {}
-                    elif isinstance(first_element, dict):
-                        response_data = first_element
-                    else:
-                        # For Response objects without json property, use empty dict
-                        response_data = {}
-                else:
-                    response_data = {}
-
-                # Ensure response_data is a dict for .get() to work
-                if not isinstance(response_data, dict):
-                    response_data = {}
+                # Get response data. A file download (e.g. the portfolio
+                # tearsheet) has a `.json` property but isn't JSON, so it
+                # resolves to None rather than raising.
+                response_data = _response_payload(response)
 
                 # End response processing stage
                 tracker.end_stage()
@@ -170,28 +254,25 @@ def track_latency(api_type):
                 if order_id is None:
                     order_id = response_data.get("request_id", "unknown")
 
-                # Get broker name from auth_db using API key
-                broker_name = None
-                if "apikey" in request_data:
-                    broker_name = get_broker_name(request_data["apikey"])
-
-                OrderLatency.log_latency(
-                    order_id=order_id,
-                    user_id=g.get("user_id"),
-                    broker=broker_name,
-                    symbol=request_data.get("symbol"),
-                    order_type=api_type,
-                    latencies={
+                # Persist off the request thread: broker-name lookup and the
+                # SQLite commit must not delay the order response.
+                _latency_log_executor.submit(
+                    _log_latency_async,
+                    request_data.get("apikey"),
+                    order_id,
+                    g.get("user_id"),
+                    request_data.get("symbol"),
+                    api_type,
+                    {
                         "rtt": rtt,  # Round-trip time (comparable to Postman/Bruno)
                         "validation": tracker.stage_times.get("validation", 0),
                         "broker_response": tracker.stage_times.get("broker_response", 0),
                         "overhead": overhead,
                         "total": total,
                     },
-                    request_body=None,  # Not storing to save database space
-                    response_body=None,  # Not storing to save database space
-                    status="SUCCESS" if status_code < 400 else "FAILED",
-                    error=response_data.get("message") if status_code >= 400 else None,
+                    "SUCCESS" if status_code < 400 else "FAILED",
+                    response_data.get("message") if status_code >= 400 else None,
+                    _session_broker() if not request_data.get("apikey") else None,
                 )
 
                 return response
@@ -211,42 +292,28 @@ def track_latency(api_type):
                     rtt = tracker.get_rtt()
                     overhead = tracker.get_overhead()
 
-                # Get broker name from auth_db using API key if available
-                broker_name = None
-                if "request_data" in locals() and isinstance(request_data, dict) and "apikey" in request_data:
-                    broker_name = get_broker_name(request_data["apikey"])
-                elif request.is_json:
-                    request_data = request.get_json() if request.is_json else {}
-                    if "apikey" in request_data:
-                        broker_name = get_broker_name(request_data["apikey"])
-                else:
-                    request_data = {}
-
-                # Use empty dict for response_data in error case
-                response_data = {}
-
-                OrderLatency.log_latency(
-                    order_id="error",
-                    user_id=g.get("user_id"),
-                    broker=broker_name,
-                    symbol=request_data.get("symbol") if "request_data" in locals() else None,
-                    order_type=api_type,
-                    latencies={
+                has_request_data = "request_data" in locals()
+                _latency_log_executor.submit(
+                    _log_latency_async,
+                    request_data.get("apikey") if has_request_data else None,
+                    "error",
+                    g.get("user_id"),
+                    request_data.get("symbol") if has_request_data else None,
+                    api_type,
+                    {
                         "rtt": rtt,
                         "validation": tracker.stage_times.get("validation", 0),
                         "broker_response": 0,
                         "overhead": overhead,
                         "total": total_time,
                     },
-                    request_body=None,  # Not storing to save database space
-                    response_body=None,  # Not storing to save database space
-                    status="FAILED",
-                    error=str(e),
+                    "FAILED",
+                    str(e),
+                    _session_broker()
+                    if not (has_request_data and request_data.get("apikey"))
+                    else None,
                 )
                 raise
-
-            finally:
-                latency_session.remove()
 
         return wrapped
 
@@ -268,73 +335,25 @@ def init_latency_monitoring(app):
     # Initialize the latency database
     init_latency_db()
 
-    # Auto-purge old data endpoint logs (keep order logs forever, purge data logs after 7 days)
-    purge_old_data_logs(days=7)
+    # Order records are kept forever; every other record goes after a week.
+    purge_old_data_logs(days=RETENTION_DAYS)
 
     # Import all RESTX API resources
     from restx_api import api
 
-    # Map of endpoint names to their types
-    # ORDER endpoints: Keep latency logs forever
-    # DATA endpoints: Auto-purge after 7 days
-    api_types = {
-        # Order execution endpoints (keep forever)
-        "place_order": "PLACE",
-        "place_smart_order": "SMART",
-        "modify_order": "MODIFY",
-        "cancel_order": "CANCEL",
-        "close_position": "CLOSE",
-        "cancel_all_order": "CANCEL_ALL",
-        "basket_order": "BASKET",
-        "split_order": "SPLIT",
-        "options_order": "OPTIONS",
-        "options_multiorder": "OPTIONS_MULTI",
-        # Data/Account endpoints (auto-purge after 7 days)
-        "quotes": "QUOTES",
-        "history": "HISTORY",
-        "depth": "DEPTH",
-        "intervals": "INTERVALS",
-        "funds": "FUNDS",
-        "orderbook": "ORDERBOOK",
-        "tradebook": "TRADEBOOK",
-        "positionbook": "POSITIONBOOK",
-        "holdings": "HOLDINGS",
-        "orderstatus": "STATUS",
-        "openposition": "POSITION",
-        "instruments": "INSTRUMENTS",
-        "search": "SEARCH",
-        "symbol": "SYMBOL",
-        "expiry": "EXPIRY",
-        "margin": "MARGIN",
-        "option_greeks": "GREEKS",
-        "multi_option_greeks": "MULTI_GREEKS",
-        "option_symbol": "OPTION_SYMBOL",
-        "synthetic_future": "SYNTHETIC",
-        "ticker": "TICKER",
-        "ping": "PING",
-        "analyzer": "ANALYZER",
-        "chart": "CHART",
-        "market/holidays": "MARKET_HOLIDAYS",
-        "market/timings": "MARKET_TIMINGS",
-    }
-
-    # Order types that should be kept forever (not purged)
-    ORDER_TYPES = {
-        "PLACE",
-        "SMART",
-        "MODIFY",
-        "CANCEL",
-        "CLOSE",
-        "CANCEL_ALL",
-        "BASKET",
-        "SPLIT",
-        "OPTIONS",
-        "OPTIONS_MULTI",
-    }
+    # The tag each endpoint is recorded under comes from
+    # database.latency_groups, keyed by the namespace's own name. The table
+    # that used to be here was keyed by names typed in by hand, and six of them
+    # matched no namespace: an unmatched namespace falls back to its uppercased
+    # name, so options orders were recorded as OPTIONSORDER and
+    # OPTIONSMULTIORDER, which the keep list did not have, and their latency
+    # was deleted after a week as though they were data queries. The fallback
+    # stays for a namespace nobody has placed in a group yet, where it lands in
+    # "Other"; test/test_latency_groups.py fails until it is placed.
 
     # Wrap all API endpoints with latency tracking
     for namespace in api.namespaces:
-        api_type = api_types.get(namespace.name, namespace.name.upper())
+        api_type = TAG_FOR_NAMESPACE.get(namespace.name, namespace.name.upper())
 
         # Get all resources in the namespace
         for resource in namespace.resources:

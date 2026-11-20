@@ -2,7 +2,10 @@ import json
 import os
 
 import httpx
+import threading
+import time
 
+from broker.shoonya.mapping.order_data import normalize_order_status
 from broker.shoonya.mapping.transform_data import (
     map_product_type,
     reverse_map_product_type,
@@ -13,6 +16,8 @@ from database.auth_db import get_auth_token
 from database.token_db import get_br_symbol, get_symbol, get_token
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
+from utils.position_read import read_position_book, refuse_smart_order_on_read_failure
+from utils.smart_order_guard import PositionBookCache, SymbolLocks
 
 logger = get_logger(__name__)
 
@@ -20,20 +25,24 @@ logger = get_logger(__name__)
 def get_api_response(endpoint, auth, method="GET", payload=""):
     AUTH_TOKEN = auth
 
-    api_key = os.getenv("BROKER_API_KEY")
-    api_key = api_key[:-2]
+    # BROKER_API_KEY format: userid:::client_id
+    full_api_key = os.getenv("BROKER_API_KEY")
+    api_key = full_api_key.split(":::")[0]  # Trading user ID
 
     data = f'{{"uid": "{api_key}", "actid": "{api_key}"}}'
 
-    if endpoint == "/NorenWClientTP/Holdings":
+    if endpoint == "/NorenWClientAPI/Holdings":
         data = f'{{"uid": "{api_key}", "actid": "{api_key}", "prd": "C"}}'
 
-    payload_str = "jData=" + data + "&jKey=" + AUTH_TOKEN
+    payload_str = "jData=" + data
 
     # Get the shared httpx client
     client = get_httpx_client()
 
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    headers = {
+        "Content-Type": "text/plain",
+        "Authorization": f"Bearer {AUTH_TOKEN}",
+    }
     url = f"https://api.shoonya.com{endpoint}"
 
     response = client.request(method, url, content=payload_str, headers=headers)
@@ -43,32 +52,84 @@ def get_api_response(endpoint, auth, method="GET", payload=""):
         return json.loads(data)
     except json.JSONDecodeError as e:
         logger.error(f"Error decoding JSON: {e}")
-        logger.info(f"Response data: {data}")
+        logger.debug(f"Response data: {data}")
         raise
 
 
 def get_order_book(auth):
-    return get_api_response("/NorenWClientTP/OrderBook", auth, method="POST")
+    return get_api_response("/NorenWClientAPI/OrderBook", auth, method="POST")
 
 
 def get_trade_book(auth):
-    return get_api_response("/NorenWClientTP/TradeBook", auth, method="POST")
+    return get_api_response("/NorenWClientAPI/TradeBook", auth, method="POST")
 
 
 def get_positions(auth):
-    return get_api_response("/NorenWClientTP/PositionBook", auth, method="POST")
+    return get_api_response("/NorenWClientAPI/PositionBook", auth, method="POST")
 
 
 def get_holdings(auth):
-    return get_api_response("/NorenWClientTP/Holdings", auth, method="POST")
+    return get_api_response("/NorenWClientAPI/Holdings", auth, method="POST")
+
+
+# --- Per-Symbol Smart Order Lock ---
+# Ensures only one smart order per symbol executes at a time.
+# Others queue and execute sequentially, each getting a fresh position book.
+# The registry forgets a symbol once nobody holds or waits on it, and under the
+# gthread worker a wait is bounded (utils/smart_order_guard.py).
+_SMART_ORDER_LOCKS = SymbolLocks()
+
+# --- Position Book Cache ---
+# Caches get_positions() for 1 second. Invalidated after each smart order placement.
+# A fetch still in flight when an order invalidates the cache is returned to its
+# own caller but never cached, so the next order cannot read the book from
+# before the previous fill (utils/smart_order_guard.py).
+_POSITION_BOOK = PositionBookCache()
+
+
+def _get_symbol_lock(symbol, exchange, product):
+    """Hold the smart order lock for one symbol, as a context manager.
+
+    Yields True while holding it. Yields False when the wait ran out, which
+    happens only under the gthread worker; the caller must then return
+    ``SymbolLocks.busy(symbol)`` without placing an order.
+    """
+    return _SMART_ORDER_LOCKS.hold(symbol, exchange, product)
+
+
+def _position_book_ok(positions_data):
+    """The PositionBook is a list whenever it holds a row.
+
+    An empty book comes back as {"stat": "Not_Ok", "emsg": "no data"}, which
+    read_position_book recognises as empty. Any other Not_Ok is a failed read.
+    """
+    return isinstance(positions_data, list)
+
+
+def _get_cached_positions(auth):
+    """Get positions from cache if fresh, otherwise fetch from broker API."""
+    return _POSITION_BOOK.get(
+        auth,
+        lambda: read_position_book("shoonya", lambda: get_positions(auth), _position_book_ok),
+    )
+
+
+def _invalidate_position_cache(auth):
+    """Invalidate the position cache so the next queued order fetches fresh data.
+
+    Also stops a fetch that started before this order from caching the book
+    it read.
+    """
+    _POSITION_BOOK.invalidate(auth)
+
 
 
 def get_open_position(tradingsymbol, exchange, producttype, auth):
     # Convert Trading Symbol from OpenAlgo Format to Broker Format Before Search in OpenPosition
     tradingsymbol = get_br_symbol(tradingsymbol, exchange)
-    positions_data = get_positions(auth)
+    positions_data = _get_cached_positions(auth)
 
-    logger.info(f"{positions_data}")
+    logger.debug(f"{positions_data}")
 
     net_qty = "0"
 
@@ -76,7 +137,7 @@ def get_open_position(tradingsymbol, exchange, producttype, auth):
         isinstance(positions_data, dict) and (positions_data["stat"] == "Not_Ok")
     ):
         # Handle the case where there is no data
-        logger.info("No data available.")
+        logger.debug("No data available.")
         net_qty = "0"
 
     if positions_data and isinstance(positions_data, list):
@@ -94,19 +155,24 @@ def get_open_position(tradingsymbol, exchange, producttype, auth):
 
 def place_order_api(data, auth):
     AUTH_TOKEN = auth
-    BROKER_API_KEY = os.getenv("BROKER_API_KEY")
+    # BROKER_API_KEY format: userid:::client_id
+    full_api_key = os.getenv("BROKER_API_KEY")
+    BROKER_API_KEY = full_api_key.split(":::")[0]  # Trading user ID
     data["apikey"] = BROKER_API_KEY
     token = get_token(data["symbol"], data["exchange"])
-    newdata = transform_data(data, token)
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    newdata = transform_data(data, token, AUTH_TOKEN)
+    headers = {
+        "Content-Type": "text/plain",
+        "Authorization": f"Bearer {AUTH_TOKEN}",
+    }
 
-    payload_str = "jData=" + json.dumps(newdata) + "&jKey=" + AUTH_TOKEN
+    payload_str = "jData=" + json.dumps(newdata)
 
-    logger.info(f"{payload_str}")
+    logger.debug(f"{payload_str}")
 
     # Get the shared httpx client
     client = get_httpx_client()
-    url = "https://api.shoonya.com/NorenWClientTP/PlaceOrder"
+    url = "https://api.shoonya.com/NorenWClientAPI/PlaceOrder"
 
     response = client.post(url, content=payload_str, headers=headers)
     response_data = json.loads(response.text)
@@ -114,14 +180,17 @@ def place_order_api(data, auth):
     # Add compatibility for service layer that expects .status attribute
     response.status = response.status_code
 
-    if response_data["stat"] == "Ok":
-        orderid = response_data["norenordno"]
+    logger.debug(f"PlaceOrder Response: {response_data}")
+
+    if response_data.get("stat") == "Ok":
+        orderid = response_data.get("norenordno")
     else:
         orderid = None
+        logger.error(f"PlaceOrder Error: {response_data.get('emsg', 'Unknown error')}")
     return response, response_data, orderid
 
 
-
+@refuse_smart_order_on_read_failure
 def place_smartorder_api(data, auth):
     AUTH_TOKEN = auth
 
@@ -132,79 +201,85 @@ def place_smartorder_api(data, auth):
     symbol = data.get("symbol")
     exchange = data.get("exchange")
     product = data.get("product")
-    position_size = int(data.get("position_size", "0"))
+    # Per-symbol lock: serialize smart orders per symbol
+    with _get_symbol_lock(symbol, exchange, product) as symbol_lock:
+        if not symbol_lock:
+            return SymbolLocks.busy(symbol)
+        position_size = int(data.get("position_size", "0"))
 
-    # Get current open position for the symbol
-    current_position = int(
-        get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
-    )
+        # Get current open position for the symbol
+        current_position = int(
+            get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
+        )
 
-    logger.info(f"position_size : {position_size}")
-    logger.info(f"Open Position : {current_position}")
+        logger.debug(f"position_size : {position_size}")
+        logger.debug(f"Open Position : {current_position}")
 
-    # Determine action based on position_size and current_position
-    action = None
-    quantity = 0
+        # Determine action based on position_size and current_position
+        action = None
+        quantity = 0
 
-    # If both position_size and current_position are 0, do nothing
-    if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
-        action = data["action"]
-        quantity = data["quantity"]
-        # logger.info(f"action : {action}")
-        # logger.info(f"Quantity : {quantity}")
-        res, response, orderid = place_order_api(data, AUTH_TOKEN)
-        # logger.info(f"{res}")
-        # logger.info(f"{response}")
+        # If both position_size and current_position are 0, do nothing
+        if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
+            action = data["action"]
+            quantity = data["quantity"]
+            # logger.debug(f"action : {action}")
+            # logger.debug(f"Quantity : {quantity}")
+            res, response, orderid = place_order_api(data, AUTH_TOKEN)
+            _invalidate_position_cache(AUTH_TOKEN)
+            # logger.debug(f"{res}")
+            # logger.debug(f"{response}")
 
-        return res, response, orderid
+            return res, response, orderid
 
-    elif position_size == current_position:
-        if int(data["quantity"]) == 0:
-            response = {
-                "status": "success",
-                "message": "No OpenPosition Found. Not placing Exit order.",
-            }
-        else:
-            response = {
-                "status": "success",
-                "message": "No action needed. Position size matches current position",
-            }
-        orderid = None
-        return res, response, orderid  # res remains None as no API call was made
+        elif position_size == current_position:
+            if int(data["quantity"]) == 0:
+                response = {
+                    "status": "success",
+                    "message": "No OpenPosition Found. Not placing Exit order.",
+                }
+            else:
+                response = {
+                    "status": "success",
+                    "message": "No action needed. Position size matches current position",
+                }
+            orderid = None
+            return res, response, orderid  # res remains None as no API call was made
 
-    if position_size == 0 and current_position > 0:
-        action = "SELL"
-        quantity = abs(current_position)
-    elif position_size == 0 and current_position < 0:
-        action = "BUY"
-        quantity = abs(current_position)
-    elif current_position == 0:
-        action = "BUY" if position_size > 0 else "SELL"
-        quantity = abs(position_size)
-    else:
-        if position_size > current_position:
-            action = "BUY"
-            quantity = position_size - current_position
-            # logger.info(f"smart buy quantity : {quantity}")
-        elif position_size < current_position:
+        if position_size == 0 and current_position > 0:
             action = "SELL"
-            quantity = current_position - position_size
-            # logger.info(f"smart sell quantity : {quantity}")
+            quantity = abs(current_position)
+        elif position_size == 0 and current_position < 0:
+            action = "BUY"
+            quantity = abs(current_position)
+        elif current_position == 0:
+            action = "BUY" if position_size > 0 else "SELL"
+            quantity = abs(position_size)
+        else:
+            if position_size > current_position:
+                action = "BUY"
+                quantity = position_size - current_position
+                # logger.debug(f"smart buy quantity : {quantity}")
+            elif position_size < current_position:
+                action = "SELL"
+                quantity = current_position - position_size
+                # logger.debug(f"smart sell quantity : {quantity}")
 
-    if action:
-        # Prepare data for placing the order
-        order_data = data.copy()
-        order_data["action"] = action
-        order_data["quantity"] = str(quantity)
+        if action:
+            # Prepare data for placing the order
+            order_data = data.copy()
+            order_data["action"] = action
+            order_data["quantity"] = str(quantity)
 
-        # logger.info(f"{order_data}")
-        # Place the order
-        res, response, orderid = place_order_api(order_data, auth)
-        # logger.info(f"{res}")
-        logger.info(f"{response}")
-        logger.info(f"{orderid}")
+            # logger.debug(f"{order_data}")
+            # Place the order
+            res, response, orderid = place_order_api(order_data, auth)
+            _invalidate_position_cache(AUTH_TOKEN)
+            # logger.debug(f"{res}")
+            logger.debug(f"{response}")
+            logger.debug(f"{orderid}")
 
-        return res, response, orderid
+            return res, response, orderid
 
 
 def close_all_positions(current_api_key, auth):
@@ -230,7 +305,7 @@ def close_all_positions(current_api_key, auth):
 
             # get openalgo symbol to send to placeorder function
             symbol = get_symbol(position["token"], position["exch"])
-            logger.info(f"The Symbol is {symbol}")
+            logger.debug(f"The Symbol is {symbol}")
 
             # Prepare the order payload
             place_order_payload = {
@@ -244,48 +319,42 @@ def close_all_positions(current_api_key, auth):
                 "quantity": str(quantity),
             }
 
-            logger.info(f"{place_order_payload}")
+            logger.debug(f"{place_order_payload}")
 
             # Place the order to close the position
             res, response, orderid = place_order_api(place_order_payload, auth)
-
-            # logger.info(f"{res}")
-            # logger.info(f"{response}")
-            # logger.info(f"{orderid}")
-
-            # Note: Ensure place_order_api handles any errors and logs accordingly
 
     return {"status": "success", "message": "All Open Positions SquaredOff"}, 200
 
 
 def cancel_order(orderid, auth):
-    # Assuming you have a function to get the authentication token
     AUTH_TOKEN = auth
-    api_key = os.getenv("BROKER_API_KEY")
-    api_key = api_key[:-2]
+    # BROKER_API_KEY format: userid:::client_id
+    full_api_key = os.getenv("BROKER_API_KEY")
+    api_key = full_api_key.split(":::")[0]  # Trading user ID
     data = {"uid": api_key, "norenordno": orderid}
 
-    payload_str = "jData=" + json.dumps(data) + "&jKey=" + AUTH_TOKEN
-    # Set up the request headers
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    payload_str = "jData=" + json.dumps(data)
+    headers = {
+        "Content-Type": "text/plain",
+        "Authorization": f"Bearer {AUTH_TOKEN}",
+    }
 
     # Get the shared httpx client
     client = get_httpx_client()
-    url = "https://api.shoonya.com/NorenWClientTP/CancelOrder"
+    url = "https://api.shoonya.com/NorenWClientAPI/CancelOrder"
 
     response = client.post(url, content=payload_str, headers=headers)
     data = json.loads(response.text)
-    logger.info(f"{data}")
+    logger.debug(f"CancelOrder Response: {data}")
 
     # Add compatibility for service layer that expects .status attribute
     response.status = response.status_code
 
     # Check if the request was successful
     if data.get("stat") == "Ok":
-        # Return a success response
         return {"status": "success", "orderid": orderid}, 200
     else:
-        # Return an error response
         return {
             "status": "error",
             "message": data.get("message", "Failed to cancel order"),
@@ -293,32 +362,33 @@ def cancel_order(orderid, auth):
 
 
 def modify_order(data, auth):
-    # Assuming you have a function to get the authentication token
     AUTH_TOKEN = auth
-    api_key = os.getenv("BROKER_API_KEY")
-    api_key = api_key[:-2]
+    # BROKER_API_KEY format: userid:::client_id
+    full_api_key = os.getenv("BROKER_API_KEY")
+    api_key = full_api_key.split(":::")[0]  # Trading user ID
 
     token = get_token(data["symbol"], data["exchange"])
     data["symbol"] = get_br_symbol(data["symbol"], data["exchange"])
     data["apikey"] = api_key
 
     transformed_data = transform_modify_order_data(data, token)
-    # Set up the request headers
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    payload_str = "jData=" + json.dumps(transformed_data) + "&jKey=" + AUTH_TOKEN
 
-    logger.debug("=== SHOONYA MODIFY ORDER ===")
-    # Redact sensitive fields for logging
     safe_log_data = {k: v for k, v in transformed_data.items() if k != "uid"}
-    logger.debug(f"jData={json.dumps(safe_log_data)}")
+    logger.debug(f"Modify Order Request Data: {safe_log_data}")
+
+    headers = {
+        "Content-Type": "text/plain",
+        "Authorization": f"Bearer {AUTH_TOKEN}",
+    }
+    payload_str = "jData=" + json.dumps(transformed_data)
 
     # Get the shared httpx client
     client = get_httpx_client()
-    url = "https://api.shoonya.com/NorenWClientTP/ModifyOrder"
+    url = "https://api.shoonya.com/NorenWClientAPI/ModifyOrder"
 
     response = client.post(url, content=payload_str, headers=headers)
     response_data = json.loads(response.text)
-    logger.info(f"Modify order response: {response_data}")
+    logger.debug(f"Modify order response: {response_data}")
 
     # Add compatibility for service layer that expects .status attribute
     response.status = response.status_code
@@ -333,20 +403,18 @@ def modify_order(data, auth):
 
 
 def cancel_all_orders_api(data, auth):
-    # Get the order book
-
     AUTH_TOKEN = auth
 
     order_book_response = get_order_book(AUTH_TOKEN)
-    # logger.info(f"{order_book_response}")
     if order_book_response is None:
-        return [], []  # Return empty lists indicating failure to retrieve the order book
+        return [], []
 
-    # Filter orders that are in 'open' or 'trigger_pending' state
+    # Filter orders still working at the exchange (OPEN / PENDING / TRIGGER_PENDING)
     orders_to_cancel = [
-        order for order in order_book_response if order["status"] in ["OPEN", "TRIGGER PENDING"]
+        order
+        for order in order_book_response
+        if normalize_order_status(order.get("status")) == "open"
     ]
-    # logger.info(f"{orders_to_cancel}")
     canceled_orders = []
     failed_cancellations = []
 

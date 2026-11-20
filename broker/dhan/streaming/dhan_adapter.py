@@ -3,11 +3,8 @@ Dhan WebSocket Adapter for OpenAlgo
 Manages both 5-level and 20-level depth connections
 """
 
-import asyncio
 import json
-import logging
 import os
-import platform
 import sys
 import threading
 import time
@@ -18,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from database.auth_db import get_auth_token
 from database.token_db import get_token
+from utils.logging import get_logger
 
 # Add parent directory to path to allow imports
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../"))
@@ -34,7 +32,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def __init__(self):
         super().__init__()
-        self.logger = logging.getLogger("dhan_websocket")
+        self.logger = get_logger("dhan_websocket")
         self.user_id = None
         self.broker_name = "dhan"
 
@@ -48,6 +46,12 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         # Track 20-depth data accumulation
         self.depth_20_accumulator = {}
+
+        # Previous-day close and OI per (exchange segment, security id), from
+        # the Prev Close packet (code 6) Dhan sends once when an instrument is
+        # subscribed. Quote/Full packets carry only today's Day Close, which
+        # Dhan fills only after market close, so OpenAlgo's close comes from here.
+        self.prev_close_data = {}
 
         # Fallback tracking for 20-depth subscriptions
         self.depth_20_fallbacks = {}  # Track which subscriptions have fallen back to 5-depth
@@ -64,6 +68,11 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.max_reconnect_delay = 60
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 10
+
+        # Batch subscription management
+        self.subscription_queue = []
+        self.batch_timer = None
+        self.batch_delay = 0.5  # 500ms delay to collect more subscriptions in a batch
 
     def initialize(
         self, broker_name: str, user_id: str, auth_data: dict[str, str] | None = None
@@ -96,7 +105,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Get OAuth access token from database (NOT from BROKER_API_SECRET)
         # BROKER_API_SECRET is the OAuth app secret, not the access token
         if not auth_data:
-            auth_token = get_auth_token(user_id)
+            auth_token = get_auth_token(user_id, bypass_cache=True)
             if not auth_token:
                 self.logger.error(f"No OAuth access token found in database for user {user_id}")
                 raise ValueError(f"No OAuth access token found for user {user_id}")
@@ -111,11 +120,14 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Store the client_id for later use
         self.client_id = client_id
 
-        # Initialize 5-depth WebSocket client
+        # Initialize 5-depth WebSocket client. Pass user_id so the client can
+        # re-read a fresh access token from the database on reconnect (tokens
+        # roll over daily at ~3 AM IST).
         self.ws_client_5depth = DhanWebSocket(
             client_id=client_id,  # Use the actual Dhan client ID
             access_token=auth_token,
             is_20_depth=False,
+            user_id=user_id,
         )
 
         # Initialize 20-depth WebSocket client
@@ -123,6 +135,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
             client_id=client_id,  # Use the actual Dhan client ID
             access_token=auth_token,
             is_20_depth=True,
+            user_id=user_id,
         )
 
         # Set callbacks for 5-depth client
@@ -155,16 +168,69 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # 20-depth WebSocket is connected lazily on first 20-depth subscription
         # to avoid wasting Dhan's 5-connection-per-user limit
 
+    def _start_batch_timer(self):
+        """Start a timer to coalesce queued subscriptions into a single grouped flush."""
+        if self.batch_timer:
+            self.batch_timer.cancel()
+
+        self.batch_timer = threading.Timer(self.batch_delay, self._process_batch_subscriptions)
+        self.batch_timer.start()
+
+    def _process_batch_subscriptions(self):
+        """Drain the queue and dispatch one subscribe call per (connection, dhan_mode)."""
+        with self.lock:
+            if not self.subscription_queue:
+                return
+
+            groups_5depth = defaultdict(list)
+            instruments_20depth = []
+
+            for item in self.subscription_queue:
+                if item["use_20_depth"]:
+                    instruments_20depth.append(item["instrument"])
+                else:
+                    groups_5depth[item["dhan_mode"]].append(item["instrument"])
+
+            self.subscription_queue.clear()
+
+        # Send 5-depth groups (one WS message per dhan_mode)
+        if groups_5depth and self.ws_client_5depth and self.ws_client_5depth.connected:
+            for dhan_mode, instruments in groups_5depth.items():
+                try:
+                    self.logger.info(
+                        f"Batch subscribing {len(instruments)} instruments in {dhan_mode} mode (5-depth)"
+                    )
+                    self.ws_client_5depth.subscribe(instruments, dhan_mode)
+                except Exception as e:
+                    self.logger.error(f"Batch 5-depth subscription failed for {dhan_mode}: {e}")
+
+        # Send 20-depth as a single batch
+        if instruments_20depth and self.ws_client_20depth and self.ws_client_20depth.connected:
+            try:
+                self.logger.info(
+                    f"Batch subscribing {len(instruments_20depth)} instruments in 20_DEPTH mode"
+                )
+                self.ws_client_20depth.subscribe(instruments_20depth, "20_DEPTH")
+            except Exception as e:
+                self.logger.error(f"Batch 20-depth subscription failed: {e}")
+
     def disconnect(self) -> None:
         """Disconnect from Dhan WebSocket endpoints with proper resource cleanup"""
         self.logger.debug("Starting Dhan adapter disconnect sequence...")
         self.running = False
+        self.connected = False
 
-        # Store references before clearing (prevents double cleanup attempts)
+        # Cancel any pending batch timer
+        if self.batch_timer:
+            self.batch_timer.cancel()
+            self.batch_timer = None
+
+        # Store references but clear them AFTER cleanup completes (not before).
+        # Clearing before cleanup creates a window under eventlet where another
+        # greenlet can see ws_client_5depth=None while the old connection is
+        # still being torn down, causing reused adapters to silently drop subscribes.
         ws_5depth = self.ws_client_5depth
         ws_20depth = self.ws_client_20depth
-        self.ws_client_5depth = None
-        self.ws_client_20depth = None
 
         try:
             # Disconnect 5-depth WebSocket
@@ -186,6 +252,10 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # Stop fallback monitor thread
             self._stop_fallback_monitor_internal()
 
+            # Clear WebSocket references AFTER cleanup is done
+            self.ws_client_5depth = None
+            self.ws_client_20depth = None
+
             # Clear all state for clean reconnection
             with self.lock:
                 self.subscriptions_5depth.clear()
@@ -195,7 +265,11 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.depth_20_timeouts.clear()
                 self.depth_20_data_received.clear()
                 self.depth_20_fallbacks.clear()
-                self.connected = False
+                self.subscription_queue.clear()
+                # Dhan sends a fresh Prev Close packet on every subscribe, so a
+                # value from this session must not stand in for it after a
+                # reconnect.
+                self.prev_close_data.clear()
 
             self.logger.debug("Dhan adapter state cleared")
 
@@ -338,17 +412,30 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.depth_20_data_received[correlation_id] = time.time()
 
             # Lazy-connect the 20-depth WebSocket on first demand
-            if self.ws_client_20depth and not self.ws_client_20depth.connected and not self.ws_client_20depth.running:
-                self.logger.info("Lazy-connecting Dhan 20-depth WebSocket (first 20-depth subscription)")
+            if (
+                self.ws_client_20depth
+                and not self.ws_client_20depth.connected
+                and not self.ws_client_20depth.running
+            ):
+                self.logger.info(
+                    "Lazy-connecting Dhan 20-depth WebSocket (first 20-depth subscription)"
+                )
                 self.ws_client_20depth.connect()
 
-            # Subscribe if connected
+            # Queue for batch flush only when connection is up.
+            # If not connected, _on_open_20depth resubscribes from subscriptions_20depth,
+            # so enqueueing here would cause a double-subscribe once the timer fires.
             if self.ws_client_20depth and self.ws_client_20depth.connected:
-                try:
-                    self.ws_client_20depth.subscribe([instrument], "20_DEPTH")
-                except Exception as e:
-                    self.logger.error(f"Error subscribing to 20-depth for {symbol}.{exchange}: {e}")
-                    return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
+                with self.lock:
+                    self.subscription_queue.append(
+                        {
+                            "instrument": instrument,
+                            "dhan_mode": "20_DEPTH",
+                            "use_20_depth": True,
+                        }
+                    )
+                    if len(self.subscription_queue) == 1:
+                        self._start_batch_timer()
         else:
             # Use 5-depth connection
             with self.lock:
@@ -373,13 +460,20 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     "instrument": instrument,
                 }
 
-            # Subscribe if connected
+            # Queue for batch flush only when connection is up.
+            # If not connected, _on_open_5depth resubscribes from subscriptions_5depth,
+            # so enqueueing here would cause a double-subscribe once the timer fires.
             if self.ws_client_5depth and self.ws_client_5depth.connected:
-                try:
-                    self.ws_client_5depth.subscribe([instrument], dhan_mode)
-                except Exception as e:
-                    self.logger.error(f"Error subscribing to {actual_symbol}.{exchange}: {e}")
-                    return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
+                with self.lock:
+                    self.subscription_queue.append(
+                        {
+                            "instrument": instrument,
+                            "dhan_mode": dhan_mode,
+                            "use_20_depth": False,
+                        }
+                    )
+                    if len(self.subscription_queue) == 1:
+                        self._start_batch_timer()
 
         # Store in base class subscriptions for reconnection
         with self.lock:
@@ -438,6 +532,21 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Remove from all possible subscriptions
         removed = False
         with self.lock:
+            # Drop any pending queued subscribes for this instrument so a
+            # quick subscribe -> unsubscribe before the batch timer fires
+            # does not send a subscribe we would immediately have to cancel.
+            # Dhan does support unsubscribe (codes 16/18/22/24 - see
+            # DhanWebSocket.REQUEST_CODES), so this is an optimisation rather
+            # than the only defence it used to be.
+            self.subscription_queue = [
+                item
+                for item in self.subscription_queue
+                if not (
+                    item["instrument"]["ExchangeSegment"] == dhan_exchange
+                    and item["instrument"]["SecurityId"] == token
+                )
+            ]
+
             # Check 5-depth subscriptions
             for depth in [5, 20]:
                 correlation_id = f"{symbol}_{exchange}_{mode}_{depth}"
@@ -464,6 +573,16 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 if correlation_id in self.subscriptions:
                     del self.subscriptions[correlation_id]
 
+            # Dhan unsubscribes the whole instrument, and sends a fresh Prev
+            # Close packet on the next subscribe, so the stored value goes
+            # once no subscription for the instrument is left.
+            if removed and not any(
+                sub["token"] == token and sub["exchange"] == exchange
+                for subs in (self.subscriptions_5depth, self.subscriptions_20depth)
+                for sub in subs.values()
+            ):
+                self.prev_close_data.pop(self._prev_close_key(exchange, token), None)
+
         if removed:
             self.logger.info(f"Unubscribing to {symbol}.{exchange} in mode {mode}")
             return self._create_success_response(
@@ -479,24 +598,53 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def unsubscribe_all(self) -> dict[str, Any]:
         """
-        Unsubscribe from all subscriptions and disconnect from WebSocket
+        Unsubscribe from all subscriptions without disconnecting.
+
+        Clears all subscription tracking and sends unsubscribe messages to Dhan,
+        but keeps the WebSocket connections alive so future subscribes work
+        without needing to reconnect.
 
         Returns:
             Dict: Response with status
         """
-        # Count subscriptions before disconnect clears them
         with self.lock:
             unsubscribed_count = len(self.subscriptions_5depth) + len(self.subscriptions_20depth)
 
-        # Centralized teardown - disconnect() handles all cleanup
-        self.disconnect()
+            # Collect instruments to unsubscribe from each connection
+            instruments_5depth = []
+            for sub in self.subscriptions_5depth.values():
+                instruments_5depth.append(sub["instrument"])
+
+            instruments_20depth = []
+            for sub in self.subscriptions_20depth.values():
+                instruments_20depth.append(sub["instrument"])
+
+            # Clear all subscription tracking
+            self.subscriptions_5depth.clear()
+            self.subscriptions_20depth.clear()
+            self.subscriptions.clear()
+            self.depth_20_accumulator.clear()
+            self.depth_20_timeouts.clear()
+            self.depth_20_data_received.clear()
+            self.depth_20_fallbacks.clear()
+            self.prev_close_data.clear()
+            # Drop any queued subscribes that haven't been flushed yet,
+            # otherwise the batch timer would resurrect ghost subscriptions.
+            self.subscription_queue.clear()
+
+        # Send unsubscribe messages (outside lock to avoid deadlock)
+        if instruments_5depth and self.ws_client_5depth:
+            self.ws_client_5depth.unsubscribe(instruments_5depth)
+
+        if instruments_20depth and self.ws_client_20depth:
+            self.ws_client_20depth.unsubscribe(instruments_20depth)
 
         self.logger.info(
-            f"Dhan adapter disconnected and cleaned up after unsubscribing {unsubscribed_count} instruments"
+            f"Dhan adapter unsubscribed from {unsubscribed_count} instruments (connections kept alive)"
         )
 
         return self._create_success_response(
-            f"Unsubscribed from {unsubscribed_count} instruments and disconnected",
+            f"Unsubscribed from {unsubscribed_count} instruments",
             unsubscribed_count=unsubscribed_count,
         )
 
@@ -568,6 +716,18 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                             )
                             break
 
+                if subscription:
+                    prev_key = self._prev_close_key(subscription["exchange"], subscription["token"])
+                    if data_type == "prev_close":
+                        # Sent once per subscribe: keep it for the quote and
+                        # full payloads, nothing to publish on its own.
+                        self.prev_close_data[prev_key] = {
+                            "prev_close": data.get("prev_close"),
+                            "prev_oi": data.get("prev_oi"),
+                        }
+                        return
+                    prev = self.prev_close_data.get(prev_key)
+
             if not subscription:
                 # self.logger.warning(f"Received data for unsubscribed token: {security_id}, segment: {exchange_segment}")
                 return
@@ -577,7 +737,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
             exchange = subscription["exchange"]
 
             # Normalize and publish data
-            market_data = self._normalize_5depth_data(data, symbol, exchange)
+            market_data = self._normalize_5depth_data(data, symbol, exchange, prev)
             if market_data:
                 # Determine topic based on data type
                 # Only publish modes the server understands (LTP, QUOTE, DEPTH)
@@ -706,61 +866,75 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         except Exception as e:
             self.logger.error(f"Error processing 20-depth data: {e}", exc_info=True)
 
+    @staticmethod
+    def _prev_close_key(exchange: str, token) -> tuple:
+        """Key of the stored Prev Close data: (Dhan segment code, security id)."""
+        return (DhanExchangeMapper.get_segment_from_exchange(exchange), str(token))
+
     def _normalize_5depth_data(
-        self, data: dict[str, Any], symbol: str, exchange: str
+        self,
+        data: dict[str, Any],
+        symbol: str,
+        exchange: str,
+        prev: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Normalize 5-depth data to common format"""
+        """Normalize 5-depth data to common format.
+
+        ``prev`` is the stored Prev Close packet for the instrument, if one
+        has arrived. OpenAlgo's ``close`` is the previous day's close, so it
+        comes from there; when none has arrived yet ``close`` is left out
+        rather than sent as 0. The packet's own Day Close (sent by Dhan only
+        after market close) is published as ``day_close`` when nonzero.
+        """
         data_type = data.get("type")
 
         base_data = {"symbol": symbol, "exchange": exchange, "timestamp": int(time.time() * 1000)}
 
         if data_type == "ticker":
-            base_data.update({"mode": 1, "ltp": data.get("ltp", 0), "ltt": data.get("ltt", 0)})
+            ltt = data.get("ltt", 0)
+            base_data.update(
+                {"mode": 1, "ltp": data.get("ltp", 0), "ltt": ltt, "last_trade_time": ltt}
+            )
 
-        elif data_type == "quote":
+        elif data_type in ("quote", "full"):
+            ltt = data.get("ltt", 0)
             base_data.update(
                 {
-                    "mode": 2,
+                    "mode": 2 if data_type == "quote" else 3,
                     "ltp": data.get("ltp", 0),
-                    "ltt": data.get("ltt", 0),
+                    "ltt": ltt,
+                    "last_trade_time": ltt,
                     "volume": data.get("volume", 0),
                     "open": data.get("open", 0),
                     "high": data.get("high", 0),
                     "low": data.get("low", 0),
-                    "close": data.get("close", 0),
                     "last_quantity": data.get("ltq", 0),
                     "average_price": data.get("atp", 0),
                     "total_buy_quantity": data.get("total_buy_quantity", 0),
                     "total_sell_quantity": data.get("total_sell_quantity", 0),
                 }
             )
+            if prev is not None and prev.get("prev_close") is not None:
+                base_data["close"] = prev["prev_close"]
+            day_close = data.get("close")
+            if day_close:
+                base_data["day_close"] = day_close
 
-        elif data_type == "full":
-            base_data.update(
-                {
-                    "mode": 3,
-                    "ltp": data.get("ltp", 0),
-                    "ltt": data.get("ltt", 0),
-                    "volume": data.get("volume", 0),
-                    "open": data.get("open", 0),
-                    "high": data.get("high", 0),
-                    "low": data.get("low", 0),
-                    "close": data.get("close", 0),
-                    "oi": data.get("oi", 0),
-                    "oi_high": data.get("oi_high", 0),
-                    "oi_low": data.get("oi_low", 0),
-                    "depth": data.get("depth", {"buy": [], "sell": []}),
-                    "depth_level": 5,
-                }
-            )
+            if data_type == "full":
+                base_data.update(
+                    {
+                        "oi": data.get("oi", 0),
+                        "oi_high": data.get("oi_high", 0),
+                        "oi_low": data.get("oi_low", 0),
+                        "depth": data.get("depth", {"buy": [], "sell": []}),
+                        "depth_level": 5,
+                    }
+                )
+                if prev is not None and prev.get("prev_oi") is not None:
+                    base_data["prev_oi"] = prev["prev_oi"]
 
         elif data_type == "oi":
             base_data.update({"oi": data.get("oi", 0)})
-
-        elif data_type == "prev_close":
-            base_data.update(
-                {"prev_close": data.get("prev_close", 0), "prev_oi": data.get("prev_oi", 0)}
-            )
 
         return base_data
 
@@ -784,8 +958,12 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
     def _stop_fallback_monitor_internal(self):
         """Internal method to stop fallback monitor without affecting running flag"""
         if self.fallback_monitor_thread and self.fallback_monitor_thread.is_alive():
-            self.fallback_monitor_thread.join(timeout=2)
-            if self.fallback_monitor_thread.is_alive():
+            try:
+                self.fallback_monitor_thread.join(timeout=2)
+            except Exception:
+                # Catches eventlet.timeout.Timeout on Linux/Gunicorn
+                pass
+            if self.fallback_monitor_thread and self.fallback_monitor_thread.is_alive():
                 self.logger.debug("Fallback monitor thread timeout - will be orphaned (daemon)")
             else:
                 self.logger.debug("Fallback monitor thread stopped")
@@ -937,18 +1115,18 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         """Destructor to ensure resources are cleaned up"""
         try:
             # During garbage collection, logger may not be available
-            if hasattr(self, 'running') and self.running:
+            if hasattr(self, "running") and self.running:
                 self.running = False
 
             # Try to clean up WebSocket clients
-            if hasattr(self, 'ws_client_5depth') and self.ws_client_5depth:
+            if hasattr(self, "ws_client_5depth") and self.ws_client_5depth:
                 try:
                     self.ws_client_5depth.disconnect()
                 except Exception:
                     pass
                 self.ws_client_5depth = None
 
-            if hasattr(self, 'ws_client_20depth') and self.ws_client_20depth:
+            if hasattr(self, "ws_client_20depth") and self.ws_client_20depth:
                 try:
                     self.ws_client_20depth.disconnect()
                 except Exception:

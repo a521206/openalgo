@@ -17,13 +17,15 @@ docker-build.bat
 ```
 
 The automated script will:
-- ✅ Verify environment configuration
-- ✅ Build Docker image with all dependencies
-- ✅ Run comprehensive tests
-- ✅ Start the container
-- ✅ Verify numba/llvmlite/scipy work correctly
+- Verify environment configuration
+- Build Docker image with all dependencies
+- Run dependency import/JIT smoke checks (not the full runtime test suite)
+- Start the container
+- Verify numba/llvmlite/scipy work correctly
 
 ### Option 2: Manual Build with Docker Compose
+
+Prepare the writable `.env` first using [Configuration Requirements](#configuration-requirements).
 
 ```bash
 # Stop existing containers
@@ -36,7 +38,7 @@ docker-compose build --no-cache
 docker-compose up -d
 
 # Verify it's working
-docker-compose exec openalgo python -c "import numba; import llvmlite; import scipy; print('✓ Success')"
+docker-compose exec openalgo python -c "import numba; import llvmlite; import scipy; print('Success')"
 ```
 
 ### Option 3: Manual Build with Docker CLI
@@ -55,7 +57,8 @@ docker run -d \
   -v openalgo_log:/app/log \
   -v openalgo_strategies:/app/strategies \
   -v openalgo_keys:/app/keys \
-  -v "$(pwd)/.env:/app/.env:ro" \
+  --stop-timeout 45 \
+  -v "$(pwd)/.env:/app/.env" \
   --tmpfs /app/tmp:size=1g,mode=1777 \
   --restart unless-stopped \
   openalgo:latest
@@ -67,18 +70,18 @@ docker run -d \
 
 The Dockerfile uses **multi-stage builds** for optimization:
 
-1. **Python Builder Stage** (`python:3.12-bullseye`)
+1. **Python Builder Stage** (`python:3.12-trixie`)
    - Installs `uv` package manager
    - Creates virtual environment
    - Installs all Python dependencies from `pyproject.toml`
-   - Installs Gunicorn with eventlet support
+   - Installs `gunicorn>=25.0,<26` and `eventlet==0.41.2`; gthread is built into Gunicorn
 
-2. **Frontend Builder Stage** (`node:20-bullseye-slim`)
+2. **Frontend Builder Stage** (`node:22-trixie-slim`)
    - Installs npm dependencies
    - Builds React frontend (`npm run build`)
    - Outputs to `frontend/dist/`
 
-3. **Production Stage** (`python:3.12-slim-bullseye`)
+3. **Production Stage** (`python:3.12-slim-trixie`)
    - Minimal base image
    - **Installs runtime libraries for numba/scipy:**
      - `libopenblas0` - BLAS/LAPACK for linear algebra
@@ -103,43 +106,27 @@ None required - all configuration is in `.env` file.
 
 ### Image Size
 
-- **Base image** (`python:3.12-slim-bullseye`): ~145 MB
-- **Python dependencies**: ~650 MB
-- **Runtime libraries**: ~15 MB
-- **Frontend dist**: ~5 MB
-- **Total final image**: ~815 MB
+Measured on arm64 with `docker history`, uncompressed:
+
+- **Runtime layer** (chromium, fonts, BLAS, tzdata): ~750 MB
+- **Python virtualenv**: ~1.1 GB
+- **Application source**: ~50 MB
+- **Frontend dist**: ~10 MB
+- **Total final image**: ~2.7 GB
+
+Chromium dominates the runtime layer; it is present for Kaleido's static
+image export (the Telegram bot's /chart). The figures above supersede an
+earlier ~815 MB estimate that predated that dependency.
 
 ## Configuration Requirements
 
 ### Before Building
 
-1. **Create .env file:**
-   ```bash
-   cp .sample.env .env
-   ```
+The automated build helpers create a missing `.env` for a fresh install, generate `APP_KEY`, `API_KEY_PEPPER` and `FERNET_SALT`, leave broker credentials empty, and set Docker listener addresses. They preserve an existing `.env`. Restore the original `.env` if a database volume exists but its keys are missing.
 
-2. **Configure broker credentials in .env:**
-   ```bash
-   # Example for Fyers
-   BROKER_API_KEY = 'Y2DJQVBAU4-100'
-   BROKER_API_SECRET = 'your_secret_here'
-   REDIRECT_URL = 'http://127.0.0.1:5000/fyers/callback'
-   ```
+For manual Compose/CLI starts, prepare `.env` first and use the [Docker environment settings](docker_env_changes.md). It must be a file readable and writable by container UID 1000; the current Compose mount is read/write. After app sign-in, add broker keys in **Select Broker → Configure**. Legacy broker keys in `.env` remain supported and take precedence for the broker named in `REDIRECT_URL`.
 
-3. **Generate security keys:**
-   ```bash
-   # APP_KEY
-   python -c "import secrets; print(secrets.token_hex(32))"
-
-   # API_KEY_PEPPER
-   python -c "import secrets; print(secrets.token_hex(32))"
-   ```
-
-4. **Update .env with generated keys:**
-   ```bash
-   APP_KEY = 'generated_key_1'
-   API_KEY_PEPPER = 'generated_key_2'
-   ```
+Eventlet is the default with exactly one worker. For optional gthread, follow the [worker guide](../gthread/README.md#switch-on-docker), including `stop_grace_period: 45s` for Compose. The gthread pool has 64 request threads; the count is fixed.
 
 ## Verification Steps
 
@@ -167,7 +154,7 @@ Expected output: HTTP 200 response
 
 **Test imports:**
 ```bash
-docker-compose exec openalgo python -c "import numba; import llvmlite; import scipy; print('✓ Imports successful')"
+docker-compose exec openalgo python -c "import numba; import llvmlite; import scipy; print('Imports successful')"
 ```
 
 **Test numba JIT:**
@@ -187,7 +174,7 @@ def calculate_ema(prices, period):
 
 prices = np.random.randn(100)
 ema = calculate_ema(prices, 20)
-print(f'✓ EMA calculated: {ema[-1]:.4f}')
+print(f'EMA calculated: {ema[-1]:.4f}')
 "
 ```
 
@@ -196,7 +183,7 @@ print(f'✓ EMA calculated: {ema[-1]:.4f}')
 docker-compose exec openalgo python -c "
 from scipy import stats
 result = stats.norm.cdf(0)
-print(f'✓ SciPy works: {result:.4f}')
+print(f'SciPy works: {result:.4f}')
 "
 ```
 
@@ -245,7 +232,7 @@ docker-compose logs --tail=100
 **Solution 2:** Verify .env file is mounted:
 ```bash
 docker-compose exec openalgo ls -la /app/.env
-docker-compose exec openalgo head -5 /app/.env
+docker-compose exec openalgo test -w /app/.env
 ```
 
 **Solution 3:** Restart container:
@@ -469,7 +456,7 @@ kubectl apply -f k8s/deployment.yaml
 
 1. **Runs as non-root user:** Container runs as `appuser`
 2. **Restricted permissions:** Keys directory has `chmod 700`
-3. **Read-only .env:** Mounted with `:ro` flag
+3. **Private writable .env:** Container UID 1000 must be able to read and write the bind-mounted file for startup secret rotation and server-setting saves
 4. **No privilege escalation:** No `--privileged` flag
 
 ## CI/CD Integration

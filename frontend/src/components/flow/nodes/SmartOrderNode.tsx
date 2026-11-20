@@ -3,9 +3,10 @@
  * Position-aware order placement
  */
 
-import { memo } from 'react'
 import { Handle, Position } from '@xyflow/react'
 import { Zap } from 'lucide-react'
+import { memo } from 'react'
+import { defaultProductForExchange } from '@/lib/flow/constants'
 import { cn } from '@/lib/utils'
 import type { SmartOrderNodeData } from '@/types/flow'
 
@@ -16,17 +17,8 @@ interface SmartOrderNodeProps {
 
 export const SmartOrderNode = memo(({ data, selected }: SmartOrderNodeProps) => {
   return (
-    <div
-      className={cn(
-        'workflow-node node-action min-w-[120px]',
-        selected && 'selected'
-      )}
-    >
-      <Handle
-        type="target"
-        position={Position.Top}
-        className="!top-0 !-translate-y-1/2"
-      />
+    <div className={cn('workflow-node node-action min-w-[120px]', selected && 'selected')}>
+      <Handle type="target" position={Position.Top} className="!top-0 !-translate-y-1/2" />
       <div className="p-2">
         <div className="mb-1.5 flex items-center gap-1.5">
           <div className="node-icon flex h-5 w-5 items-center justify-center rounded">
@@ -34,9 +26,7 @@ export const SmartOrderNode = memo(({ data, selected }: SmartOrderNodeProps) => 
           </div>
           <div>
             <div className="text-xs font-medium leading-tight">Smart Order</div>
-            <div className="text-[9px] text-muted-foreground">
-              {data.exchange || 'NSE'}
-            </div>
+            <div className="text-[9px] text-muted-foreground">{data.exchange || 'NSE'}</div>
           </div>
         </div>
         <div className="space-y-1">
@@ -64,15 +54,11 @@ export const SmartOrderNode = memo(({ data, selected }: SmartOrderNodeProps) => 
           </div>
           <div className="flex items-center justify-between text-[9px] text-muted-foreground">
             <span>{data.priceType || 'MARKET'}</span>
-            <span>{data.product || 'MIS'}</span>
+            <span>{data.product || defaultProductForExchange(data.exchange)}</span>
           </div>
         </div>
       </div>
-      <Handle
-        type="source"
-        position={Position.Bottom}
-        className="!bottom-0 !translate-y-1/2"
-      />
+      <Handle type="source" position={Position.Bottom} className="!bottom-0 !translate-y-1/2" />
     </div>
   )
 })

@@ -1,14 +1,16 @@
 import { AlertTriangle, ArrowLeft, ExternalLink, Loader2, Shield } from 'lucide-react'
 import { useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
-import { showToast } from '@/utils/toast'
+import { Link, useNavigate, useParams } from 'react-router'
 import { fetchCSRFToken } from '@/api/client'
+import { syncBrokerSession } from '@/components/auth/AuthSync'
+import { BrokerAuthSignOut } from '@/components/auth/BrokerAuthSignOut'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useAuthStore } from '@/stores/authStore'
+import { showToast } from '@/utils/toast'
 
 // Field configuration type
 interface FieldConfig {
@@ -112,6 +114,31 @@ const brokerFields: Record<string, BrokerConfig> = {
     ],
     callbackUrl: '/firstock/callback',
   },
+  indmoney: {
+    fields: [
+      {
+        name: 'mpin',
+        label: 'MPIN',
+        type: 'password',
+        placeholder: 'Enter your account MPIN',
+        inputMode: 'numeric',
+        hint: 'The MPIN you use to log in to INDstocks',
+      },
+      {
+        name: 'totp',
+        label: 'TOTP Code',
+        type: 'text',
+        placeholder: 'Enter 6-digit TOTP',
+        maxLength: 6,
+        pattern: '[0-9]{6}',
+        inputMode: 'numeric',
+        hint: 'Get TOTP from your authenticator app. Use a fresh code - a code that has already been submitted will be rejected.',
+      },
+    ],
+    callbackUrl: '/indmoney/callback',
+    warning:
+      'Set up TOTP once at indstocks.com > API Trading > Access Tokens, and put the Client ID shown there in BROKER_API_KEY. Token generation is limited to 1 request per 60 seconds, and 5 wrong codes in 15 minutes locks it for 15 minutes.',
+  },
   kotak: {
     fields: [
       {
@@ -189,14 +216,14 @@ const brokerFields: Record<string, BrokerConfig> = {
   nubra: {
     fields: [
       {
-        name: 'totp',
-        label: 'TOTP Code',
+        name: 'otp',
+        label: 'OTP',
         type: 'text',
-        placeholder: 'Enter 6-digit TOTP',
+        placeholder: 'Enter 6-digit OTP',
         maxLength: 6,
         pattern: '[0-9]{6}',
         inputMode: 'numeric',
-        hint: 'Enter the 6-digit code from your authenticator app',
+        hint: 'An OTP has been sent to your registered mobile number. For a new code, start the Nubra login again from the broker page.',
       },
     ],
     callbackUrl: '/nubra/callback',
@@ -233,9 +260,31 @@ const brokerFields: Record<string, BrokerConfig> = {
     ],
     callbackUrl: '/shoonya/callback',
   },
+  sahi: {
+    fields: [
+      {
+        name: 'totp',
+        label: 'TOTP code',
+        type: 'text',
+        placeholder: 'Enter 6-digit TOTP',
+        maxLength: 6,
+        pattern: '[0-9]{6}',
+        inputMode: 'numeric',
+        hint: 'For a TOTP key, the code your authenticator app shows. Leave it blank for a Regular key you approved in the Sahi API Dashboard today.',
+        optional: true,
+      },
+    ],
+    callbackUrl: '/sahi/callback',
+  },
   tradejini: {
     fields: [
-      { name: 'password', label: 'Password', type: 'password', placeholder: 'Enter your Password' },
+      {
+        name: 'password',
+        label: 'PIN',
+        type: 'password',
+        placeholder: 'Enter your login PIN',
+        hint: 'The PIN you use to log in to CubePlus, not your account password',
+      },
       {
         name: 'twofa',
         label: '2FA Code / TOTP',
@@ -285,15 +334,16 @@ const brokerNames: Record<string, string> = {
   angel: 'Angel One',
   definedge: 'Definedge Securities',
   firstock: 'Firstock',
+  indmoney: 'IndMoney (INDstocks)',
   kotak: 'Kotak NEO',
   motilal: 'Motilal Oswal',
   mstock: 'MStock',
   nubra: 'Nubra (Nuvama)',
+  sahi: 'Sahi',
   samco: 'Samco',
   shoonya: 'Shoonya',
   tradejini: 'Tradejini',
   zebu: 'Zebu',
-  jmfinancial: 'JM Financial',
 }
 
 export default function BrokerTOTP() {
@@ -372,6 +422,9 @@ export default function BrokerTOTP() {
 
       if (data.status === 'success' || response.ok) {
         login(formData.userid || formData.mobile || '', broker || '')
+        // No page reload follows, so load the API key, capabilities and app
+        // mode now; without the key every order ticket stays disabled.
+        await syncBrokerSession()
         showToast.success('Authentication successful')
         navigate('/dashboard')
       } else {
@@ -512,6 +565,7 @@ export default function BrokerTOTP() {
                   Documentation
                   <ExternalLink className="h-3 w-3" />
                 </a>
+                <BrokerAuthSignOut />
               </div>
             </div>
           </CardContent>

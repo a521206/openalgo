@@ -9,14 +9,14 @@ import {
   RefreshCw,
   Server,
 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
-import { showToast } from '@/utils/toast'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Progress } from '@/components/ui/progress'
 import { Skeleton } from '@/components/ui/skeleton'
+import { showToast } from '@/utils/toast'
 
 async function fetchCSRFToken(): Promise<string> {
   const response = await fetch('/auth/csrf-token', {
@@ -124,31 +124,62 @@ export default function MasterContract() {
   const [isLoading, setIsLoading] = useState(true)
   const [isDownloading, setIsDownloading] = useState(false)
   const [isReloadingCache, setIsReloadingCache] = useState(false)
-  const [pollingInterval, setPollingInterval] = useState<ReturnType<typeof setInterval> | null>(null)
+  const pollingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const statusControllerRef = useRef<AbortController | null>(null)
+  const pollingRequestedRef = useRef(false)
+  const forceProbePendingRef = useRef(false)
+  const refreshQueuedRef = useRef(false)
+  const mountedRef = useRef(false)
 
   const fetchStatus = useCallback(async () => {
+    if (!mountedRef.current) return
+    if (statusControllerRef.current) {
+      refreshQueuedRef.current = true
+      return
+    }
+    if (pollingTimeoutRef.current) {
+      clearTimeout(pollingTimeoutRef.current)
+      pollingTimeoutRef.current = null
+    }
+    const controller = new AbortController()
+    statusControllerRef.current = controller
     try {
       const response = await fetch('/api/master-contract/smart-status', {
         credentials: 'include',
+        signal: controller.signal,
       })
       if (response.ok) {
         const data = await response.json()
+        if (!mountedRef.current || statusControllerRef.current !== controller) return
         setStatus(data)
-
-        // If downloading, continue polling
-        if (data.status === 'downloading' && !pollingInterval) {
-          const interval = setInterval(fetchStatus, 2000)
-          setPollingInterval(interval)
-        } else if (data.status !== 'downloading' && pollingInterval) {
-          clearInterval(pollingInterval)
-          setPollingInterval(null)
+        if (data.status === 'downloading') {
+          forceProbePendingRef.current = false
+          pollingRequestedRef.current = true
+        } else if (forceProbePendingRef.current) {
+          // A new download may not yet appear in the immediate status response.
+          forceProbePendingRef.current = false
+          pollingRequestedRef.current = true
+        } else {
+          pollingRequestedRef.current = false
         }
       }
-    } catch (error) {
+    } catch (_error) {
     } finally {
-      setIsLoading(false)
+      if (statusControllerRef.current === controller && mountedRef.current) {
+        statusControllerRef.current = null
+        setIsLoading(false)
+        if (refreshQueuedRef.current) {
+          refreshQueuedRef.current = false
+          void fetchStatus()
+        } else if (pollingRequestedRef.current) {
+          pollingTimeoutRef.current = setTimeout(() => {
+            pollingTimeoutRef.current = null
+            void fetchStatus()
+          }, 2000)
+        }
+      }
     }
-  }, [pollingInterval])
+  }, [])
 
   const fetchCacheHealth = useCallback(async () => {
     try {
@@ -159,23 +190,27 @@ export default function MasterContract() {
         const data = await response.json()
         setCacheHealth(data)
       }
-    } catch (error) {
-    }
+    } catch (_error) {}
   }, [])
 
+  // Each poll starts only after the previous response; leaving aborts that response.
   useEffect(() => {
+    mountedRef.current = true
     fetchStatus()
     fetchCacheHealth()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  useEffect(() => {
     return () => {
-      if (pollingInterval) {
-        clearInterval(pollingInterval)
+      mountedRef.current = false
+      pollingRequestedRef.current = false
+      forceProbePendingRef.current = false
+      refreshQueuedRef.current = false
+      if (pollingTimeoutRef.current) {
+        clearTimeout(pollingTimeoutRef.current)
+        pollingTimeoutRef.current = null
       }
+      statusControllerRef.current?.abort()
+      statusControllerRef.current = null
     }
-  }, [pollingInterval])
+  }, [fetchStatus, fetchCacheHealth])
 
   const handleForceDownload = async () => {
     setIsDownloading(true)
@@ -195,16 +230,15 @@ export default function MasterContract() {
 
       if (data.status === 'success' || data.started) {
         showToast.success('Master contract download started')
-        // Start polling
-        const interval = setInterval(fetchStatus, 2000)
-        setPollingInterval(interval)
-        fetchStatus()
+        pollingRequestedRef.current = true
+        forceProbePendingRef.current = true
+        void fetchStatus()
       } else if (data.status === 'skipped') {
         showToast.info(data.message)
       } else {
         showToast.error(data.message || 'Failed to start download')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to start download')
     } finally {
       setIsDownloading(false)
@@ -231,7 +265,7 @@ export default function MasterContract() {
       } else {
         showToast.error(data.message || 'Failed to reload cache')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to reload cache')
     } finally {
       setIsReloadingCache(false)
@@ -262,9 +296,7 @@ export default function MasterContract() {
             <Database className="h-8 w-8" />
             Master Contract
           </h1>
-          <p className="text-muted-foreground mt-1">
-            Manage master contract data and symbol cache
-          </p>
+          <p className="text-muted-foreground mt-1">Manage master contract data and symbol cache</p>
         </div>
         <div className="flex gap-3">
           <Button
@@ -311,16 +343,16 @@ export default function MasterContract() {
               <Server className="h-5 w-5" />
               Download Status
             </CardTitle>
-            <CardDescription>
-              Current master contract download status
-            </CardDescription>
+            <CardDescription>Current master contract download status</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">Status</span>
               <div className="flex items-center gap-2">
                 {getStatusIcon(status?.status || 'unknown')}
-                <span className={`font-medium capitalize ${getStatusColor(status?.status || 'unknown')}`}>
+                <span
+                  className={`font-medium capitalize ${getStatusColor(status?.status || 'unknown')}`}
+                >
                   {status?.status || 'Unknown'}
                 </span>
               </div>
@@ -374,23 +406,17 @@ export default function MasterContract() {
               <Clock className="h-5 w-5" />
               Download History
             </CardTitle>
-            <CardDescription>
-              Last successful download information
-            </CardDescription>
+            <CardDescription>Last successful download information</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">Last Download</span>
-              <span className="text-sm">
-                {formatDateTime(status?.last_download_time || null)}
-              </span>
+              <span className="text-sm">{formatDateTime(status?.last_download_time || null)}</span>
             </div>
 
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">Download Date</span>
-              <span className="text-sm">
-                {status?.download_date || 'N/A'}
-              </span>
+              <span className="text-sm">{status?.download_date || 'N/A'}</span>
             </div>
 
             <div className="flex items-center justify-between">
@@ -408,7 +434,8 @@ export default function MasterContract() {
               <p className="text-sm text-muted-foreground">
                 Downloads after{' '}
                 <span className="font-medium">
-                  {status?.smart_download?.cutoff_time || '08:00'} {status?.smart_download?.cutoff_timezone || 'IST'}
+                  {status?.smart_download?.cutoff_time || '08:00'}{' '}
+                  {status?.smart_download?.cutoff_timezone || 'IST'}
                 </span>{' '}
                 are cached for the day. Login after cutoff reuses cached data.
               </p>
@@ -423,9 +450,7 @@ export default function MasterContract() {
               <FileStack className="h-5 w-5" />
               Exchange Statistics
             </CardTitle>
-            <CardDescription>
-              Symbol count per exchange
-            </CardDescription>
+            <CardDescription>Symbol count per exchange</CardDescription>
           </CardHeader>
           <CardContent>
             {status?.exchange_stats && Object.keys(status.exchange_stats).length > 0 ? (
@@ -438,9 +463,7 @@ export default function MasterContract() {
                       className="flex items-center justify-between p-3 rounded-lg bg-muted/50"
                     >
                       <span className="font-medium">{exchange}</span>
-                      <Badge variant="secondary">
-                        {count.toLocaleString()}
-                      </Badge>
+                      <Badge variant="secondary">{count.toLocaleString()}</Badge>
                     </div>
                   ))}
               </div>
@@ -459,21 +482,14 @@ export default function MasterContract() {
               <Server className="h-5 w-5" />
               Cache Health
             </CardTitle>
-            <CardDescription>
-              In-memory symbol cache status
-            </CardDescription>
+            <CardDescription>In-memory symbol cache status</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">Health Score</span>
               <div className="flex items-center gap-2">
-                <Progress
-                  value={cacheHealth?.health_score || 0}
-                  className="w-24 h-2"
-                />
-                <span className="font-mono text-sm">
-                  {cacheHealth?.health_score || 0}%
-                </span>
+                <Progress value={cacheHealth?.health_score || 0} className="w-24 h-2" />
+                <span className="font-mono text-sm">{cacheHealth?.health_score || 0}%</span>
               </div>
             </div>
 
@@ -515,9 +531,7 @@ export default function MasterContract() {
 
             {cacheHealth?.recommendations && cacheHealth.recommendations.length > 0 && (
               <div className="pt-2 border-t">
-                <p className="text-sm text-muted-foreground">
-                  {cacheHealth.recommendations[0]}
-                </p>
+                <p className="text-sm text-muted-foreground">{cacheHealth.recommendations[0]}</p>
               </div>
             )}
 

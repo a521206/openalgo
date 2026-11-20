@@ -52,8 +52,8 @@ The Action Center is a centralized order approval system for semi-automated trad
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │  Strategy │ Symbol │ Exchange │ Action │ Qty │ Price │ Actions      │   │
 │  ├─────────────────────────────────────────────────────────────────────┤   │
-│  │  MyStrat  │ SBIN   │ NSE      │ BUY    │ 100 │ MKT   │ ✓ Approve    │   │
-│  │           │        │          │        │     │       │ ✗ Reject     │   │
+│  │  MyStrat  │ SBIN   │ NSE      │ BUY    │ 100 │ MKT   │ Approve    │   │
+│  │           │        │          │        │     │       │ Reject     │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                              │
 │                         [Approve All Pending]                               │
@@ -167,7 +167,7 @@ CREATE INDEX idx_user_status ON pending_orders(user_id, status);
 CREATE INDEX idx_created_at ON pending_orders(created_at);
 ```
 
-## Supported Order Types
+## Executor-Supported Queued Types
 
 | API Type | Description |
 |----------|-------------|
@@ -176,62 +176,46 @@ CREATE INDEX idx_created_at ON pending_orders(created_at);
 | basketorder | Multiple orders |
 | splitorder | Split large orders |
 | optionsorder | Options contracts |
+| optionsmultiorder | Multi-leg options orders |
+| placegttorder | GTT placement for brokers with a GTT module |
+
+Approval dispatch in `services/pending_order_execution_service.py` handles all seven queued API types. Single orders retain their broker order ID, batch and multi-leg orders retain child order IDs with `open` or `partial` execution state, and GTT placement retains the broker trigger ID. The GTT service capability gate returns HTTP 501 for unsupported brokers; Angel One, Dhan, Fyers, Rupeezy, Upstox and Zerodha currently provide GTT modules.
+
+The committed `pending_orders` row is the authoritative queue result. Socket.IO notification is best-effort: if background notification startup fails, the error is logged and the already-created order still returns a successful queue response.
 
 ## Restricted Operations
 
-These operations ALWAYS execute immediately, even in semi-auto mode:
+These operations are never queued. Read-only operations execute immediately; destructive operations apply their own service policy and are blocked in semi-auto mode unless analyzer behavior explicitly permits them.
 
 | Operation | Reason |
 |-----------|--------|
-| closeposition | Prevent stuck positions |
-| closeallpositions | Emergency close |
-| cancelorder | Order management |
-| cancelallorder | Bulk cancel |
-| modifyorder | Order adjustment |
+| closeposition | Blocked by close-position service in semi-auto live mode |
+| cancelorder | Blocked by cancel-order service in semi-auto live mode |
+| cancelallorder | Blocked by cancel-all service in semi-auto live mode |
+| modifyorder | Blocked by modify-order service in semi-auto live mode |
+| modifygttorder / cancelgttorder | Blocked because a delayed change may target a stale trigger |
 | orderstatus | Status query |
 | orderbook | Data retrieval |
 | tradebook | Data retrieval |
-| positions | Data retrieval |
+| positionbook / openposition | Data retrieval |
 | holdings | Data retrieval |
 | funds | Data retrieval |
+
+## Execution Claims And Interrupted Sends
+
+`approve_pending_order` is a compare-and-set state transition. Before contacting the broker, the executor also atomically claims the row's `broker_status` as `submitting`; concurrent approvals cannot send it twice. A row left `submitting` by a restart is never automatically resent. The UI uses server-computed `approved_age_seconds` to distinguish a recent send from an old unconfirmed one; check the broker order book before placing another order.
+
+A failed database claim sends nothing. If it can restore the row to pending, the trader can approve again. Under gthread, a proven pre-send broker-pacer refusal for an eligible single-order type can likewise return it to pending. That rule does not authorize retrying a partially executed batch. Lost broker replies are a separate uncertainty; see [PlaceOrder Call Flow](../19-placeorder-flow/) and [known conflicts](../../prd/CONFLICTS.md).
 
 ## API Endpoints
 
 ### Get Orders
 
 ```
-POST /action-center/api/data?status=pending
+GET /action-center/api/data?status=pending
 ```
 
-**Response:**
-```json
-{
-    "status": "success",
-    "orders": [
-        {
-            "id": 1,
-            "strategy": "MyStrategy",
-            "symbol": "SBIN",
-            "exchange": "NSE",
-            "action": "BUY",
-            "quantity": 100,
-            "price": 0,
-            "price_type": "MARKET",
-            "product": "MIS",
-            "order_type": "placeorder",
-            "status": "pending",
-            "created_at": "5 minutes ago"
-        }
-    ],
-    "statistics": {
-        "total_pending": 3,
-        "total_approved": 15,
-        "total_rejected": 2,
-        "total_buy_orders": 10,
-        "total_sell_orders": 10
-    }
-}
-```
+**Response:** The route returns `{"status": "success", "data": {"orders": [...], "statistics": {...}}}`. Rows include `api_type`, `product_type`, `broker_order_id`, `broker_status`, IST timestamps and `approved_age_seconds`; `raw_order_data` excludes API keys. `services/action_center_service.py:parse_pending_order` defines type-specific display fields.
 
 ### Approve Order
 
@@ -267,9 +251,9 @@ POST /action-center/approve-all
 ```json
 {
     "status": "success",
-    "approved": 5,
-    "executed": 5,
-    "failed": 0
+    "approved_count": 5,
+    "executed_count": 5,
+    "failed_executions": []
 }
 ```
 
@@ -378,16 +362,11 @@ Click chevron to view raw order data:
 
 ```python
 def should_route_to_pending(api_key, api_type=None):
-    """Check if order should be queued"""
-    # Skip restricted operations
+    """Return True only for queue-eligible requests in semi-auto mode."""
     if api_type in IMMEDIATE_EXECUTION_OPERATIONS:
         return False
-
-    # Check user's order mode
-    user_id = get_user_id_from_api_key(api_key)
-    order_mode = get_order_mode(user_id)
-
-    return order_mode == 'semi_auto'
+    user_id = verify_api_key(api_key)
+    return bool(user_id and get_order_mode(user_id) == 'semi_auto')
 ```
 
 ### Queue Order
@@ -403,11 +382,8 @@ def queue_order(api_key, order_data, api_type):
         order_data=order_data
     )
 
-    # Emit real-time event
-    socketio.emit('pending_order_created', {
-        'order_id': pending_order_id,
-        'user_id': user_id
-    })
+    # Emit best-effort UI notification after persistence.
+    socketio.emit('pending_order_created', {'order_id': pending_order_id, 'user_id': user_id})
 
     return True, {
         'status': 'success',

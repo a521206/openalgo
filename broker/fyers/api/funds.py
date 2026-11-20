@@ -2,6 +2,8 @@
 
 import json
 import os
+import threading
+import time
 from typing import Any, Dict, Optional
 
 import httpx
@@ -13,10 +15,20 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Per-user cache and rate limit state, keyed by auth_token
+_cache: dict[str, dict] = {}
+_rate_limit: dict[str, dict] = {}
+_lock = threading.Lock()
+
+CACHE_TTL = 60  # seconds - serve cached data within this window
+INITIAL_BACKOFF = 30  # seconds - first backoff after 429
+MAX_BACKOFF = 120  # seconds - maximum backoff duration
+
 
 def get_margin_data(auth_token: str) -> dict[str, str]:
     """
     Fetch and process margin/funds data from Fyers' API using shared HTTP client with connection pooling.
+    Includes response caching and exponential backoff on rate limits (429).
 
     Args:
         auth_token: The authentication token for Fyers API (format: 'app_id:access_token')
@@ -29,19 +41,36 @@ def get_margin_data(auth_token: str) -> dict[str, str]:
             - m2mrealized: Realized M2M
             - utiliseddebits: Utilized amount
     """
-    # Initialize default response
-    default_response = {
-        "availablecash": "0.00",
-        "collateral": "0.00",
-        "m2munrealized": "0.00",
-        "m2mrealized": "0.00",
-        "utiliseddebits": "0.00",
-    }
+    # IMPORTANT: never fabricate a zero-balance funds dict on an error. Fyers returns
+    # real zeros for a genuinely empty account via the normal success path; a
+    # FABRICATED zeros dict here would make an expired/invalid session (e.g. daily
+    # token expiry → HTTP 401) look like a live, zero-balance account. The
+    # funds_service layer treats an empty {} as "session invalid/expired", which
+    # relies on every broker returning {} — not populated zeros — when it has no real
+    # data. So on any error we return {} (empty). The ONE exception is a transient 429
+    # rate-limit, where serving genuinely-cached REAL data (with backoff) is correct.
+
+    now = time.time()
+
+    with _lock:
+        user_cache = _cache.get(auth_token, {"data": None, "timestamp": 0})
+        user_rate_limit = _rate_limit.get(auth_token, {"backoff_until": 0, "backoff_seconds": 0})
+
+    # If within cache TTL, return cached data
+    if user_cache["data"] and (now - user_cache["timestamp"]) < CACHE_TTL:
+        return user_cache["data"]
+
+    # If rate-limited and in backoff period, serve cached REAL data (transient 429);
+    # with no cache we can't fabricate — return {} so the session is reported honestly.
+    if now < user_rate_limit["backoff_until"]:
+        remaining = int(user_rate_limit["backoff_until"] - now)
+        logger.debug(f"Rate limit backoff active, {remaining}s remaining. Serving cached data.")
+        return user_cache["data"] if user_cache["data"] else {}
 
     api_key = os.getenv("BROKER_API_KEY")
     if not api_key:
         logger.error("BROKER_API_KEY environment variable not set")
-        return default_response
+        return {}
 
     # Get shared HTTP client with connection pooling
     client = get_httpx_client()
@@ -59,7 +88,9 @@ def get_margin_data(auth_token: str) -> dict[str, str]:
         if funds_data.get("code") != 200:
             error_msg = funds_data.get("message", "Unknown error")
             logger.error(f"Error in Fyers funds API: {error_msg}")
-            return default_response
+            # API-level error (e.g. expired token) — return {} (no real data), never
+            # fabricate zeros. Serve cache only for transient 429 (handled below).
+            return {}
 
         # Process the funds data
         processed_funds = {}
@@ -76,8 +107,15 @@ def get_margin_data(auth_token: str) -> dict[str, str]:
 
         # Calculate totals with proper error handling
         try:
-            # Get available balance
-            balance = processed_funds.get("available_balance", {})
+            # "availablecash" must be the actual settled cash balance, not
+            # total trading capacity. Fyers' "Available Balance" is the final
+            # ledger line (Clear Balance + Collaterals + Fund Transfer +
+            # Receivables + Adhoc Limit, per the fund_limit ledger order),
+            # so it folds collateral back in -- double-counting against the
+            # separately reported "collateral" field below, same class of
+            # bug as GitHub issue #1582. "Clear Balance" is the settled,
+            # collateral-free cash figure, so use that instead.
+            balance = processed_funds.get("clear_balance", {})
             balance_equity = float(balance.get("equity_amount", 0))
             balance_commodity = float(balance.get("commodity_amount", 0))
             total_balance = balance_equity + balance_commodity
@@ -120,7 +158,7 @@ def get_margin_data(auth_token: str) -> dict[str, str]:
             total_realised, total_unrealised = sum_realised_unrealised(position_book)
 
             # Format and return the response
-            return {
+            result = {
                 "availablecash": f"{total_balance:.2f}",
                 "collateral": f"{total_collateral:.2f}",
                 "m2munrealized": f"{total_unrealised:.2f}",
@@ -128,12 +166,38 @@ def get_margin_data(auth_token: str) -> dict[str, str]:
                 "utiliseddebits": f"{total_utilized:.2f}",
             }
 
+            # Cache successful response and reset backoff
+            with _lock:
+                _cache[auth_token] = {"data": result, "timestamp": now}
+                _rate_limit[auth_token] = {"backoff_until": 0, "backoff_seconds": 0}
+
+            return result
+
         except (ValueError, TypeError):
             logger.exception("Error calculating fund totals")
-            return default_response
+            return {}
 
     except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            # Exponential backoff: 30s → 60s → 120s (max)
+            with _lock:
+                backoff = user_rate_limit["backoff_seconds"]
+                backoff = INITIAL_BACKOFF if backoff == 0 else min(backoff * 2, MAX_BACKOFF)
+                _rate_limit[auth_token] = {
+                    "backoff_until": time.time() + backoff,
+                    "backoff_seconds": backoff,
+                }
+            logger.warning(
+                f"Fyers API rate limited (429). Backing off for {backoff}s. "
+                f"Serving cached data."
+            )
+            # Transient — serve genuinely-cached REAL data if we have it, else {}.
+            return user_cache["data"] if user_cache["data"] else {}
+        # Any other HTTP error (notably 401 = expired/invalid token) means we have no
+        # valid funds data — return {} so the session is reported as invalid/expired,
+        # never masked as a live zero-balance account.
         logger.error(f"HTTP error {e.response.status_code} fetching Fyers funds: {e.response.text}")
+        return {}
     except httpx.RequestError as e:
         logger.error(f"Request failed: {str(e)}")
     except json.JSONDecodeError as e:
@@ -141,4 +205,5 @@ def get_margin_data(auth_token: str) -> dict[str, str]:
     except Exception:
         logger.exception("Unexpected error in get_margin_data")
 
-    return default_response
+    # No real funds data obtained — return {} (never fabricate zeros).
+    return {}

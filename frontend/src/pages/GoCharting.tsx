@@ -1,10 +1,10 @@
 import { AlertTriangle, BookOpen, Copy, ExternalLink, Info, RefreshCw } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { showToast } from '@/utils/toast'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
+import { JsonEditor } from '@/components/ui/json-editor'
 import { Label } from '@/components/ui/label'
 import {
   Select,
@@ -13,7 +13,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { JsonEditor } from '@/components/ui/json-editor'
+import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
+import { showToast } from '@/utils/toast'
 
 interface SearchResult {
   symbol: string
@@ -22,14 +23,7 @@ interface SearchResult {
   token: string
 }
 
-const EXCHANGES = [
-  { value: 'NSE', label: 'NSE' },
-  { value: 'NFO', label: 'NFO' },
-  { value: 'BSE', label: 'BSE' },
-  { value: 'BFO', label: 'BFO' },
-  { value: 'CDS', label: 'CDS' },
-  { value: 'MCX', label: 'MCX' },
-]
+// EXCHANGES is now dynamic — provided by useSupportedExchanges() hook
 
 const PRODUCTS = [
   { value: 'MIS', label: 'MIS - Intraday' },
@@ -38,10 +32,12 @@ const PRODUCTS = [
 ]
 
 export default function GoCharting() {
+  const { tradingExchanges, defaultExchange, isCrypto } = useSupportedExchanges()
+
   // Form state
-  const [symbol, setSymbol] = useState('NHPC')
-  const [exchange, setExchange] = useState('NSE')
-  const [product, setProduct] = useState('MIS')
+  const [symbol, setSymbol] = useState(isCrypto ? 'BTCUSDFUT' : 'NHPC')
+  const [exchange, setExchange] = useState(defaultExchange)
+  const [product, setProduct] = useState(isCrypto ? 'NRML' : 'MIS')
   const [action, setAction] = useState('BUY')
   const [quantity, setQuantity] = useState('1')
 
@@ -50,6 +46,13 @@ export default function GoCharting() {
   const [showResults, setShowResults] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
 
+  // Re-sync exchange when broker capabilities load asynchronously
+  useEffect(() => {
+    setExchange((prev) =>
+      prev && tradingExchanges.some((ex) => ex.value === prev) ? prev : defaultExchange
+    )
+  }, [defaultExchange, tradingExchanges])
+
   // JSON output
   const [generatedJson, setGeneratedJson] = useState<string>('')
 
@@ -57,7 +60,10 @@ export default function GoCharting() {
   const [apiKey, setApiKey] = useState<string>('')
 
   // Host config state for webhook URL
-  const [hostConfig, setHostConfig] = useState<{ host_server: string; is_localhost: boolean } | null>(null)
+  const [hostConfig, setHostConfig] = useState<{
+    host_server: string
+    is_localhost: boolean
+  } | null>(null)
 
   // Refs
   const inputWrapperRef = useRef<HTMLDivElement>(null)
@@ -69,11 +75,12 @@ export default function GoCharting() {
         const response = await fetch('/api/config/host', { credentials: 'include' })
         const data = await response.json()
         setHostConfig(data)
-      } catch (error) {
+      } catch (_error) {
         // Fallback to window.location.origin if config fetch fails
         setHostConfig({
           host_server: window.location.origin,
-          is_localhost: window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+          is_localhost:
+            window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1',
         })
       }
     }
@@ -93,7 +100,9 @@ export default function GoCharting() {
   }, [])
 
   // Get webhook URL from host config or fallback to window.location.origin
-  const webhookUrl = hostConfig ? `${hostConfig.host_server}/api/v1/placeorder` : `${window.location.origin}/api/v1/placeorder`
+  const webhookUrl = hostConfig
+    ? `${hostConfig.host_server}/api/v1/placeorder`
+    : `${window.location.origin}/api/v1/placeorder`
 
   // Debounced search
   const performSearch = useCallback(
@@ -115,7 +124,7 @@ export default function GoCharting() {
         const data = await response.json()
         setSearchResults((data.results || []).slice(0, 10))
         setShowResults(true)
-      } catch (error) {
+      } catch (_error) {
         setSearchResults([])
       } finally {
         setIsLoading(false)
@@ -151,7 +160,7 @@ export default function GoCharting() {
     setShowResults(false)
   }
 
-  const generateJson = (showError = true) => {
+  const generateJson = useCallback((showError = true) => {
     if (!symbol || !exchange) {
       if (showError) {
         showToast.error('Please select a symbol and exchange', 'system')
@@ -171,13 +180,12 @@ export default function GoCharting() {
     }
 
     setGeneratedJson(JSON.stringify(json, null, 2))
-  }
+  }, [symbol, exchange, apiKey, action, product, quantity])
 
   // Auto-generate JSON when values change
   useEffect(() => {
     generateJson(false)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [generateJson])
 
   const copyToClipboard = async (text: string, label: string) => {
     try {
@@ -206,7 +214,8 @@ export default function GoCharting() {
             <strong>Webhook URL not accessible!</strong> GoCharting cannot send alerts to localhost.
             Use <strong>ngrok</strong>, <strong>Cloudflare Tunnel</strong>,{' '}
             <strong>VS Code Dev Tunnel</strong>, or a <strong>custom domain</strong> to expose your
-            OpenAlgo instance to the internet. Update <code>HOST_SERVER</code> in your <code>.env</code> file with your external URL.
+            OpenAlgo instance to the internet. Update <code>HOST_SERVER</code> in your{' '}
+            <code>.env</code> file with your external URL.
           </AlertDescription>
         </Alert>
       )}
@@ -297,7 +306,7 @@ export default function GoCharting() {
                     <SelectValue placeholder="Select Exchange" />
                   </SelectTrigger>
                   <SelectContent>
-                    {EXCHANGES.map((ex) => (
+                    {tradingExchanges.map((ex) => (
                       <SelectItem key={ex.value} value={ex.value}>
                         {ex.label}
                       </SelectItem>
@@ -306,22 +315,24 @@ export default function GoCharting() {
                 </Select>
               </div>
 
-              {/* Product Type */}
-              <div className="space-y-2">
-                <Label htmlFor="product">Product Type</Label>
-                <Select value={product} onValueChange={setProduct}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {PRODUCTS.map((p) => (
-                      <SelectItem key={p.value} value={p.value}>
-                        {p.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
+              {/* Product Type (hidden for crypto — Delta Exchange ignores it) */}
+              {!isCrypto && (
+                <div className="space-y-2">
+                  <Label htmlFor="product">Product Type</Label>
+                  <Select value={product} onValueChange={setProduct}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {PRODUCTS.map((p) => (
+                        <SelectItem key={p.value} value={p.value}>
+                          {p.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
 
               {/* Action */}
               <div className="space-y-2">

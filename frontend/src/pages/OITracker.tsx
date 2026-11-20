@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Check, ChevronsUpDown } from 'lucide-react'
 import type * as PlotlyTypes from 'plotly.js'
-import { useThemeStore } from '@/stores/themeStore'
-import { oiTrackerApi, type OIDataResponse } from '@/api/oi-tracker'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type OIDataResponse, oiTrackerApi } from '@/api/oi-tracker'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import {
   Command,
@@ -20,22 +21,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
+import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
+import Plot from '@/lib/Plot2D'
+import { serverSentence } from '@/lib/serverSentence'
+import { useThemeStore } from '@/stores/themeStore'
 import { showToast } from '@/utils/toast'
-import Plot from 'react-plotly.js'
 
-const FNO_EXCHANGES = [
-  { value: 'NFO', label: 'NFO' },
-  { value: 'BFO', label: 'BFO' },
-  { value: 'CRYPTO', label: 'CRYPTO' },
-]
-
-const DEFAULT_UNDERLYINGS: Record<string, string[]> = {
-  NFO: ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'],
-  BFO: ['SENSEX', 'BANKEX'],
-  CRYPTO: ['BTC', 'ETH', 'SOL', 'BNB', 'XRP'],
-}
+// FNO_EXCHANGES and DEFAULT_UNDERLYINGS are now provided by useSupportedExchanges() hook
 
 function convertExpiryForAPI(expiry: string): string {
   if (!expiry) return ''
@@ -55,22 +47,38 @@ function formatNumber(num: number): string {
 
 export default function OITracker() {
   const { mode, appMode } = useThemeStore()
+  const {
+    toolsFnoExchanges: fnoExchanges,
+    defaultToolsFnoExchange: defaultFnoExchange,
+    defaultUnderlyings,
+  } = useSupportedExchanges()
   const isAnalyzer = appMode === 'analyzer'
   const isDark = mode === 'dark' || isAnalyzer
 
-  const [selectedExchange, setSelectedExchange] = useState('NFO')
-  const [underlyings, setUnderlyings] = useState<string[]>(DEFAULT_UNDERLYINGS.NFO)
+  const [selectedExchange, setSelectedExchange] = useState(defaultFnoExchange)
+  const [underlyings, setUnderlyings] = useState<string[]>(
+    defaultUnderlyings[defaultFnoExchange] || []
+  )
   const [underlyingOpen, setUnderlyingOpen] = useState(false)
-  const [selectedUnderlying, setSelectedUnderlying] = useState('NIFTY')
+  const [selectedUnderlying, setSelectedUnderlying] = useState(
+    defaultUnderlyings[defaultFnoExchange]?.[0] || ''
+  )
   const [expiries, setExpiries] = useState<string[]>([])
   const [selectedExpiry, setSelectedExpiry] = useState('')
   const [oiData, setOiData] = useState<OIDataResponse | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const requestIdRef = useRef(0)
 
+  // Re-sync exchange when broker capabilities load asynchronously
+  useEffect(() => {
+    setSelectedExchange((prev) =>
+      prev && fnoExchanges.some((ex) => ex.value === prev) ? prev : defaultFnoExchange
+    )
+  }, [defaultFnoExchange, fnoExchanges])
+
   // Fetch underlyings when exchange changes
   useEffect(() => {
-    const defaults = DEFAULT_UNDERLYINGS[selectedExchange] || []
+    const defaults = defaultUnderlyings[selectedExchange] || []
     setUnderlyings(defaults)
     setSelectedUnderlying(defaults[0] || '')
     setExpiries([])
@@ -93,8 +101,10 @@ export default function OITracker() {
       }
     }
     fetchUnderlyings()
-    return () => { cancelled = true }
-  }, [selectedExchange])
+    return () => {
+      cancelled = true
+    }
+  }, [selectedExchange, defaultUnderlyings[selectedExchange]])
 
   // Fetch expiries when underlying changes
   useEffect(() => {
@@ -122,9 +132,10 @@ export default function OITracker() {
       }
     }
     fetchExpiries()
-    return () => { cancelled = true }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedUnderlying])
+    return () => {
+      cancelled = true
+    }
+  }, [selectedUnderlying, selectedExchange])
 
   // Fetch OI data - uses requestIdRef to discard stale responses
   const fetchOIData = useCallback(async () => {
@@ -144,21 +155,21 @@ export default function OITracker() {
       } else {
         showToast.error(response.message || 'Failed to fetch OI data')
       }
-    } catch {
+    } catch (error) {
       if (requestIdRef.current !== requestId) return
-      showToast.error('Failed to fetch OI data')
+      showToast.error(serverSentence(error, 'Failed to fetch OI data'))
     } finally {
       if (requestIdRef.current === requestId) setIsLoading(false)
     }
   }, [selectedUnderlying, selectedExpiry, selectedExchange])
 
+  // Only trigger on expiry change - not on fetchOIData identity change,
+  // which would cause a stale request with mixed params during exchange switch.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: must fire only when selectedExpiry changes; adding fetchOIData would refire on underlying/exchange changes mid-switch and issue a stale request with mixed params
   useEffect(() => {
     if (selectedExpiry) {
       fetchOIData()
     }
-    // Only trigger on expiry change - not on fetchOIData identity change,
-    // which would cause a stale request with mixed params during exchange switch.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedExpiry])
 
   // Theme colors for Plotly
@@ -172,20 +183,12 @@ export default function OITracker() {
           ? 'rgba(180,160,255,0.1)'
           : 'rgba(255,255,255,0.1)'
         : 'rgba(0,0,0,0.08)',
-      ceBar: '#ef4444',
-      peBar: '#22c55e',
+      ceBar: '#22c55e',
+      peBar: '#ef4444',
       atmLine: isDark ? 'rgba(255,255,255,0.6)' : 'rgba(0,0,0,0.5)',
-      hoverBg: isDark
-        ? isAnalyzer
-          ? '#2d2545'
-          : '#1e293b'
-        : '#ffffff',
+      hoverBg: isDark ? (isAnalyzer ? '#2d2545' : '#1e293b') : '#ffffff',
       hoverFont: isDark ? '#e0e0e0' : '#333333',
-      hoverBorder: isDark
-        ? isAnalyzer
-          ? '#7c3aed'
-          : '#475569'
-        : '#e2e8f0',
+      hoverBorder: isDark ? (isAnalyzer ? '#7c3aed' : '#475569') : '#e2e8f0',
     }),
     [isDark, isAnalyzer]
   )
@@ -341,7 +344,7 @@ export default function OITracker() {
               <SelectValue placeholder="Exchange" />
             </SelectTrigger>
             <SelectContent>
-              {FNO_EXCHANGES.map((ex) => (
+              {fnoExchanges.map((ex) => (
                 <SelectItem key={ex.value} value={ex.value}>
                   {ex.label}
                 </SelectItem>
@@ -352,7 +355,12 @@ export default function OITracker() {
           {/* Underlying selector */}
           <Popover open={underlyingOpen} onOpenChange={setUnderlyingOpen}>
             <PopoverTrigger asChild>
-              <Button variant="outline" role="combobox" aria-expanded={underlyingOpen} className="w-[160px] justify-between">
+              <Button
+                variant="outline"
+                role="combobox"
+                aria-expanded={underlyingOpen}
+                className="w-[160px] justify-between"
+              >
                 {selectedUnderlying || 'Underlying'}
                 <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
               </Button>
@@ -372,7 +380,9 @@ export default function OITracker() {
                           setUnderlyingOpen(false)
                         }}
                       >
-                        <Check className={`mr-2 h-4 w-4 ${selectedUnderlying === u ? 'opacity-100' : 'opacity-0'}`} />
+                        <Check
+                          className={`mr-2 h-4 w-4 ${selectedUnderlying === u ? 'opacity-100' : 'opacity-0'}`}
+                        />
                         {u}
                       </CommandItem>
                     ))}
@@ -456,7 +466,9 @@ export default function OITracker() {
             />
           ) : (
             <div className="flex items-center justify-center h-[500px] text-muted-foreground">
-              {selectedExpiry ? 'No OI data available' : 'Select an underlying and expiry to view OI data'}
+              {selectedExpiry
+                ? 'No OI data available'
+                : 'Select an underlying and expiry to view OI data'}
             </div>
           )}
         </CardContent>

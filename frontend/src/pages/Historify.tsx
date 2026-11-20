@@ -28,8 +28,10 @@ import {
   Zap,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
-import { showToast } from '@/utils/toast'
+import { Link, useNavigate } from 'react-router'
+import { authApi } from '@/api/auth'
+import { LogoutConfirmDialog } from '@/components/auth/LogoutConfirmDialog'
+import { useSocketContext } from '@/components/socket/SocketProvider'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -43,6 +45,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
   DialogContent,
@@ -51,6 +54,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Progress } from '@/components/ui/progress'
@@ -62,6 +72,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import {
   Table,
   TableBody,
@@ -72,22 +83,11 @@ import {
 } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { Checkbox } from '@/components/ui/checkbox'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
-import { Switch } from '@/components/ui/switch'
-import { useSocket } from '@/hooks/useSocket'
+import { useProfileMenuItems } from '@/hooks/useProfileMenuItems'
 import { cn } from '@/lib/utils'
-import { profileMenuItems } from '@/config/navigation'
-import { authApi } from '@/api/auth'
 import { useAuthStore } from '@/stores/authStore'
 import { useThemeStore } from '@/stores/themeStore'
-import { LogoutConfirmDialog } from '@/components/auth/LogoutConfirmDialog'
+import { showToast } from '@/utils/toast'
 
 // Types
 interface SearchResult {
@@ -95,6 +95,20 @@ interface SearchResult {
   name: string
   exchange: string
   token: string
+}
+
+/** A symbol the bulk add could not add, with the server's reason. */
+interface BulkAddFailure {
+  symbol: string
+  exchange: string
+  error: string
+}
+
+/** A symbol the server added under its master contract spelling (M_M as M&M). */
+interface BulkAddRename {
+  from: string
+  to: string
+  exchange: string
 }
 
 interface WatchlistItem {
@@ -156,7 +170,14 @@ interface IntervalData {
 interface DownloadJob {
   id: string
   job_type: string
-  status: 'pending' | 'running' | 'paused' | 'completed' | 'completed_with_errors' | 'failed' | 'cancelled'
+  status:
+    | 'pending'
+    | 'running'
+    | 'paused'
+    | 'completed'
+    | 'completed_with_errors'
+    | 'failed'
+    | 'cancelled'
   total_symbols: number
   completed_symbols: number
   failed_symbols: number
@@ -193,7 +214,7 @@ interface Schedule {
   interval_value?: number
   interval_unit?: 'minutes' | 'hours'
   time_of_day?: string
-  download_source?: 'watchlist'  // Always watchlist, kept for API compatibility
+  download_source?: 'watchlist' // Always watchlist, kept for API compatibility
   data_interval: '1m' | 'D'
   lookback_days: number
   is_enabled: boolean
@@ -249,6 +270,8 @@ function getDateFromPreset(months: number): string {
 export default function Historify() {
   const { appMode, toggleAppMode, mode, toggleMode, isTogglingMode } = useThemeStore()
   const { user, logout } = useAuthStore()
+  // Filtered by broker capabilities (hides crypto-only Leverage on Indian brokers, issue #1480)
+  const profileMenuItems = useProfileMenuItems()
   const navigate = useNavigate()
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
 
@@ -261,8 +284,26 @@ export default function Historify() {
     computed_intervals: string[]
     all_intervals: string[]
   } | null>(null)
-  const [exchanges, setExchanges] = useState<string[]>(['NSE', 'BSE', 'NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NSE_INDEX', 'BSE_INDEX', 'CRYPTO'])
-  const [stats, setStats] = useState<Stats>({ database_size_mb: 0, total_records: 0, total_symbols: 0, watchlist_count: 0 })
+  const [exchanges, setExchanges] = useState<string[]>([
+    'NSE',
+    'BSE',
+    'NFO',
+    'BFO',
+    'MCX',
+    'NCO',
+    'CDS',
+    'BCD',
+    'NSE_INDEX',
+    'BSE_INDEX',
+    'GLOBAL_INDEX',
+    'CRYPTO',
+  ])
+  const [stats, setStats] = useState<Stats>({
+    database_size_mb: 0,
+    total_records: 0,
+    total_symbols: 0,
+    watchlist_count: 0,
+  })
 
   // Tab state
   const [activeTab, setActiveTab] = useState<string>('watchlist')
@@ -304,7 +345,9 @@ export default function Historify() {
   const [schedulesLoading, setSchedulesLoading] = useState(false)
   const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false)
   const [editingSchedule, setEditingSchedule] = useState<Schedule | null>(null)
-  const [scheduleExecutions, setScheduleExecutions] = useState<Record<string, ScheduleExecution[]>>({})
+  const [scheduleExecutions, setScheduleExecutions] = useState<Record<string, ScheduleExecution[]>>(
+    {}
+  )
   const [expandedSchedule, setExpandedSchedule] = useState<string | null>(null)
 
   // Schedule form state
@@ -321,6 +364,7 @@ export default function Historify() {
   // Dialog states
   const [bulkAddDialogOpen, setBulkAddDialogOpen] = useState(false)
   const [bulkAddText, setBulkAddText] = useState('')
+  const [bulkAddFailures, setBulkAddFailures] = useState<BulkAddFailure[]>([])
   const [isBulkAdding, setIsBulkAdding] = useState(false)
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false)
   const [uploadSymbol, setUploadSymbol] = useState('')
@@ -330,7 +374,11 @@ export default function Historify() {
   const [isUploading, setIsUploading] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
-  const [deleteTarget, setDeleteTarget] = useState<{ symbol: string; exchange: string; interval?: string } | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<{
+    symbol: string
+    exchange: string
+    interval?: string
+  } | null>(null)
   const [bulkDeleteDialogOpen, setBulkDeleteDialogOpen] = useState(false)
   const [isBulkDeleting, setIsBulkDeleting] = useState(false)
   const [bulkWatchlistDeleteDialogOpen, setBulkWatchlistDeleteDialogOpen] = useState(false)
@@ -340,7 +388,7 @@ export default function Historify() {
   const [exportDialogOpen, setExportDialogOpen] = useState(false)
   const [exportFormat, setExportFormat] = useState<'csv' | 'txt' | 'zip' | 'parquet'>('csv')
   const [exportSymbols, setExportSymbols] = useState<'all' | 'selected'>('all')
-  const [exportIntervals, setExportIntervals] = useState<Set<string>>(new Set(['D']))  // Multi-select intervals
+  const [exportIntervals, setExportIntervals] = useState<Set<string>>(new Set(['D'])) // Multi-select intervals
   const [catalogSelectedSymbols, setCatalogSelectedSymbols] = useState<Set<string>>(new Set())
   const [isExporting, setIsExporting] = useState(false)
 
@@ -354,8 +402,11 @@ export default function Historify() {
   // Catalog filtering
   const [catalogFilter, setCatalogFilter] = useState({ exchange: '', interval: '', search: '' })
 
-  // Socket.IO for real-time progress
-  const { socket } = useSocket()
+  // Socket.IO for real-time progress, on the app-wide connection SocketProvider
+  // owns. Calling useSocket() here opened a second connection for this page
+  // and registered every global alert handler a second time, so each order
+  // toast and sound played twice while this page was open.
+  const { socket } = useSocketContext()
 
   // Computed values (allIntervals not needed for now since we use storage_intervals)
   // const allIntervals = intervals
@@ -412,12 +463,21 @@ export default function Historify() {
   // Filter grouped catalog
   const filteredGroupedCatalog = useMemo(() => {
     return groupedCatalog.filter((item) => {
-      if (catalogFilter.exchange && catalogFilter.exchange !== '__all__' && item.exchange !== catalogFilter.exchange) return false
+      if (
+        catalogFilter.exchange &&
+        catalogFilter.exchange !== '__all__' &&
+        item.exchange !== catalogFilter.exchange
+      )
+        return false
       if (catalogFilter.interval && catalogFilter.interval !== '__all__') {
         // Show symbols that have the selected interval
         if (!item.intervals.some((i) => i.interval === catalogFilter.interval)) return false
       }
-      if (catalogFilter.search && !item.symbol.toLowerCase().includes(catalogFilter.search.toLowerCase())) return false
+      if (
+        catalogFilter.search &&
+        !item.symbol.toLowerCase().includes(catalogFilter.search.toLowerCase())
+      )
+        return false
       return true
     })
   }, [groupedCatalog, catalogFilter])
@@ -433,6 +493,7 @@ export default function Historify() {
   // }, [catalog, catalogFilter])
 
   // Load data on mount
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional one-time initial data load on mount; the loaders are recreated every render, so adding them would re-run all fetches on every render.
   useEffect(() => {
     loadWatchlist()
     loadCatalog()
@@ -445,6 +506,7 @@ export default function Historify() {
   }, [])
 
   // Socket.IO event handlers
+  // biome-ignore lint/correctness/useExhaustiveDependencies: loaders are invoked inside socket event callbacks at event-fire time (not at bind time); since they are recreated every render, including them would re-register all socket listeners on every render. Re-binding is intentionally limited to socket/expandedSchedule changes.
   useEffect(() => {
     if (!socket) return
 
@@ -452,12 +514,19 @@ export default function Historify() {
       setJobProgress((prev) => ({ ...prev, [data.job_id]: data }))
       setJobs((prevJobs) =>
         prevJobs.map((job) =>
-          job.id === data.job_id ? { ...job, completed_symbols: data.current, status: 'running' } : job
+          job.id === data.job_id
+            ? { ...job, completed_symbols: data.current, status: 'running' }
+            : job
         )
       )
     }
 
-    const handleJobComplete = (data: { job_id: string; completed: number; failed: number; status: string }) => {
+    const handleJobComplete = (data: {
+      job_id: string
+      completed: number
+      failed: number
+      status: string
+    }) => {
       setJobProgress((prev) => {
         const newProgress = { ...prev }
         delete newProgress[data.job_id]
@@ -466,7 +535,10 @@ export default function Historify() {
       loadJobs()
       loadCatalog()
       loadStats()
-      showToast.success(`Job completed: ${data.completed} success, ${data.failed} failed`, 'historify')
+      showToast.success(
+        `Job completed: ${data.completed} success, ${data.failed} failed`,
+        'historify'
+      )
     }
 
     const handleJobPaused = (data: { job_id: string }) => {
@@ -498,7 +570,11 @@ export default function Historify() {
       loadSchedules()
     }
 
-    const handleScheduleExecutionStarted = (data: { schedule_id: string; execution_id: number; job_id: string }) => {
+    const handleScheduleExecutionStarted = (data: {
+      schedule_id: string
+      execution_id: number
+      job_id: string
+    }) => {
       showToast.info(`Schedule execution started`, 'historify')
       loadSchedules()
       loadJobs()
@@ -507,7 +583,11 @@ export default function Historify() {
       }
     }
 
-    const handleScheduleExecutionComplete = (data: { schedule_id: string; execution_id: number; status: string }) => {
+    const handleScheduleExecutionComplete = (data: {
+      schedule_id: string
+      execution_id: number
+      status: string
+    }) => {
       loadSchedules()
       if (expandedSchedule === data.schedule_id) {
         loadScheduleExecutions(data.schedule_id)
@@ -545,7 +625,10 @@ export default function Historify() {
   // Click outside handler for search
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
-      if (searchContainerRef.current && !searchContainerRef.current.contains(event.target as Node)) {
+      if (
+        searchContainerRef.current &&
+        !searchContainerRef.current.contains(event.target as Node)
+      ) {
         setShowSearchResults(false)
       }
     }
@@ -554,6 +637,7 @@ export default function Historify() {
   }, [])
 
   // Symbol search
+  // biome-ignore lint/correctness/useExhaustiveDependencies: performSearch is recreated every render; the debounce must reset only when the search query (newSymbol) changes, not on every render, so it is intentionally excluded.
   useEffect(() => {
     const timer = setTimeout(() => {
       if (newSymbol.length >= 2) {
@@ -572,8 +656,7 @@ export default function Historify() {
       const response = await fetch('/historify/api/watchlist', { credentials: 'include' })
       const data = await response.json()
       if (data.status === 'success') setWatchlist(data.data || [])
-    } catch (error) {
-    }
+    } catch (_error) {}
   }
 
   const loadCatalog = async () => {
@@ -581,8 +664,7 @@ export default function Historify() {
       const response = await fetch('/historify/api/catalog', { credentials: 'include' })
       const data = await response.json()
       if (data.status === 'success') setCatalog(data.data || [])
-    } catch (error) {
-    }
+    } catch (_error) {}
   }
 
   const loadIntervals = async () => {
@@ -590,8 +672,7 @@ export default function Historify() {
       const response = await fetch('/historify/api/intervals', { credentials: 'include' })
       const data = await response.json()
       if (data.status === 'success') setIntervals(data.data)
-    } catch (error) {
-    }
+    } catch (_error) {}
   }
 
   const loadHistorifyIntervals = async () => {
@@ -602,11 +683,10 @@ export default function Historify() {
         setHistorifyIntervals({
           storage_intervals: data.storage_intervals,
           computed_intervals: data.computed_intervals,
-          all_intervals: data.all_intervals
+          all_intervals: data.all_intervals,
         })
       }
-    } catch (error) {
-    }
+    } catch (_error) {}
   }
 
   const loadStats = async () => {
@@ -614,8 +694,7 @@ export default function Historify() {
       const response = await fetch('/historify/api/stats', { credentials: 'include' })
       const data = await response.json()
       if (data.status === 'success') setStats(data.data)
-    } catch (error) {
-    }
+    } catch (_error) {}
   }
 
   const loadExchanges = async () => {
@@ -623,8 +702,7 @@ export default function Historify() {
       const response = await fetch('/historify/api/exchanges', { credentials: 'include' })
       const data = await response.json()
       if (data.status === 'success' && data.data?.length > 0) setExchanges(data.data)
-    } catch (error) {
-    }
+    } catch (_error) {}
   }
 
   const loadJobs = async () => {
@@ -633,7 +711,7 @@ export default function Historify() {
       const response = await fetch('/historify/api/jobs?limit=50', { credentials: 'include' })
       const data = await response.json()
       if (data.status === 'success') setJobs(data.data || [])
-    } catch (error) {
+    } catch (_error) {
     } finally {
       setJobsLoading(false)
     }
@@ -646,7 +724,7 @@ export default function Historify() {
       const response = await fetch('/historify/api/schedules', { credentials: 'include' })
       const data = await response.json()
       if (data.status === 'success') setSchedules(data.data || [])
-    } catch (error) {
+    } catch (_error) {
     } finally {
       setSchedulesLoading(false)
     }
@@ -654,13 +732,14 @@ export default function Historify() {
 
   const loadScheduleExecutions = async (scheduleId: string) => {
     try {
-      const response = await fetch(`/historify/api/schedules/${scheduleId}/executions?limit=10`, { credentials: 'include' })
+      const response = await fetch(`/historify/api/schedules/${scheduleId}/executions?limit=10`, {
+        credentials: 'include',
+      })
       const data = await response.json()
       if (data.status === 'success') {
         setScheduleExecutions((prev) => ({ ...prev, [scheduleId]: data.data || [] }))
       }
-    } catch (error) {
-    }
+    } catch (_error) {}
   }
 
   const resetScheduleForm = () => {
@@ -737,7 +816,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to save schedule', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to save schedule', 'historify')
     } finally {
       setIsCreatingSchedule(false)
@@ -759,7 +838,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to delete schedule', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to delete schedule', 'historify')
     }
   }
@@ -780,7 +859,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to toggle schedule', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to toggle schedule', 'historify')
     }
   }
@@ -801,7 +880,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to pause/resume schedule', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to pause/resume schedule', 'historify')
     }
   }
@@ -822,7 +901,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to trigger schedule', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to trigger schedule', 'historify')
     }
   }
@@ -832,12 +911,24 @@ export default function Historify() {
       return <Badge variant="secondary">Disabled</Badge>
     }
     if (schedule.is_paused) {
-      return <Badge variant="outline" className="border-yellow-500 text-yellow-600">Paused</Badge>
+      return (
+        <Badge variant="outline" className="border-yellow-500 text-yellow-600">
+          Paused
+        </Badge>
+      )
     }
     if (schedule.status === 'running') {
-      return <Badge variant="default" className="bg-blue-500">Running</Badge>
+      return (
+        <Badge variant="default" className="bg-blue-500">
+          Running
+        </Badge>
+      )
     }
-    return <Badge variant="default" className="bg-green-500">Active</Badge>
+    return (
+      <Badge variant="default" className="bg-green-500">
+        Active
+      </Badge>
+    )
   }
 
   const formatScheduleFrequency = (schedule: Schedule) => {
@@ -860,7 +951,7 @@ export default function Historify() {
       const data = await response.json()
       setSearchResults((data.results || []).slice(0, 10))
       setShowSearchResults(true)
-    } catch (error) {
+    } catch (_error) {
       setSearchResults([])
     }
   }
@@ -888,7 +979,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to add symbol', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to add symbol', 'historify')
     }
   }
@@ -910,7 +1001,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to remove symbol', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to remove symbol', 'historify')
     }
   }
@@ -930,6 +1021,7 @@ export default function Historify() {
     }
 
     setIsBulkAdding(true)
+    setBulkAddFailures([])
     try {
       const csrfToken = await fetchCSRFToken()
       const response = await fetch('/historify/api/watchlist/bulk', {
@@ -940,15 +1032,37 @@ export default function Historify() {
       })
       const data = await response.json()
       if (data.status === 'success') {
-        showToast.success(`Added ${data.added} symbols`, 'historify')
-        setBulkAddDialogOpen(false)
-        setBulkAddText('')
-        loadWatchlist()
-        loadStats()
+        const failed: BulkAddFailure[] = data.failed ?? []
+        const renamed: BulkAddRename[] = data.renamed ?? []
+
+        let summary = `Added ${data.added} symbol${data.added === 1 ? '' : 's'}`
+        if (data.skipped > 0) summary += `, ${data.skipped} already in watchlist`
+        const renamedNote =
+          renamed.length > 0
+            ? `Added as: ${renamed.map((r) => `${r.from} as ${r.to}`).join(', ')}`
+            : undefined
+
+        if (failed.length === 0) {
+          showToast.success(summary, 'historify', { description: renamedNote })
+          setBulkAddDialogOpen(false)
+          setBulkAddText('')
+        } else {
+          // Keep the dialog open with only the symbols that were not added,
+          // so they can be corrected and sent again.
+          showToast.warning(`${summary}. ${failed.length} not added.`, 'historify', {
+            description: renamedNote,
+          })
+          setBulkAddFailures(failed)
+          setBulkAddText(failed.map((f) => `${f.symbol},${f.exchange}`).join('\n'))
+        }
+        if (data.added > 0) {
+          loadWatchlist()
+          loadStats()
+        }
       } else {
         showToast.error(data.message || 'Failed to bulk add symbols', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to bulk add symbols', 'historify')
     } finally {
       setIsBulkAdding(false)
@@ -1017,7 +1131,10 @@ export default function Historify() {
   // }
 
   // Job operations
-  const createDownloadJob = async (symbols: { symbol: string; exchange: string }[], jobType: string = 'custom') => {
+  const createDownloadJob = async (
+    symbols: { symbol: string; exchange: string }[],
+    jobType: string = 'custom'
+  ) => {
     if (symbols.length === 0) {
       showToast.warning('No symbols selected', 'historify')
       return
@@ -1045,7 +1162,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to create job', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to create job', 'historify')
     }
   }
@@ -1074,7 +1191,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to pause job', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to pause job', 'historify')
     }
   }
@@ -1094,7 +1211,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to resume job', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to resume job', 'historify')
     }
   }
@@ -1114,7 +1231,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to cancel job', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to cancel job', 'historify')
     }
   }
@@ -1134,7 +1251,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to retry job', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to retry job', 'historify')
     }
   }
@@ -1157,7 +1274,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to delete job', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to delete job', 'historify')
     }
   }
@@ -1181,7 +1298,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to delete data', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to delete data', 'historify')
     } finally {
       setDeleteDialogOpen(false)
@@ -1214,7 +1331,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to delete data', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to delete data', 'historify')
     } finally {
       setIsBulkDeleting(false)
@@ -1246,7 +1363,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to remove from watchlist', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to remove from watchlist', 'historify')
     } finally {
       setIsBulkWatchlistDeleting(false)
@@ -1303,7 +1420,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to upload data', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to upload CSV', 'historify')
     } finally {
       setIsUploading(false)
@@ -1315,12 +1432,13 @@ export default function Historify() {
     setIsExporting(true)
     try {
       const csrfToken = await fetchCSRFToken()
-      const symbols = exportSymbols === 'selected'
-        ? Array.from(catalogSelectedSymbols).map((key) => {
-            const [symbol, exchange] = key.split(':')
-            return { symbol, exchange }
-          })
-        : null  // null means export all symbols
+      const symbols =
+        exportSymbols === 'selected'
+          ? Array.from(catalogSelectedSymbols).map((key) => {
+              const [symbol, exchange] = key.split(':')
+              return { symbol, exchange }
+            })
+          : null // null means export all symbols
 
       // Convert Set to array for API
       const intervalsArray = Array.from(exportIntervals)
@@ -1330,9 +1448,9 @@ export default function Historify() {
         headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
         credentials: 'include',
         body: JSON.stringify({
-          format: exportFormat === 'csv' && intervalsArray.length > 1 ? 'zip' : exportFormat,  // Force ZIP if multiple intervals
+          format: exportFormat === 'csv' && intervalsArray.length > 1 ? 'zip' : exportFormat, // Force ZIP if multiple intervals
           symbols,
-          intervals: intervalsArray,  // Pass multiple intervals
+          intervals: intervalsArray, // Pass multiple intervals
           compression: 'zstd',
         }),
       })
@@ -1344,7 +1462,7 @@ export default function Historify() {
       } else {
         showToast.error(data.message || 'Failed to export data', 'historify')
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to export data', 'historify')
     } finally {
       setIsExporting(false)
@@ -1374,13 +1492,20 @@ export default function Historify() {
 
   const getJobStatusColor = (status: string) => {
     switch (status) {
-      case 'running': return 'bg-blue-500'
-      case 'paused': return 'bg-yellow-500'
-      case 'completed': return 'bg-green-500'
-      case 'completed_with_errors': return 'bg-orange-500'
-      case 'failed': return 'bg-red-500'
-      case 'cancelled': return 'bg-gray-500'
-      default: return 'bg-gray-400'
+      case 'running':
+        return 'bg-blue-500'
+      case 'paused':
+        return 'bg-yellow-500'
+      case 'completed':
+        return 'bg-green-500'
+      case 'completed_with_errors':
+        return 'bg-orange-500'
+      case 'failed':
+        return 'bg-red-500'
+      case 'cancelled':
+        return 'bg-gray-500'
+      default:
+        return 'bg-gray-400'
     }
   }
 
@@ -1416,7 +1541,9 @@ export default function Historify() {
             <Database className="h-6 w-6 text-primary" />
             <div>
               <h1 className="text-lg font-semibold">Historify</h1>
-              <p className="text-xs text-muted-foreground hidden sm:block">Historical Data Management</p>
+              <p className="text-xs text-muted-foreground hidden sm:block">
+                Historical Data Management
+              </p>
             </div>
           </div>
 
@@ -1456,8 +1583,14 @@ export default function Historify() {
               )}
               onClick={handleModeToggle}
             >
-              {appMode === 'live' ? <Zap className="h-3 w-3 mr-1" /> : <BarChart3 className="h-3 w-3 mr-1" />}
-              <span className="hidden sm:inline">{appMode === 'live' ? 'Live Mode' : 'Analyze Mode'}</span>
+              {appMode === 'live' ? (
+                <Zap className="h-3 w-3 mr-1" />
+              ) : (
+                <BarChart3 className="h-3 w-3 mr-1" />
+              )}
+              <span className="hidden sm:inline">
+                {appMode === 'live' ? 'Live Mode' : 'Analyze Mode'}
+              </span>
               <span className="sm:hidden">{appMode === 'live' ? 'Live' : 'Analyze'}</span>
             </Badge>
 
@@ -1469,6 +1602,7 @@ export default function Historify() {
               onClick={handleModeToggle}
               disabled={isTogglingMode}
               title={`Switch to ${appMode === 'live' ? 'Analyze' : 'Live'} mode`}
+              aria-label={`Switch to ${appMode === 'live' ? 'Analyze' : 'Live'} mode`}
             >
               {isTogglingMode ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -1487,6 +1621,7 @@ export default function Historify() {
               onClick={toggleMode}
               disabled={appMode !== 'live'}
               title={mode === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}
+              aria-label={mode === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}
             >
               {mode === 'light' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </Button>
@@ -1522,6 +1657,7 @@ export default function Historify() {
                   variant="ghost"
                   size="icon"
                   className="h-8 w-8 rounded-full bg-primary text-primary-foreground"
+                  aria-label="Open profile menu"
                 >
                   <span className="text-sm font-medium">
                     {user?.username?.[0]?.toUpperCase() || 'O'}
@@ -1581,7 +1717,9 @@ export default function Historify() {
                 <span className="hidden sm:inline">Watchlist</span>
                 <span className="sm:hidden">Watch</span>
                 {watchlist.length > 0 && (
-                  <Badge variant="secondary" className="ml-1 h-5 min-w-5 text-xs">{watchlist.length}</Badge>
+                  <Badge variant="secondary" className="ml-1 h-5 min-w-5 text-xs">
+                    {watchlist.length}
+                  </Badge>
                 )}
               </TabsTrigger>
               <TabsTrigger value="scheduler" className="gap-1.5 data-[state=active]:bg-muted">
@@ -1641,7 +1779,9 @@ export default function Historify() {
                                 }}
                               >
                                 <div className="font-medium">{result.symbol}</div>
-                                <div className="text-xs text-muted-foreground">{result.name} - {result.exchange}</div>
+                                <div className="text-xs text-muted-foreground">
+                                  {result.name} - {result.exchange}
+                                </div>
                               </div>
                             ))}
                           </div>
@@ -1653,7 +1793,9 @@ export default function Historify() {
                         </SelectTrigger>
                         <SelectContent>
                           {exchanges.map((ex) => (
-                            <SelectItem key={ex} value={ex}>{ex}</SelectItem>
+                            <SelectItem key={ex} value={ex}>
+                              {ex}
+                            </SelectItem>
                           ))}
                         </SelectContent>
                       </Select>
@@ -1661,7 +1803,12 @@ export default function Historify() {
                         <Plus className="h-4 w-4 mr-1" />
                         Add to Watchlist
                       </Button>
-                      <Button variant="outline" onClick={() => setBulkAddDialogOpen(true)} className="h-9" size="sm">
+                      <Button
+                        variant="outline"
+                        onClick={() => setBulkAddDialogOpen(true)}
+                        className="h-9"
+                        size="sm"
+                      >
                         <ListPlus className="h-4 w-4 mr-1" />
                         Bulk
                       </Button>
@@ -1677,13 +1824,17 @@ export default function Historify() {
                         <Input
                           placeholder="Filter symbols..."
                           value={catalogFilter.search}
-                          onChange={(e) => setCatalogFilter((prev) => ({ ...prev, search: e.target.value }))}
+                          onChange={(e) =>
+                            setCatalogFilter((prev) => ({ ...prev, search: e.target.value }))
+                          }
                           className="h-9"
                         />
                       </div>
                       <Select
                         value={catalogFilter.exchange || '__all__'}
-                        onValueChange={(v) => setCatalogFilter((prev) => ({ ...prev, exchange: v }))}
+                        onValueChange={(v) =>
+                          setCatalogFilter((prev) => ({ ...prev, exchange: v }))
+                        }
                       >
                         <SelectTrigger className="w-full sm:w-32 h-9">
                           <SelectValue placeholder="Exchange" />
@@ -1691,21 +1842,30 @@ export default function Historify() {
                         <SelectContent>
                           <SelectItem value="__all__">All</SelectItem>
                           {exchanges.map((ex) => (
-                            <SelectItem key={ex} value={ex}>{ex}</SelectItem>
+                            <SelectItem key={ex} value={ex}>
+                              {ex}
+                            </SelectItem>
                           ))}
                         </SelectContent>
                       </Select>
                       <Select
                         value={catalogFilter.interval || '__all__'}
-                        onValueChange={(v) => setCatalogFilter((prev) => ({ ...prev, interval: v }))}
+                        onValueChange={(v) =>
+                          setCatalogFilter((prev) => ({ ...prev, interval: v }))
+                        }
                       >
-                        <SelectTrigger className="w-full sm:w-32 h-9" title="Filter symbols that have this interval">
+                        <SelectTrigger
+                          className="w-full sm:w-32 h-9"
+                          title="Filter symbols that have this interval"
+                        >
                           <SelectValue placeholder="Has Interval" />
                         </SelectTrigger>
                         <SelectContent>
                           <SelectItem value="__all__">All Intervals</SelectItem>
                           {(historifyIntervals?.storage_intervals || ['1m', 'D']).map((int) => (
-                            <SelectItem key={int} value={int}>Has {int}</SelectItem>
+                            <SelectItem key={int} value={int}>
+                              Has {int}
+                            </SelectItem>
                           ))}
                         </SelectContent>
                       </Select>
@@ -1731,7 +1891,12 @@ export default function Historify() {
                           <FileDown className="h-4 w-4 mr-1" />
                           Export
                         </Button>
-                        <Button variant="outline" size="sm" onClick={() => setUploadDialogOpen(true)} className="h-9">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setUploadDialogOpen(true)}
+                          className="h-9"
+                        >
                           <Upload className="h-4 w-4 mr-1" />
                           Import
                         </Button>
@@ -1748,10 +1913,17 @@ export default function Historify() {
                         <TableRow>
                           <TableHead className="w-10">
                             <Checkbox
-                              checked={catalogSelectedSymbols.size === filteredGroupedCatalog.length && filteredGroupedCatalog.length > 0}
+                              checked={
+                                catalogSelectedSymbols.size === filteredGroupedCatalog.length &&
+                                filteredGroupedCatalog.length > 0
+                              }
                               onCheckedChange={(checked) => {
                                 if (checked) {
-                                  setCatalogSelectedSymbols(new Set(filteredGroupedCatalog.map((c) => `${c.symbol}:${c.exchange}`)))
+                                  setCatalogSelectedSymbols(
+                                    new Set(
+                                      filteredGroupedCatalog.map((c) => `${c.symbol}:${c.exchange}`)
+                                    )
+                                  )
                                 } else {
                                   setCatalogSelectedSymbols(new Set())
                                 }
@@ -1761,7 +1933,9 @@ export default function Historify() {
                           <TableHead>Symbol</TableHead>
                           <TableHead className="hidden sm:table-cell">Exchange</TableHead>
                           <TableHead>Available Intervals</TableHead>
-                          <TableHead className="text-right hidden sm:table-cell">Total Records</TableHead>
+                          <TableHead className="text-right hidden sm:table-cell">
+                            Total Records
+                          </TableHead>
                           <TableHead className="hidden md:table-cell">Date Range</TableHead>
                           <TableHead className="w-20"></TableHead>
                         </TableRow>
@@ -1769,7 +1943,10 @@ export default function Historify() {
                       <TableBody>
                         {filteredGroupedCatalog.length === 0 ? (
                           <TableRow>
-                            <TableCell colSpan={7} className="text-center py-8 text-muted-foreground">
+                            <TableCell
+                              colSpan={7}
+                              className="text-center py-8 text-muted-foreground"
+                            >
                               No data available. Add symbols to watchlist and download data.
                             </TableCell>
                           </TableRow>
@@ -1778,8 +1955,12 @@ export default function Historify() {
                             <TableRow key={`${item.symbol}-${item.exchange}`}>
                               <TableCell>
                                 <Checkbox
-                                  checked={catalogSelectedSymbols.has(`${item.symbol}:${item.exchange}`)}
-                                  onCheckedChange={() => toggleCatalogSymbol(item.symbol, item.exchange)}
+                                  checked={catalogSelectedSymbols.has(
+                                    `${item.symbol}:${item.exchange}`
+                                  )}
+                                  onCheckedChange={() =>
+                                    toggleCatalogSymbol(item.symbol, item.exchange)
+                                  }
                                 />
                               </TableCell>
                               <TableCell className="font-medium">
@@ -1798,7 +1979,13 @@ export default function Historify() {
                                   {item.intervals.map((int) => (
                                     <Badge
                                       key={int.interval}
-                                      variant={int.interval === '1m' ? 'default' : int.interval === 'D' ? 'secondary' : 'outline'}
+                                      variant={
+                                        int.interval === '1m'
+                                          ? 'default'
+                                          : int.interval === 'D'
+                                            ? 'secondary'
+                                            : 'outline'
+                                      }
                                       className="text-xs cursor-pointer hover:bg-primary/80"
                                       title={`${int.record_count.toLocaleString()} records (${int.first_date} - ${int.last_date})`}
                                       onClick={() => {
@@ -1807,12 +1994,18 @@ export default function Historify() {
                                       }}
                                     >
                                       {int.interval}
-                                      <span className="ml-1 opacity-70">{int.record_count > 1000 ? `${Math.round(int.record_count/1000)}k` : int.record_count}</span>
+                                      <span className="ml-1 opacity-70">
+                                        {int.record_count > 1000
+                                          ? `${Math.round(int.record_count / 1000)}k`
+                                          : int.record_count}
+                                      </span>
                                     </Badge>
                                   ))}
                                 </div>
                               </TableCell>
-                              <TableCell className="text-right hidden sm:table-cell">{item.total_records.toLocaleString()}</TableCell>
+                              <TableCell className="text-right hidden sm:table-cell">
+                                {item.total_records.toLocaleString()}
+                              </TableCell>
                               <TableCell className="hidden md:table-cell text-muted-foreground text-sm">
                                 {item.earliest_date} - {item.latest_date}
                               </TableCell>
@@ -1823,8 +2016,11 @@ export default function Historify() {
                                     size="icon"
                                     className="h-7 w-7"
                                     asChild
+                                    aria-label={`View ${item.symbol} chart`}
                                   >
-                                    <Link to={`/historify/charts/${item.symbol}?exchange=${item.exchange}&interval=${item.intervals[0]?.interval || 'D'}`}>
+                                    <Link
+                                      to={`/historify/charts/${item.symbol}?exchange=${item.exchange}&interval=${item.intervals[0]?.interval || 'D'}`}
+                                    >
                                       <LineChart className="h-3.5 w-3.5" />
                                     </Link>
                                   </Button>
@@ -1833,9 +2029,13 @@ export default function Historify() {
                                     size="icon"
                                     className="h-7 w-7 text-destructive hover:text-destructive"
                                     onClick={() => {
-                                      setDeleteTarget({ symbol: item.symbol, exchange: item.exchange })
+                                      setDeleteTarget({
+                                        symbol: item.symbol,
+                                        exchange: item.exchange,
+                                      })
                                       setDeleteDialogOpen(true)
                                     }}
+                                    aria-label={`Delete ${item.symbol} from watchlist`}
                                   >
                                     <Trash2 className="h-3.5 w-3.5" />
                                   </Button>
@@ -1877,7 +2077,9 @@ export default function Historify() {
                               }}
                             >
                               <div className="font-medium">{result.symbol}</div>
-                              <div className="text-xs text-muted-foreground">{result.name} - {result.exchange}</div>
+                              <div className="text-xs text-muted-foreground">
+                                {result.name} - {result.exchange}
+                              </div>
                             </div>
                           ))}
                         </div>
@@ -1889,7 +2091,9 @@ export default function Historify() {
                       </SelectTrigger>
                       <SelectContent>
                         {exchanges.map((ex) => (
-                          <SelectItem key={ex} value={ex}>{ex}</SelectItem>
+                          <SelectItem key={ex} value={ex}>
+                            {ex}
+                          </SelectItem>
                         ))}
                       </SelectContent>
                     </Select>
@@ -1897,7 +2101,11 @@ export default function Historify() {
                       <Plus className="h-4 w-4 mr-1" />
                       Add
                     </Button>
-                    <Button variant="outline" onClick={() => setBulkAddDialogOpen(true)} className="h-9">
+                    <Button
+                      variant="outline"
+                      onClick={() => setBulkAddDialogOpen(true)}
+                      className="h-9"
+                    >
                       <ListPlus className="h-4 w-4 mr-1" />
                       Bulk
                     </Button>
@@ -1919,18 +2127,21 @@ export default function Historify() {
                     <div className="space-y-4">
                       {/* Date Range Quick Buttons */}
                       <div>
-                        <Label className="text-sm text-muted-foreground mb-2 block">Quick Date Range</Label>
+                        <Label className="text-sm text-muted-foreground mb-2 block">
+                          Quick Date Range
+                        </Label>
                         <div className="flex flex-wrap gap-2">
                           {DATE_PRESETS.map((preset) => {
                             const isSelected = startDate === getDateFromPreset(preset.months)
                             return (
                               <Button
                                 key={preset.label}
-                                variant={isSelected ? "default" : "outline"}
+                                variant={isSelected ? 'default' : 'outline'}
                                 size="sm"
                                 className={cn(
-                                  "h-8 min-w-[3rem]",
-                                  isSelected && "ring-2 ring-primary ring-offset-2 ring-offset-background"
+                                  'h-8 min-w-[3rem]',
+                                  isSelected &&
+                                    'ring-2 ring-primary ring-offset-2 ring-offset-background'
                                 )}
                                 onClick={() => {
                                   setStartDate(getDateFromPreset(preset.months))
@@ -1990,7 +2201,9 @@ export default function Historify() {
                       <div className="flex items-center justify-between p-3 bg-muted/50 rounded-lg">
                         <div>
                           <Label className="font-medium">Incremental Download</Label>
-                          <p className="text-xs text-muted-foreground">Only download new data after last timestamp</p>
+                          <p className="text-xs text-muted-foreground">
+                            Only download new data after last timestamp
+                          </p>
                         </div>
                         <Switch
                           checked={incrementalDownload}
@@ -2007,7 +2220,9 @@ export default function Historify() {
                               downloadWatchlist()
                             } else {
                               const selectedSymbols = watchlist
-                                .filter((w) => watchlistSelectedSymbols.has(`${w.symbol}:${w.exchange}`))
+                                .filter((w) =>
+                                  watchlistSelectedSymbols.has(`${w.symbol}:${w.exchange}`)
+                                )
                                 .map((w) => ({ symbol: w.symbol, exchange: w.exchange }))
                               createDownloadJob(selectedSymbols, 'watchlist')
                             }
@@ -2017,8 +2232,7 @@ export default function Historify() {
                           <DownloadCloud className="h-4 w-4 mr-2" />
                           {watchlistSelectedSymbols.size > 0
                             ? `Download Selected (${watchlistSelectedSymbols.size})`
-                            : `Download All (${watchlist.length})`
-                          }
+                            : `Download All (${watchlist.length})`}
                         </Button>
                         {watchlistSelectedSymbols.size > 0 && (
                           <Button
@@ -2062,11 +2276,15 @@ export default function Historify() {
                             if (watchlistSelectedSymbols.size === watchlist.length) {
                               setWatchlistSelectedSymbols(new Set())
                             } else {
-                              setWatchlistSelectedSymbols(new Set(watchlist.map((w) => `${w.symbol}:${w.exchange}`)))
+                              setWatchlistSelectedSymbols(
+                                new Set(watchlist.map((w) => `${w.symbol}:${w.exchange}`))
+                              )
                             }
                           }}
                         >
-                          {watchlistSelectedSymbols.size === watchlist.length ? 'Deselect All' : 'Select All'}
+                          {watchlistSelectedSymbols.size === watchlist.length
+                            ? 'Deselect All'
+                            : 'Select All'}
                         </Button>
                       </div>
                     </div>
@@ -2078,10 +2296,15 @@ export default function Historify() {
                           <TableRow>
                             <TableHead className="w-10">
                               <Checkbox
-                                checked={watchlistSelectedSymbols.size === watchlist.length && watchlist.length > 0}
+                                checked={
+                                  watchlistSelectedSymbols.size === watchlist.length &&
+                                  watchlist.length > 0
+                                }
                                 onCheckedChange={(checked) => {
                                   if (checked) {
-                                    setWatchlistSelectedSymbols(new Set(watchlist.map((w) => `${w.symbol}:${w.exchange}`)))
+                                    setWatchlistSelectedSymbols(
+                                      new Set(watchlist.map((w) => `${w.symbol}:${w.exchange}`))
+                                    )
                                   } else {
                                     setWatchlistSelectedSymbols(new Set())
                                   }
@@ -2097,7 +2320,10 @@ export default function Historify() {
                         <TableBody>
                           {watchlist.length === 0 ? (
                             <TableRow>
-                              <TableCell colSpan={5} className="text-center py-12 text-muted-foreground">
+                              <TableCell
+                                colSpan={5}
+                                className="text-center py-12 text-muted-foreground"
+                              >
                                 <Target className="h-12 w-12 mx-auto mb-4 opacity-50" />
                                 <p>No symbols in watchlist</p>
                                 <p className="text-sm mt-1">Add symbols using the search above</p>
@@ -2108,12 +2334,15 @@ export default function Historify() {
                               <TableRow
                                 key={item.id}
                                 className={cn(
-                                  watchlistSelectedSymbols.has(`${item.symbol}:${item.exchange}`) && "bg-muted/50"
+                                  watchlistSelectedSymbols.has(`${item.symbol}:${item.exchange}`) &&
+                                    'bg-muted/50'
                                 )}
                               >
                                 <TableCell>
                                   <Checkbox
-                                    checked={watchlistSelectedSymbols.has(`${item.symbol}:${item.exchange}`)}
+                                    checked={watchlistSelectedSymbols.has(
+                                      `${item.symbol}:${item.exchange}`
+                                    )}
                                     onCheckedChange={() => {
                                       setWatchlistSelectedSymbols((prev) => {
                                         const next = new Set(prev)
@@ -2127,7 +2356,9 @@ export default function Historify() {
                                 </TableCell>
                                 <TableCell className="font-medium">
                                   {item.symbol}
-                                  <span className="sm:hidden text-xs text-muted-foreground ml-1">({item.exchange})</span>
+                                  <span className="sm:hidden text-xs text-muted-foreground ml-1">
+                                    ({item.exchange})
+                                  </span>
                                 </TableCell>
                                 <TableCell className="hidden sm:table-cell">
                                   <Badge variant="outline">{item.exchange}</Badge>
@@ -2143,8 +2374,11 @@ export default function Historify() {
                                       className="h-7 w-7"
                                       asChild
                                       title="View chart"
+                                      aria-label="View chart"
                                     >
-                                      <Link to={`/historify/charts/${item.symbol}?exchange=${item.exchange}&interval=D`}>
+                                      <Link
+                                        to={`/historify/charts/${item.symbol}?exchange=${item.exchange}&interval=D`}
+                                      >
                                         <LineChart className="h-4 w-4" />
                                       </Link>
                                     </Button>
@@ -2152,8 +2386,11 @@ export default function Historify() {
                                       variant="ghost"
                                       size="icon"
                                       className="h-7 w-7 text-destructive hover:text-destructive"
-                                      onClick={() => removeFromWatchlist(item.symbol, item.exchange)}
+                                      onClick={() =>
+                                        removeFromWatchlist(item.symbol, item.exchange)
+                                      }
                                       title="Remove from watchlist"
+                                      aria-label={`Remove ${item.symbol} from watchlist`}
                                     >
                                       <X className="h-4 w-4" />
                                     </Button>
@@ -2179,7 +2416,7 @@ export default function Historify() {
                     <div className="flex items-center justify-between">
                       <CardTitle className="text-base">Download Jobs</CardTitle>
                       <Button variant="outline" size="sm" onClick={loadJobs} disabled={jobsLoading}>
-                        <RefreshCw className={cn("h-4 w-4 mr-1", jobsLoading && "animate-spin")} />
+                        <RefreshCw className={cn('h-4 w-4 mr-1', jobsLoading && 'animate-spin')} />
                         Refresh
                       </Button>
                     </div>
@@ -2196,17 +2433,37 @@ export default function Historify() {
                         <div className="divide-y divide-border">
                           {jobs.map((job) => {
                             const progress = jobProgress[job.id]
-                            const percent = progress?.percent || (job.total_symbols > 0 ? Math.round((job.completed_symbols / job.total_symbols) * 100) : 0)
+                            const percent =
+                              progress?.percent ||
+                              (job.total_symbols > 0
+                                ? Math.round((job.completed_symbols / job.total_symbols) * 100)
+                                : 0)
 
                             return (
                               <div key={job.id} className="p-4 hover:bg-muted/50 transition-colors">
                                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                                   <div className="flex-1 min-w-0">
                                     <div className="flex items-center gap-2 mb-1">
-                                      <div className={cn("w-2 h-2 rounded-full", getJobStatusColor(job.status))} />
+                                      <div
+                                        className={cn(
+                                          'w-2 h-2 rounded-full',
+                                          getJobStatusColor(job.status)
+                                        )}
+                                      />
                                       <span className="font-medium truncate">Job {job.id}</span>
-                                      <Badge variant="outline" className="text-xs">{job.job_type}</Badge>
-                                      <Badge variant={job.status === 'running' ? 'default' : job.status === 'paused' ? 'secondary' : 'outline'} className="text-xs">
+                                      <Badge variant="outline" className="text-xs">
+                                        {job.job_type}
+                                      </Badge>
+                                      <Badge
+                                        variant={
+                                          job.status === 'running'
+                                            ? 'default'
+                                            : job.status === 'paused'
+                                              ? 'secondary'
+                                              : 'outline'
+                                        }
+                                        className="text-xs"
+                                      >
                                         {job.status}
                                       </Badge>
                                     </div>
@@ -2224,7 +2481,9 @@ export default function Historify() {
                                           {job.failed_symbols}
                                         </span>
                                       )}
-                                      <span className="text-muted-foreground">/ {job.total_symbols} total</span>
+                                      <span className="text-muted-foreground">
+                                        / {job.total_symbols} total
+                                      </span>
                                     </div>
                                     {(job.status === 'running' || job.status === 'paused') && (
                                       <div className="mt-2">
@@ -2242,32 +2501,61 @@ export default function Historify() {
                                   <div className="flex items-center gap-2">
                                     {job.status === 'running' && (
                                       <>
-                                        <Button variant="outline" size="sm" onClick={() => pauseJob(job.id)}>
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          onClick={() => pauseJob(job.id)}
+                                        >
                                           <Pause className="h-4 w-4" />
                                         </Button>
-                                        <Button variant="outline" size="sm" className="text-destructive" onClick={() => cancelJob(job.id)}>
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          className="text-destructive"
+                                          onClick={() => cancelJob(job.id)}
+                                        >
                                           <Square className="h-4 w-4" />
                                         </Button>
                                       </>
                                     )}
                                     {job.status === 'paused' && (
                                       <>
-                                        <Button variant="outline" size="sm" onClick={() => resumeJob(job.id)}>
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          onClick={() => resumeJob(job.id)}
+                                        >
                                           <Play className="h-4 w-4" />
                                         </Button>
-                                        <Button variant="outline" size="sm" className="text-destructive" onClick={() => cancelJob(job.id)}>
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          className="text-destructive"
+                                          onClick={() => cancelJob(job.id)}
+                                        >
                                           <Square className="h-4 w-4" />
                                         </Button>
                                       </>
                                     )}
-                                    {(job.status === 'completed_with_errors' || job.status === 'failed') && job.failed_symbols > 0 && (
-                                      <Button variant="outline" size="sm" onClick={() => retryJob(job.id)}>
-                                        <RefreshCw className="h-4 w-4 mr-1" />
-                                        Retry
-                                      </Button>
-                                    )}
+                                    {(job.status === 'completed_with_errors' ||
+                                      job.status === 'failed') &&
+                                      job.failed_symbols > 0 && (
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          onClick={() => retryJob(job.id)}
+                                        >
+                                          <RefreshCw className="h-4 w-4 mr-1" />
+                                          Retry
+                                        </Button>
+                                      )}
                                     {job.status !== 'running' && job.status !== 'paused' && (
-                                      <Button variant="ghost" size="sm" className="text-destructive" onClick={() => deleteJob(job.id)}>
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="text-destructive"
+                                        onClick={() => deleteJob(job.id)}
+                                      >
                                         <Trash2 className="h-4 w-4" />
                                       </Button>
                                     )}
@@ -2291,7 +2579,9 @@ export default function Historify() {
                 <div className="flex items-center justify-between">
                   <div>
                     <h2 className="text-lg font-semibold">Scheduled Downloads</h2>
-                    <p className="text-sm text-muted-foreground">Automate data downloads on a schedule</p>
+                    <p className="text-sm text-muted-foreground">
+                      Automate data downloads on a schedule
+                    </p>
                   </div>
                   <Button onClick={() => openScheduleDialog()}>
                     <Plus className="h-4 w-4 mr-1" />
@@ -2321,7 +2611,9 @@ export default function Historify() {
                                 <div className="flex items-center gap-2 mb-1">
                                   <h3 className="font-medium">{schedule.name}</h3>
                                   {getScheduleStatusBadge(schedule)}
-                                  <Badge variant="outline">{schedule.data_interval === '1m' ? '1 Min' : 'Daily'}</Badge>
+                                  <Badge variant="outline">
+                                    {schedule.data_interval === '1m' ? '1 Min' : 'Daily'}
+                                  </Badge>
                                 </div>
                                 <p className="text-sm text-muted-foreground">
                                   {formatScheduleFrequency(schedule)}
@@ -2329,12 +2621,19 @@ export default function Historify() {
                                 </p>
                                 <div className="flex items-center gap-4 mt-2 text-xs text-muted-foreground">
                                   {schedule.next_run_at && (
-                                    <span>Next: {new Date(schedule.next_run_at).toLocaleString()}</span>
+                                    <span>
+                                      Next: {new Date(schedule.next_run_at).toLocaleString()}
+                                    </span>
                                   )}
                                   {schedule.last_run_at && (
-                                    <span>Last: {new Date(schedule.last_run_at).toLocaleString()}</span>
+                                    <span>
+                                      Last: {new Date(schedule.last_run_at).toLocaleString()}
+                                    </span>
                                   )}
-                                  <span>Runs: {schedule.total_runs} ({schedule.successful_runs} ok, {schedule.failed_runs} failed)</span>
+                                  <span>
+                                    Runs: {schedule.total_runs} ({schedule.successful_runs} ok,{' '}
+                                    {schedule.failed_runs} failed)
+                                  </span>
                                 </div>
                               </div>
                               <div className="flex items-center gap-1">
@@ -2342,7 +2641,9 @@ export default function Historify() {
                                 <Switch
                                   checked={schedule.is_enabled}
                                   onCheckedChange={() => handleToggleScheduleEnabled(schedule)}
-                                  title={schedule.is_enabled ? 'Disable schedule' : 'Enable schedule'}
+                                  title={
+                                    schedule.is_enabled ? 'Disable schedule' : 'Enable schedule'
+                                  }
                                 />
                                 {/* Pause/Resume */}
                                 {schedule.is_enabled && (
@@ -2352,8 +2653,15 @@ export default function Historify() {
                                     className="h-8 w-8"
                                     onClick={() => handlePauseResumeSchedule(schedule)}
                                     title={schedule.is_paused ? 'Resume' : 'Pause'}
+                                    aria-label={
+                                      schedule.is_paused ? 'Resume schedule' : 'Pause schedule'
+                                    }
                                   >
-                                    {schedule.is_paused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}
+                                    {schedule.is_paused ? (
+                                      <Play className="h-4 w-4" />
+                                    ) : (
+                                      <Pause className="h-4 w-4" />
+                                    )}
                                   </Button>
                                 )}
                                 {/* Trigger Now */}
@@ -2364,6 +2672,7 @@ export default function Historify() {
                                   onClick={() => handleTriggerSchedule(schedule.id)}
                                   disabled={!schedule.is_enabled || schedule.status === 'running'}
                                   title="Run now"
+                                  aria-label="Run schedule now"
                                 >
                                   <Zap className="h-4 w-4" />
                                 </Button>
@@ -2374,6 +2683,7 @@ export default function Historify() {
                                   className="h-8 w-8"
                                   onClick={() => openScheduleDialog(schedule)}
                                   title="Edit"
+                                  aria-label="Edit schedule"
                                 >
                                   <Settings className="h-4 w-4" />
                                 </Button>
@@ -2391,8 +2701,17 @@ export default function Historify() {
                                     }
                                   }}
                                   title="View history"
+                                  aria-label={
+                                    expandedSchedule === schedule.id
+                                      ? 'Collapse schedule details'
+                                      : 'Expand schedule details'
+                                  }
                                 >
-                                  {expandedSchedule === schedule.id ? <X className="h-4 w-4" /> : <BarChart3 className="h-4 w-4" />}
+                                  {expandedSchedule === schedule.id ? (
+                                    <X className="h-4 w-4" />
+                                  ) : (
+                                    <BarChart3 className="h-4 w-4" />
+                                  )}
                                 </Button>
                                 {/* Delete */}
                                 <Button
@@ -2401,6 +2720,7 @@ export default function Historify() {
                                   className="h-8 w-8 text-destructive hover:text-destructive"
                                   onClick={() => handleDeleteSchedule(schedule.id)}
                                   title="Delete"
+                                  aria-label="Delete schedule"
                                 >
                                   <Trash2 className="h-4 w-4" />
                                 </Button>
@@ -2411,7 +2731,8 @@ export default function Historify() {
                             {expandedSchedule === schedule.id && (
                               <div className="mt-4 pt-4 border-t border-border">
                                 <h4 className="text-sm font-medium mb-2">Recent Executions</h4>
-                                {!scheduleExecutions[schedule.id] || scheduleExecutions[schedule.id].length === 0 ? (
+                                {!scheduleExecutions[schedule.id] ||
+                                scheduleExecutions[schedule.id].length === 0 ? (
                                   <p className="text-sm text-muted-foreground">No executions yet</p>
                                 ) : (
                                   <Table>
@@ -2432,8 +2753,20 @@ export default function Historify() {
                                           </TableCell>
                                           <TableCell>
                                             <Badge
-                                              variant={exec.status === 'completed' ? 'default' : exec.status === 'running' ? 'secondary' : 'destructive'}
-                                              className={exec.status === 'completed' ? 'bg-green-500' : exec.status === 'running' ? 'bg-blue-500' : ''}
+                                              variant={
+                                                exec.status === 'completed'
+                                                  ? 'default'
+                                                  : exec.status === 'running'
+                                                    ? 'secondary'
+                                                    : 'destructive'
+                                              }
+                                              className={
+                                                exec.status === 'completed'
+                                                  ? 'bg-green-500'
+                                                  : exec.status === 'running'
+                                                    ? 'bg-blue-500'
+                                                    : ''
+                                              }
                                             >
                                               {exec.status}
                                             </Badge>
@@ -2441,7 +2774,9 @@ export default function Historify() {
                                           <TableCell className="text-right text-sm">
                                             {exec.symbols_success}/{exec.symbols_processed}
                                             {exec.symbols_failed > 0 && (
-                                              <span className="text-destructive ml-1">({exec.symbols_failed} failed)</span>
+                                              <span className="text-destructive ml-1">
+                                                ({exec.symbols_failed} failed)
+                                              </span>
                                             )}
                                           </TableCell>
                                           <TableCell className="text-right text-sm">
@@ -2470,15 +2805,20 @@ export default function Historify() {
       </div>
 
       {/* Schedule Dialog */}
-      <Dialog open={scheduleDialogOpen} onOpenChange={(open) => {
-        setScheduleDialogOpen(open)
-        if (!open) resetScheduleForm()
-      }}>
+      <Dialog
+        open={scheduleDialogOpen}
+        onOpenChange={(open) => {
+          setScheduleDialogOpen(open)
+          if (!open) resetScheduleForm()
+        }}
+      >
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>{editingSchedule ? 'Edit Schedule' : 'Create Schedule'}</DialogTitle>
             <DialogDescription>
-              {editingSchedule ? 'Update schedule configuration' : 'Set up automated data downloads'}
+              {editingSchedule
+                ? 'Update schedule configuration'
+                : 'Set up automated data downloads'}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
@@ -2503,7 +2843,10 @@ export default function Historify() {
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <Label>Schedule Type</Label>
-                <Select value={scheduleType} onValueChange={(v) => setScheduleType(v as 'interval' | 'daily')}>
+                <Select
+                  value={scheduleType}
+                  onValueChange={(v) => setScheduleType(v as 'interval' | 'daily')}
+                >
                   <SelectTrigger className="mt-1">
                     <SelectValue />
                   </SelectTrigger>
@@ -2515,7 +2858,10 @@ export default function Historify() {
               </div>
               <div>
                 <Label>Data Interval</Label>
-                <Select value={scheduleDataInterval} onValueChange={(v) => setScheduleDataInterval(v as '1m' | 'D')}>
+                <Select
+                  value={scheduleDataInterval}
+                  onValueChange={(v) => setScheduleDataInterval(v as '1m' | 'D')}
+                >
                   <SelectTrigger className="mt-1">
                     <SelectValue />
                   </SelectTrigger>
@@ -2531,7 +2877,10 @@ export default function Historify() {
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <Label>Every</Label>
-                  <Select value={String(scheduleIntervalValue)} onValueChange={(v) => setScheduleIntervalValue(parseInt(v))}>
+                  <Select
+                    value={String(scheduleIntervalValue)}
+                    onValueChange={(v) => setScheduleIntervalValue(parseInt(v, 10))}
+                  >
                     <SelectTrigger className="mt-1">
                       <SelectValue />
                     </SelectTrigger>
@@ -2545,7 +2894,10 @@ export default function Historify() {
                 </div>
                 <div>
                   <Label>Unit</Label>
-                  <Select value={scheduleIntervalUnit} onValueChange={(v) => setScheduleIntervalUnit(v as 'minutes' | 'hours')}>
+                  <Select
+                    value={scheduleIntervalUnit}
+                    onValueChange={(v) => setScheduleIntervalUnit(v as 'minutes' | 'hours')}
+                  >
                     <SelectTrigger className="mt-1">
                       <SelectValue />
                     </SelectTrigger>
@@ -2569,13 +2921,15 @@ export default function Historify() {
                     onValueChange={(v) => {
                       const [h, m] = scheduleTimeOfDay.split(':').map(Number)
                       const isPM = h >= 12
-                      let newHour = parseInt(v)
+                      let newHour = parseInt(v, 10)
                       if (isPM) {
                         newHour = newHour === 12 ? 12 : newHour + 12
                       } else {
                         newHour = newHour === 12 ? 0 : newHour
                       }
-                      setScheduleTimeOfDay(`${newHour.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`)
+                      setScheduleTimeOfDay(
+                        `${newHour.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`
+                      )
                     }}
                   >
                     <SelectTrigger className="w-20">
@@ -2583,7 +2937,9 @@ export default function Historify() {
                     </SelectTrigger>
                     <SelectContent>
                       {[12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map((h) => (
-                        <SelectItem key={h} value={h.toString()}>{h}</SelectItem>
+                        <SelectItem key={h} value={h.toString()}>
+                          {h}
+                        </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
@@ -2600,12 +2956,14 @@ export default function Historify() {
                     </SelectTrigger>
                     <SelectContent>
                       {['00', '15', '30', '45'].map((m) => (
-                        <SelectItem key={m} value={m}>{m}</SelectItem>
+                        <SelectItem key={m} value={m}>
+                          {m}
+                        </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
                   <Select
-                    value={parseInt(scheduleTimeOfDay.split(':')[0]) >= 12 ? 'PM' : 'AM'}
+                    value={parseInt(scheduleTimeOfDay.split(':')[0], 10) >= 12 ? 'PM' : 'AM'}
                     onValueChange={(v) => {
                       const [h, m] = scheduleTimeOfDay.split(':').map(Number)
                       const hour12 = h === 0 ? 12 : h > 12 ? h - 12 : h
@@ -2615,7 +2973,9 @@ export default function Historify() {
                       } else {
                         newHour = hour12 === 12 ? 0 : hour12
                       }
-                      setScheduleTimeOfDay(`${newHour.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`)
+                      setScheduleTimeOfDay(
+                        `${newHour.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`
+                      )
                     }}
                   >
                     <SelectTrigger className="w-20">
@@ -2637,17 +2997,22 @@ export default function Historify() {
                 min="1"
                 max="30"
                 value={scheduleLookbackDays}
-                onChange={(e) => setScheduleLookbackDays(parseInt(e.target.value) || 1)}
+                onChange={(e) => setScheduleLookbackDays(parseInt(e.target.value, 10) || 1)}
                 className="mt-1"
               />
-              <p className="text-xs text-muted-foreground mt-1">Incremental download from watchlist. Lookback used only for new symbols.</p>
+              <p className="text-xs text-muted-foreground mt-1">
+                Incremental download from watchlist. Lookback used only for new symbols.
+              </p>
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => {
-              setScheduleDialogOpen(false)
-              resetScheduleForm()
-            }}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setScheduleDialogOpen(false)
+                resetScheduleForm()
+              }}
+            >
               Cancel
             </Button>
             <Button onClick={handleCreateOrUpdateSchedule} disabled={isCreatingSchedule}>
@@ -2659,22 +3024,57 @@ export default function Historify() {
       </Dialog>
 
       {/* Bulk Add Dialog */}
-      <Dialog open={bulkAddDialogOpen} onOpenChange={setBulkAddDialogOpen}>
+      <Dialog
+        open={bulkAddDialogOpen}
+        onOpenChange={(open) => {
+          setBulkAddDialogOpen(open)
+          if (!open) setBulkAddFailures([])
+        }}
+      >
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>Bulk Add Symbols</DialogTitle>
-            <DialogDescription>Add multiple symbols at once. One per line: SYMBOL,EXCHANGE</DialogDescription>
+            <DialogDescription>
+              Add multiple symbols at once. One per line: SYMBOL,EXCHANGE
+            </DialogDescription>
           </DialogHeader>
           <Textarea
             placeholder="RELIANCE,NSE
-INFY,NSE
+M&M,NSE
+BAJAJ-AUTO,NSE
 NIFTY24DEC25000CE,NFO"
             value={bulkAddText}
             onChange={(e) => setBulkAddText(e.target.value)}
             rows={8}
           />
+          {bulkAddFailures.length > 0 && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">
+              <p className="font-medium text-destructive">
+                {bulkAddFailures.length} symbol{bulkAddFailures.length === 1 ? ' was' : 's were'}{' '}
+                not added. Correct them above and add again.
+              </p>
+              <ul className="mt-2 max-h-32 space-y-1 overflow-y-auto text-muted-foreground">
+                {bulkAddFailures.map((f) => (
+                  <li key={`${f.symbol}:${f.exchange}`}>
+                    <span className="font-mono text-foreground">
+                      {f.symbol},{f.exchange}
+                    </span>
+                    : {f.error}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <DialogFooter>
-            <Button variant="outline" onClick={() => setBulkAddDialogOpen(false)}>Cancel</Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setBulkAddDialogOpen(false)
+                setBulkAddFailures([])
+              }}
+            >
+              Cancel
+            </Button>
             <Button onClick={handleBulkAdd} disabled={isBulkAdding}>
               {isBulkAdding && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
               Add Symbols
@@ -2709,7 +3109,9 @@ NIFTY24DEC25000CE,NFO"
                   </SelectTrigger>
                   <SelectContent>
                     {exchanges.map((ex) => (
-                      <SelectItem key={ex} value={ex}>{ex}</SelectItem>
+                      <SelectItem key={ex} value={ex}>
+                        {ex}
+                      </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
@@ -2746,15 +3148,21 @@ NIFTY24DEC25000CE,NFO"
                 <p className="text-sm text-muted-foreground mt-1">Selected: {uploadFile.name}</p>
               )}
               <p className="text-xs text-muted-foreground mt-2">
-                Download sample: {' '}
-                <a href="/historify/api/sample/csv" className="text-primary hover:underline">CSV</a>
+                Download sample:{' '}
+                <a href="/historify/api/sample/csv" className="text-primary hover:underline">
+                  CSV
+                </a>
                 {' | '}
-                <a href="/historify/api/sample/parquet" className="text-primary hover:underline">Parquet</a>
+                <a href="/historify/api/sample/parquet" className="text-primary hover:underline">
+                  Parquet
+                </a>
               </p>
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setUploadDialogOpen(false)}>Cancel</Button>
+            <Button variant="outline" onClick={() => setUploadDialogOpen(false)}>
+              Cancel
+            </Button>
             <Button onClick={uploadCSVData} disabled={isUploading}>
               {isUploading && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
               Upload
@@ -2817,8 +3225,10 @@ NIFTY24DEC25000CE,NFO"
                     <div
                       key={int}
                       className={cn(
-                        "flex flex-col items-center p-2 rounded-lg border cursor-pointer transition-colors",
-                        isSelected ? "bg-primary text-primary-foreground border-primary" : "bg-muted/50 hover:bg-muted"
+                        'flex flex-col items-center p-2 rounded-lg border cursor-pointer transition-colors',
+                        isSelected
+                          ? 'bg-primary text-primary-foreground border-primary'
+                          : 'bg-muted/50 hover:bg-muted'
                       )}
                       onClick={() => {
                         setExportIntervals((prev) => {
@@ -2831,7 +3241,7 @@ NIFTY24DEC25000CE,NFO"
                     >
                       <Checkbox
                         checked={isSelected}
-                        className={cn("mb-1", isSelected && "border-primary-foreground")}
+                        className={cn('mb-1', isSelected && 'border-primary-foreground')}
                         onClick={(e) => e.stopPropagation()}
                         onCheckedChange={() => {
                           setExportIntervals((prev) => {
@@ -2843,7 +3253,12 @@ NIFTY24DEC25000CE,NFO"
                         }}
                       />
                       <span className="font-medium text-sm">{int}</span>
-                      <span className={cn("text-[10px]", isSelected ? "opacity-80" : "text-muted-foreground")}>
+                      <span
+                        className={cn(
+                          'text-[10px]',
+                          isSelected ? 'opacity-80' : 'text-muted-foreground'
+                        )}
+                      >
                         {isComputed ? 'Computed' : 'Stored'}
                       </span>
                     </div>
@@ -2864,7 +3279,12 @@ NIFTY24DEC25000CE,NFO"
                     className="h-8 w-14 text-center"
                     placeholder="1"
                   />
-                  <Select value={customExportUnit} onValueChange={(v) => setCustomExportUnit(v as 'm' | 'h' | 'W' | 'M' | 'Q' | 'Y')}>
+                  <Select
+                    value={customExportUnit}
+                    onValueChange={(v) =>
+                      setCustomExportUnit(v as 'm' | 'h' | 'W' | 'M' | 'Q' | 'Y')
+                    }
+                  >
                     <SelectTrigger className="w-20 h-8">
                       <SelectValue />
                     </SelectTrigger>
@@ -2882,7 +3302,7 @@ NIFTY24DEC25000CE,NFO"
                     size="sm"
                     className="h-8"
                     onClick={() => {
-                      const val = parseInt(customExportValue) || 1
+                      const val = parseInt(customExportValue, 10) || 1
                       // For W, M, Q, Y with value 1, just use the unit
                       let customInterval: string
                       if (['W', 'M', 'Q', 'Y'].includes(customExportUnit)) {
@@ -2900,24 +3320,31 @@ NIFTY24DEC25000CE,NFO"
                   </Button>
                 </div>
                 {/* Show added custom intervals */}
-                {Array.from(exportIntervals).filter(int => !['1m', '5m', '15m', '30m', '1h', 'D', 'W', 'M', 'Q', 'Y'].includes(int)).length > 0 && (
+                {Array.from(exportIntervals).filter(
+                  (int) => !['1m', '5m', '15m', '30m', '1h', 'D', 'W', 'M', 'Q', 'Y'].includes(int)
+                ).length > 0 && (
                   <div className="flex flex-wrap gap-1 mt-2">
-                    {Array.from(exportIntervals).filter(int => !['1m', '5m', '15m', '30m', '1h', 'D', 'W', 'M', 'Q', 'Y'].includes(int)).map(int => (
-                      <Badge
-                        key={int}
-                        variant="secondary"
-                        className="cursor-pointer hover:bg-destructive hover:text-destructive-foreground"
-                        onClick={() => {
-                          setExportIntervals((prev) => {
-                            const next = new Set(prev)
-                            next.delete(int)
-                            return next
-                          })
-                        }}
-                      >
-                        {int} <X className="h-3 w-3 ml-1" />
-                      </Badge>
-                    ))}
+                    {Array.from(exportIntervals)
+                      .filter(
+                        (int) =>
+                          !['1m', '5m', '15m', '30m', '1h', 'D', 'W', 'M', 'Q', 'Y'].includes(int)
+                      )
+                      .map((int) => (
+                        <Badge
+                          key={int}
+                          variant="secondary"
+                          className="cursor-pointer hover:bg-destructive hover:text-destructive-foreground"
+                          onClick={() => {
+                            setExportIntervals((prev) => {
+                              const next = new Set(prev)
+                              next.delete(int)
+                              return next
+                            })
+                          }}
+                        >
+                          {int} <X className="h-3 w-3 ml-1" />
+                        </Badge>
+                      ))}
                   </div>
                 )}
               </div>
@@ -2927,7 +3354,11 @@ NIFTY24DEC25000CE,NFO"
             <div>
               <div className="flex items-center justify-between mb-2">
                 <Label className="text-sm">
-                  {exportSymbols === 'selected' ? 'Selected Symbols' : 'All Symbols'} ({exportSymbols === 'selected' ? catalogSelectedSymbols.size : groupedCatalog.length})
+                  {exportSymbols === 'selected' ? 'Selected Symbols' : 'All Symbols'} (
+                  {exportSymbols === 'selected'
+                    ? catalogSelectedSymbols.size
+                    : groupedCatalog.length}
+                  )
                 </Label>
                 {exportSymbols === 'selected' && (
                   <div className="flex gap-2">
@@ -2936,7 +3367,9 @@ NIFTY24DEC25000CE,NFO"
                       size="sm"
                       className="h-6 text-xs"
                       onClick={() => {
-                        const allKeys = groupedCatalog.map(item => `${item.symbol}:${item.exchange}`)
+                        const allKeys = groupedCatalog.map(
+                          (item) => `${item.symbol}:${item.exchange}`
+                        )
                         setCatalogSelectedSymbols(new Set(allKeys))
                       }}
                     >
@@ -2962,9 +3395,14 @@ NIFTY24DEC25000CE,NFO"
                     if (exportSymbols === 'all') {
                       // Show all symbols (no selection UI in "all" mode)
                       return (
-                        <div key={key} className="flex items-center justify-between text-sm py-1 border-b border-border/50 last:border-0">
+                        <div
+                          key={key}
+                          className="flex items-center justify-between text-sm py-1 border-b border-border/50 last:border-0"
+                        >
                           <span className="font-medium">{item.symbol}</span>
-                          <Badge variant="outline" className="text-xs">{item.exchange}</Badge>
+                          <Badge variant="outline" className="text-xs">
+                            {item.exchange}
+                          </Badge>
                         </div>
                       )
                     } else {
@@ -2973,8 +3411,8 @@ NIFTY24DEC25000CE,NFO"
                         <div
                           key={key}
                           className={cn(
-                            "flex items-center gap-2 text-sm py-1.5 px-2 rounded cursor-pointer transition-colors border-b border-border/50 last:border-0",
-                            isSelected ? "bg-primary/10" : "hover:bg-muted/50"
+                            'flex items-center gap-2 text-sm py-1.5 px-2 rounded cursor-pointer transition-colors border-b border-border/50 last:border-0',
+                            isSelected ? 'bg-primary/10' : 'hover:bg-muted/50'
                           )}
                           onClick={() => {
                             setCatalogSelectedSymbols((prev) => {
@@ -2998,7 +3436,9 @@ NIFTY24DEC25000CE,NFO"
                             onClick={(e) => e.stopPropagation()}
                           />
                           <span className="font-medium flex-1">{item.symbol}</span>
-                          <Badge variant="outline" className="text-xs">{item.exchange}</Badge>
+                          <Badge variant="outline" className="text-xs">
+                            {item.exchange}
+                          </Badge>
                         </div>
                       )
                     }
@@ -3012,7 +3452,10 @@ NIFTY24DEC25000CE,NFO"
               <div className="flex items-center justify-between text-sm">
                 <span className="text-muted-foreground">Export Summary:</span>
                 <span className="font-medium">
-                  {exportSymbols === 'selected' ? catalogSelectedSymbols.size : groupedCatalog.length} symbols x {exportIntervals.size} timeframe{exportIntervals.size !== 1 ? 's' : ''}
+                  {exportSymbols === 'selected'
+                    ? catalogSelectedSymbols.size
+                    : groupedCatalog.length}{' '}
+                  symbols x {exportIntervals.size} timeframe{exportIntervals.size !== 1 ? 's' : ''}
                 </span>
               </div>
               <div className="text-xs text-muted-foreground mt-1">
@@ -3021,10 +3464,16 @@ NIFTY24DEC25000CE,NFO"
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setExportDialogOpen(false)}>Cancel</Button>
+            <Button variant="outline" onClick={() => setExportDialogOpen(false)}>
+              Cancel
+            </Button>
             <Button
               onClick={handleBulkExport}
-              disabled={isExporting || exportIntervals.size === 0 || (exportSymbols === 'selected' && catalogSelectedSymbols.size === 0)}
+              disabled={
+                isExporting ||
+                exportIntervals.size === 0 ||
+                (exportSymbols === 'selected' && catalogSelectedSymbols.size === 0)
+              }
             >
               {isExporting && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
               Export ({exportIntervals.size} timeframe{exportIntervals.size !== 1 ? 's' : ''})
@@ -3039,13 +3488,16 @@ NIFTY24DEC25000CE,NFO"
           <AlertDialogHeader>
             <AlertDialogTitle>Delete Data</AlertDialogTitle>
             <AlertDialogDescription>
-              Are you sure you want to delete all data for {deleteTarget?.symbol} ({deleteTarget?.exchange})?
-              This action cannot be undone.
+              Are you sure you want to delete all data for {deleteTarget?.symbol} (
+              {deleteTarget?.exchange})? This action cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleDeleteData} className="bg-destructive text-destructive-foreground">
+            <AlertDialogAction
+              onClick={handleDeleteData}
+              className="bg-destructive text-destructive-foreground"
+            >
               Delete
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -3058,13 +3510,20 @@ NIFTY24DEC25000CE,NFO"
           <AlertDialogHeader>
             <AlertDialogTitle>Delete {catalogSelectedSymbols.size} Symbol(s)</AlertDialogTitle>
             <AlertDialogDescription>
-              Are you sure you want to delete all data for the selected symbols? This will remove all historical data for:
+              Are you sure you want to delete all data for the selected symbols? This will remove
+              all historical data for:
               <div className="mt-2 max-h-32 overflow-y-auto text-sm">
-                {Array.from(catalogSelectedSymbols).slice(0, 10).map((key) => (
-                  <div key={key} className="text-foreground">{key.replace(':', ' - ')}</div>
-                ))}
+                {Array.from(catalogSelectedSymbols)
+                  .slice(0, 10)
+                  .map((key) => (
+                    <div key={key} className="text-foreground">
+                      {key.replace(':', ' - ')}
+                    </div>
+                  ))}
                 {catalogSelectedSymbols.size > 10 && (
-                  <div className="text-muted-foreground">...and {catalogSelectedSymbols.size - 10} more</div>
+                  <div className="text-muted-foreground">
+                    ...and {catalogSelectedSymbols.size - 10} more
+                  </div>
                 )}
               </div>
               <div className="mt-2 font-medium text-destructive">This action cannot be undone.</div>
@@ -3091,21 +3550,34 @@ NIFTY24DEC25000CE,NFO"
       </AlertDialog>
 
       {/* Bulk Watchlist Delete Confirmation Dialog */}
-      <AlertDialog open={bulkWatchlistDeleteDialogOpen} onOpenChange={setBulkWatchlistDeleteDialogOpen}>
+      <AlertDialog
+        open={bulkWatchlistDeleteDialogOpen}
+        onOpenChange={setBulkWatchlistDeleteDialogOpen}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Remove {watchlistSelectedSymbols.size} Symbol(s) from Watchlist</AlertDialogTitle>
+            <AlertDialogTitle>
+              Remove {watchlistSelectedSymbols.size} Symbol(s) from Watchlist
+            </AlertDialogTitle>
             <AlertDialogDescription>
               Are you sure you want to remove the selected symbols from your watchlist?
               <div className="mt-2 max-h-32 overflow-y-auto text-sm">
-                {Array.from(watchlistSelectedSymbols).slice(0, 10).map((key) => (
-                  <div key={key} className="text-foreground">{key.replace(':', ' - ')}</div>
-                ))}
+                {Array.from(watchlistSelectedSymbols)
+                  .slice(0, 10)
+                  .map((key) => (
+                    <div key={key} className="text-foreground">
+                      {key.replace(':', ' - ')}
+                    </div>
+                  ))}
                 {watchlistSelectedSymbols.size > 10 && (
-                  <div className="text-muted-foreground">...and {watchlistSelectedSymbols.size - 10} more</div>
+                  <div className="text-muted-foreground">
+                    ...and {watchlistSelectedSymbols.size - 10} more
+                  </div>
                 )}
               </div>
-              <div className="mt-2 text-muted-foreground text-sm">This will not delete any downloaded historical data.</div>
+              <div className="mt-2 text-muted-foreground text-sm">
+                This will not delete any downloaded historical data.
+              </div>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

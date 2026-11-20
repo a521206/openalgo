@@ -5,10 +5,11 @@ from datetime import datetime
 
 import pandas as pd
 import requests
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from database.engine_factory import create_db_engine
 from extensions import socketio  # Import SocketIO
 from utils.logging import get_logger
 
@@ -17,7 +18,7 @@ logger = get_logger(__name__)
 
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
-engine = create_engine(DATABASE_URL)
+engine = create_db_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -54,8 +55,43 @@ def delete_symtoken_table():
     db_session.commit()
 
 
+def drop_incomplete_rows(df, exchange, required=("brsymbol", "name")):
+    """Drops rows that are missing the fields needed to build an OpenAlgo symbol.
+
+    Shoonya's symbol files carry placeholder rows that have a Token but blank
+    Symbol/TradingSymbol/Expiry columns (NFO_symbols.txt currently ships ~18 of
+    them at the top of the file). Left in place they reach the bulk insert as
+    NaN and trip the NOT NULL constraint on symtoken.brsymbol, which rolls back
+    the whole exchange rather than just the offending rows.
+
+    Args:
+        df: DataFrame with columns already renamed to the schema names.
+        exchange: Exchange name, used for logging only.
+        required: Columns that must be present and non-null.
+
+    Returns:
+        DataFrame containing only the usable rows.
+    """
+    subset = [column for column in required if column in df.columns]
+    if not subset:
+        return df
+
+    cleaned = df.dropna(subset=subset)
+    dropped = len(df) - len(cleaned)
+    if dropped:
+        logger.warning(
+            f"Skipping {dropped} incomplete {exchange} rows with blank {'/'.join(subset)}"
+        )
+    return cleaned.copy()
+
+
 def copy_from_dataframe(df):
     logger.info("Performing Bulk Insert")
+
+    # Final guard: symbol and brsymbol are NOT NULL, and one bad row aborts the
+    # entire transaction for that exchange. Never let one reach the insert.
+    df = df.dropna(subset=["symbol", "brsymbol"])
+
     # Convert DataFrame to a list of dictionaries
     data_dict = df.to_dict(orient="records")
 
@@ -85,6 +121,43 @@ def copy_from_dataframe(df):
         db_session.rollback()
 
 
+def replace_symtoken_table(frames):
+    """Swap the master contract in one transaction.
+
+    ``frames`` is a list of (segment, DataFrame). Rows with no symbol or
+    brsymbol, and a row whose (token, exchange) was already taken by an earlier
+    segment, are dropped, matching what the old per-segment copy_from_dataframe
+    calls produced. The delete and the insert commit together, so any failure
+    rolls back to the previous contract instead of leaving the table empty or
+    half-filled.
+    """
+    records = []
+    seen = set()
+    for segment, df in frames:
+        if df is None or df.empty:
+            raise RuntimeError(
+                f"The Shoonya {segment} symbol file had no usable rows. "
+                "Your existing symbols were kept; try the download again."
+            )
+        df = df.dropna(subset=["symbol", "brsymbol"])
+        rows = [
+            row
+            for row in df.to_dict(orient="records")
+            if (row["token"], row["exchange"]) not in seen
+        ]
+        seen.update((row["token"], row["exchange"]) for row in rows)
+        records.extend(rows)
+
+    try:
+        SymToken.query.delete()
+        db_session.bulk_insert_mappings(SymToken, records)
+        db_session.commit()
+        logger.info(f"Replaced symtoken table with {len(records)} records")
+    except Exception:
+        db_session.rollback()
+        raise
+
+
 # Define the shoonya URLs for downloading the symbol files
 shoonya_urls = {
     "NSE": "https://api.shoonya.com/NSE_symbols.txt.zip",
@@ -99,14 +172,20 @@ shoonya_urls = {
 def download_and_unzip_shoonya_data(output_path):
     """
     Downloads and unzips the shoonya text files to the tmp folder.
+
+    Raises if any file fails, so the caller never replaces the stored contract
+    with a partial set. Files left over from an earlier failed run are removed
+    first, so a failed download cannot be masked by yesterday's copy.
     """
     logger.info("Downloading and Unzipping shoonya Data")
 
     # Create the tmp directory if it doesn't exist
     if not os.path.exists(output_path):
         os.makedirs(output_path)
+    delete_shoonya_temp_data(output_path)
 
     downloaded_files = []
+    failed = []
 
     # Iterate through the shoonya URLs and download/unzip files
     for key, url in shoonya_urls.items():
@@ -125,8 +204,16 @@ def download_and_unzip_shoonya_data(output_path):
                 logger.error(
                     f"Failed to download {key} from {url}. Status code: {response.status_code}"
                 )
+                failed.append(key)
         except Exception as e:
             logger.error(f"Error downloading {key} from {url}: {e}")
+            failed.append(key)
+
+    if failed:
+        raise RuntimeError(
+            f"Could not download the Shoonya symbol files for {', '.join(failed)}. "
+            "Your existing symbols were kept; try the download again."
+        )
 
     return downloaded_files
 
@@ -158,6 +245,9 @@ def process_shoonya_nse_data(output_path):
 
     # Rename columns to match your schema
     df.columns = ["exchange", "token", "lotsize", "name", "brsymbol", "instrumenttype", "tick_size"]
+
+    # Drop placeholder rows before any string transform runs on a NaN
+    df = drop_incomplete_rows(df, "NSE")
 
     # Add missing columns to ensure DataFrame matches the database structure
     df["symbol"] = df["brsymbol"]  # Initialize 'symbol' with 'brsymbol'
@@ -224,18 +314,20 @@ def process_shoonya_nse_data(output_path):
     )
 
     # Explicit overrides for NSE_INDEX symbols that don't follow simple concatenation
-    df_filtered.loc[nse_idx_mask, "symbol"] = df_filtered.loc[nse_idx_mask, "symbol"].replace({
-        # Major Indices
-        "NIFTY50": "NIFTY",
-        "NIFTYINDEX": "NIFTY",
-        "NIFTYBANK": "BANKNIFTY",
-        "NIFTYFIN": "FINNIFTY",
-        "NIFTYFINSERVICE": "FINNIFTY",
-        "NIFTYFINANCIALSERVICES": "FINNIFTY",
-        "NIFTYNEXT50": "NIFTYNXT50",
-        "NIFTYMIDSELECT": "MIDCPNIFTY",
-        "NIFTYMIDCAPSELECT": "MIDCPNIFTY",
-    })
+    df_filtered.loc[nse_idx_mask, "symbol"] = df_filtered.loc[nse_idx_mask, "symbol"].replace(
+        {
+            # Major Indices
+            "NIFTY50": "NIFTY",
+            "NIFTYINDEX": "NIFTY",
+            "NIFTYBANK": "BANKNIFTY",
+            "NIFTYFIN": "FINNIFTY",
+            "NIFTYFINSERVICE": "FINNIFTY",
+            "NIFTYFINANCIALSERVICES": "FINNIFTY",
+            "NIFTYNEXT50": "NIFTYNXT50",
+            "NIFTYMIDSELECT": "MIDCPNIFTY",
+            "NIFTYMIDCAPSELECT": "MIDCPNIFTY",
+        }
+    )
 
     # Return the processed DataFrame
     return df_filtered
@@ -279,6 +371,10 @@ def process_shoonya_nfo_data(output_path):
         "strike",
         "tick_size",
     ]
+
+    # Drop placeholder rows (blank Symbol/TradingSymbol) before they reach the
+    # insert as NaN and roll back the whole NFO transaction
+    df = drop_incomplete_rows(df, "NFO")
 
     # Add missing columns to ensure DataFrame matches the database structure
     df["expiry"] = df["expiry"].fillna("")  # Fill expiry with empty strings if missing
@@ -406,6 +502,9 @@ def process_shoonya_cds_data(output_path):
         df["token"] > 100
     ]  # Filter out CDS tokens with less than 100 digits to avioid dummy entries or index values that are not actual CDS tokens
 
+    # Drop placeholder rows before any string transform runs on a NaN
+    df = drop_incomplete_rows(df, "CDS")
+
     # Add missing columns to ensure DataFrame matches the database structure
     df["expiry"] = df["expiry"].fillna("")  # Fill expiry with empty strings if missing
     df["strike"] = df["strike"].fillna("-1")  # Fill strike with -1 if missing
@@ -428,9 +527,9 @@ def process_shoonya_cds_data(output_path):
 
     # Update instrumenttype to 'CE' or 'PE' based on the option type
     df["instrumenttype"] = df.apply(
-        lambda row: row["optiontype"]
-        if row["instrumenttype"] == "OPTCUR"
-        else row["instrumenttype"],
+        lambda row: (
+            row["optiontype"] if row["instrumenttype"] == "OPTCUR" else row["instrumenttype"]
+        ),
         axis=1,
     )
 
@@ -533,6 +632,9 @@ def process_shoonya_mcx_data(output_path):
         "tick_size",
     ]
 
+    # Drop placeholder rows before any string transform runs on a NaN
+    df = drop_incomplete_rows(df, "MCX")
+
     # Add missing columns to ensure DataFrame matches the database structure
     df["expiry"] = df["expiry"].fillna("")  # Fill expiry with empty strings if missing
     df["strike"] = df["strike"].fillna("-1")  # Fill strike with -1 if missing
@@ -555,9 +657,9 @@ def process_shoonya_mcx_data(output_path):
 
     # Update instrumenttype to 'CE' or 'PE' based on the option type
     df["instrumenttype"] = df.apply(
-        lambda row: row["optiontype"]
-        if row["instrumenttype"] == "OPTFUT"
-        else row["instrumenttype"],
+        lambda row: (
+            row["optiontype"] if row["instrumenttype"] == "OPTFUT" else row["instrumenttype"]
+        ),
         axis=1,
     )
 
@@ -643,6 +745,9 @@ def process_shoonya_bse_data(output_path):
 
     # Rename columns to match your schema
     df.columns = ["exchange", "token", "lotsize", "name", "brsymbol", "instrumenttype", "tick_size"]
+
+    # Drop placeholder rows before any string transform runs on a NaN
+    df = drop_incomplete_rows(df, "BSE")
 
     # Add missing columns to ensure DataFrame matches the database structure
     df["symbol"] = df["brsymbol"]  # Initialize 'symbol' with 'brsymbol'
@@ -781,6 +886,11 @@ def process_shoonya_bfo_data(output_path):
         "tick_size",
     ]
 
+    # BFO re-derives 'name' from the trading symbol, so only brsymbol is required.
+    # extract_name/extract_instrument_type would raise TypeError on a NaN and
+    # abort the entire master contract download.
+    df = drop_incomplete_rows(df, "BFO", required=("brsymbol",))
+
     # Add missing columns to ensure DataFrame matches the database structure
     df["expiry"] = df["expiry"].fillna("")  # Fill expiry with empty strings if missing
     df["strike"] = df["strike"].fillna("-1")  # Fill strike with -1 if missing
@@ -896,24 +1006,24 @@ def master_contract_download():
     """
     logger.info("Downloading shoonya Master Contract")
 
-    output_path = "tmp"
+    # A Shoonya-only folder: Zebu and TradeSmart are also Noren brokers whose
+    # files have the same names (NSE_symbols.txt, ...), and the cleanup removes
+    # every .txt, so sharing tmp/ would delete or overwrite their files.
+    output_path = os.path.join("tmp", "shoonya")
     try:
+        # Download and process every segment before touching the stored
+        # contract. A failure anywhere up to the swap leaves it unchanged.
         download_and_unzip_shoonya_data(output_path)
-        delete_symtoken_table()
 
-        # Process exchange data
-        token_df = process_shoonya_nse_data(output_path)
-        copy_from_dataframe(token_df)
-        token_df = process_shoonya_bse_data(output_path)
-        copy_from_dataframe(token_df)
-        token_df = process_shoonya_nfo_data(output_path)
-        copy_from_dataframe(token_df)
-        token_df = process_shoonya_cds_data(output_path)
-        copy_from_dataframe(token_df)
-        token_df = process_shoonya_mcx_data(output_path)
-        copy_from_dataframe(token_df)
-        token_df = process_shoonya_bfo_data(output_path)
-        copy_from_dataframe(token_df)
+        frames = [
+            ("NSE", process_shoonya_nse_data(output_path)),
+            ("BSE", process_shoonya_bse_data(output_path)),
+            ("NFO", process_shoonya_nfo_data(output_path)),
+            ("CDS", process_shoonya_cds_data(output_path)),
+            ("MCX", process_shoonya_mcx_data(output_path)),
+            ("BFO", process_shoonya_bfo_data(output_path)),
+        ]
+        replace_symtoken_table(frames)
 
         delete_shoonya_temp_data(output_path)
 
@@ -921,5 +1031,8 @@ def master_contract_download():
             "master_contract_download", {"status": "success", "message": "Successfully Downloaded"}
         )
     except Exception as e:
-        logger.info(f"{str(e)}")
-        return socketio.emit("master_contract_download", {"status": "error", "message": str(e)})
+        logger.exception(f"Shoonya master contract download failed: {e}")
+        socketio.emit("master_contract_download", {"status": "error", "message": str(e)})
+        # Raise so the shared caller (utils/auth_utils) records the download as
+        # failed; it ignores the return value and reports success otherwise.
+        raise
