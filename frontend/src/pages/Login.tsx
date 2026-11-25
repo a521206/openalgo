@@ -9,15 +9,43 @@ import {
   MessageCircle,
   ShieldCheck,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
+import { brokerConfigApi } from '@/api/broker-config'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { resumeBrokerSession, startBrokerLogin } from '@/lib/brokerProfiles'
 import { useAuthStore } from '@/stores/authStore'
 import { showToast } from '@/utils/toast'
+
+// With exactly one broker configured, open it directly: the broker's own
+// sign-in, or its dashboard when another device already has it logged in.
+// Nothing configured or several brokers configured still opens Select Broker,
+// where the trader picks one. Returns whether the browser has been sent
+// somewhere.
+async function openConfiguredBroker(): Promise<boolean> {
+  try {
+    const list = await brokerConfigApi.list()
+    const configured = list.brokers.filter((b) => b.configured)
+    if (configured.length !== 1) return false
+    const broker = configured[0]
+    if (list.logged_in === broker.id) {
+      if (await resumeBrokerSession()) return false
+      window.location.href = '/dashboard'
+      return true
+    }
+    if (list.logged_in) return false
+    const started = await startBrokerLogin(broker.id)
+    if (started.error !== undefined) return false
+    window.location.href = started.url
+    return true
+  } catch {
+    return false
+  }
+}
 
 export default function Login() {
   const navigate = useNavigate()
@@ -30,6 +58,9 @@ export default function Login() {
   const [isLoading, setIsLoading] = useState(false)
   const [isCheckingSetup, setIsCheckingSetup] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // The page-load check runs twice in development (StrictMode); starting the
+  // broker sign-in twice would leave two pending logins.
+  const autoOpenStarted = useRef(false)
 
   // Check if setup is required or already logged in on page load
   useEffect(() => {
@@ -63,7 +94,12 @@ export default function Login() {
             sessionData.authenticated &&
             !sessionData.logged_in
           ) {
-            // Logged in but no broker, go to broker selection
+            // Signed in to OpenAlgo but not to a broker: go straight to the
+            // only configured broker, or to Select Broker when there is a
+            // choice.
+            if (autoOpenStarted.current) return
+            autoOpenStarted.current = true
+            if (await openConfiguredBroker()) return
             navigate('/broker', { replace: true })
             return
           }
@@ -139,8 +175,12 @@ export default function Login() {
         // Set login state (broker from response if session was resumed, empty otherwise)
         setLogin(username, data.broker || '')
         showToast.success('Login successful', 'system')
-        // Use redirect from response if provided, otherwise go to broker
-        navigate(data.redirect || '/broker')
+        if (data.redirect) {
+          navigate(data.redirect)
+          return
+        }
+        if (await openConfiguredBroker()) return
+        navigate('/broker')
       }
     } catch (_err) {
       setError('Login failed. Please try again.')
@@ -191,7 +231,12 @@ export default function Login() {
 
       setLogin(username, data.broker || '')
       showToast.success('Login successful', 'system')
-      navigate(data.redirect || '/broker')
+      if (data.redirect) {
+        navigate(data.redirect)
+        return
+      }
+      if (await openConfiguredBroker()) return
+      navigate('/broker')
     } catch (_err) {
       setError('Failed to verify TOTP. Please try again.')
     } finally {
