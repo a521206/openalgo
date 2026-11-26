@@ -1,6 +1,7 @@
 import csv
 import io
 import os
+import time
 from importlib import import_module
 
 from flask import Blueprint, Response, jsonify, redirect, render_template, request, session, url_for
@@ -158,6 +159,7 @@ def generate_positions_csv(positions_data):
 @check_session_validity
 @limiter.limit(API_RATE_LIMIT)
 def orderbook():
+    request_started = time.perf_counter()
     login_username = session["user"]
     auth_token = get_auth_token(login_username)
 
@@ -193,7 +195,12 @@ def orderbook():
     order_data = data.get("orders", [])
     order_stats = data.get("statistics", {})
 
-    return render_template("orderbook.html", order_data=order_data, order_stats=order_stats)
+    response = render_template("orderbook.html", order_data=order_data, order_stats=order_stats)
+    logger.info(
+        "Orderbook page request timing total_ms=%.2f status=200",
+        (time.perf_counter() - request_started) * 1000,
+    )
+    return response
 
 
 @orders_bp.route("/tradebook")
