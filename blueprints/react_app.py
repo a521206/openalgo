@@ -5,15 +5,11 @@ Serves the pre-built React app for migrated routes.
 
 import mimetypes
 import os
-import time
 from pathlib import Path
 
 from flask import Blueprint, abort, request, send_file, send_from_directory
 
-from utils.logging import get_logger
-
 react_bp = Blueprint("react", __name__)
-logger = get_logger(__name__)
 
 # Pre-compressed encodings to negotiate, in preference order (best ratio first).
 # utils/precompress_assets.py writes <asset>.gz next to each hashed asset at
@@ -74,7 +70,6 @@ def is_react_frontend_available():
 
 def serve_react_app():
     """Serve the React app's index.html."""
-    request_started = time.perf_counter()
     if not is_react_frontend_available():
         return (
             """
@@ -102,12 +97,6 @@ npm run build</pre>
     # revalidate-before-use (not "don't store"); this is what lets 180k users
     # pick up frontend updates without ever clearing their cache.
     response.headers["Cache-Control"] = "no-cache"
-    if request.path in {"/", "/positions", "/orderbook"}:
-        logger.info(
-            "Page request timing path=%s total_ms=%.2f status=200",
-            request.path,
-            (time.perf_counter() - request_started) * 1000,
-        )
     return response
 
 

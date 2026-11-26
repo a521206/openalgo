@@ -1,5 +1,4 @@
 import importlib
-import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from database.auth_db import get_auth_token_broker
@@ -147,15 +146,7 @@ def get_orderbook_with_auth(
 
     try:
         # Get orderbook data using broker's implementation
-        broker_started = time.perf_counter()
-        try:
-            order_data = broker_funcs["get_order_book"](auth_token)
-        finally:
-            logger.info(
-                "Orderbook broker call broker=%s duration_ms=%.2f",
-                broker,
-                (time.perf_counter() - broker_started) * 1000,
-            )
+        order_data = broker_funcs["get_order_book"](auth_token)
 
         if "status" in order_data and order_data["status"] == "error":
             return (
