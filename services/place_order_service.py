@@ -1,9 +1,12 @@
 import copy
 import importlib
+import math
+from decimal import Decimal
 from typing import Any, Dict, Optional, Tuple
 
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
+from database.symbol import SymToken, db_session
 from events import AnalyzerErrorEvent, OrderFailedEvent, OrderPlacedEvent
 from restx_api.schemas import OrderSchema
 from services.quotes_service import get_quotes
@@ -13,6 +16,7 @@ from services.smart_trade_rules_service import (
     validate_against_smart_trade_rules,
 )
 from utils.broker_backpressure import BrokerBusyError
+from utils.config import get_execution_buffer
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -23,7 +27,6 @@ from utils.constants import (
 from utils.event_bus import bus
 from utils.httpx_client import UNANSWERED_ORDER_MESSAGE, watch_for_unanswered_writes
 from utils.logging import get_logger
-from utils.config import get_execution_buffer
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -51,22 +54,49 @@ def import_broker_module(broker_name: str) -> Any | None:
         return None
 
 
-def _discover_limit_price(order_data: dict[str, Any], original_data: dict[str, Any]) -> None:
+def _discover_limit_price(
+    order_data: dict[str, Any], original_data: dict[str, Any]
+) -> str | None:
     """Fill a zero-price LIMIT order from the current bid/ask quote."""
     if order_data.get("pricetype") != "LIMIT" or float(order_data.get("price", 0) or 0) != 0:
-        return
+        return None
     success, response, _ = get_quotes(
         symbol=order_data.get("symbol"),
         exchange=order_data.get("exchange"),
         api_key=original_data.get("apikey"),
     )
     if not success:
-        return
+        return None
     quote = response.get("data", {})
     action = order_data.get("action", "BUY").upper()
     reference = quote.get("ask" if action == "BUY" else "bid") or quote.get("ltp", 0)
     if reference and float(reference) > 0:
-        order_data["price"] = round(float(reference) * (1 + get_execution_buffer()), 2) if action == "BUY" else round(float(reference) * (1 - get_execution_buffer()), 2)
+        raw_price = (
+            float(reference) * (1 + get_execution_buffer())
+            if action == "BUY"
+            else float(reference) * (1 - get_execution_buffer())
+        )
+        tick_size = 0.0
+        symbol_info = (
+            db_session.query(SymToken)
+            .filter(
+                SymToken.symbol == order_data.get("symbol"),
+                SymToken.exchange == order_data.get("exchange"),
+            )
+            .first()
+        )
+        if not symbol_info or not symbol_info.tick_size or symbol_info.tick_size <= 0:
+            return (
+                f"Cannot discover a valid LIMIT price: tick size is unavailable for "
+                f"{order_data.get('symbol')} on {order_data.get('exchange')}"
+            )
+
+        tick_size = float(symbol_info.tick_size)
+        ratio = raw_price / tick_size
+        ticks = math.ceil(ratio - 1e-10) if action == "BUY" else math.floor(ratio + 1e-10)
+        decimals = max(0, -Decimal(str(tick_size)).as_tuple().exponent)
+        order_data["price"] = round(ticks * tick_size, decimals)
+    return None
 
 
 def _validate_smart_trade_rules(order_data: dict[str, Any], broker: str, auth_token: str) -> tuple[bool, str | None]:
@@ -265,7 +295,9 @@ def place_order_with_auth(
         )
         return False, error_response, 404
 
-    _discover_limit_price(order_data, original_data)
+    price_error = _discover_limit_price(order_data, original_data)
+    if price_error:
+        return False, {"status": "error", "message": price_error}, 400
 
     unanswered: list[str] = []
     try:
