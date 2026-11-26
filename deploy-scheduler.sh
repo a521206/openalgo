@@ -146,7 +146,7 @@ else
     # Replace eventlet with gthread and add config
     CONFIG_PATH="${OPENALGO_DIR}/gunicorn.conf.py"
     sudo sed -i \
-        -e "s/--worker-class eventlet/--worker-class gthread --threads 2/g" \
+        -e "s/--worker-class eventlet/--worker-class gthread --threads 64/g" \
         -e "s/app:app$/--config ${CONFIG_PATH} app:app/g" \
         "${FLASK_SERVICE_FILE}"
 

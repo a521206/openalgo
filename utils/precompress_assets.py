@@ -82,7 +82,7 @@ def _is_current(source: Path, variant: Path) -> bool:
         variant_stat = variant.stat()
     except OSError:
         return False
-    return variant_stat.st_size > 0 and variant_stat.st_mtime >= source.stat().st_mtime
+    return variant_stat.st_size > 0 and variant_stat.st_mtime_ns >= source.stat().st_mtime_ns
 
 
 def _remove_variant(variant: Path) -> bool:
