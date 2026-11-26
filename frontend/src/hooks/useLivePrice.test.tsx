@@ -16,16 +16,20 @@ import { useLivePrice } from './useLivePrice'
  * it.
  */
 const marketData = new Map<string, { data: { ltp: number }; lastUpdate: number }>()
+const marketDataCapture = vi.hoisted(() => ({ symbols: [] as Array<{ symbol: string; exchange: string }> }))
 
 vi.mock('./useMarketData', () => ({
-  useMarketData: () => ({
-    data: marketData,
-    isConnected: true,
-    isAuthenticated: true,
-    isPaused: false,
-    isFallbackMode: false,
-    error: null,
-  }),
+  useMarketData: ({ symbols }: { symbols: Array<{ symbol: string; exchange: string }> }) => {
+    marketDataCapture.symbols = symbols
+    return {
+      data: marketData,
+      isConnected: true,
+      isAuthenticated: true,
+      isPaused: false,
+      isFallbackMode: false,
+      error: null,
+    }
+  },
 }))
 
 vi.mock('./useMarketStatus', () => ({
@@ -73,6 +77,25 @@ describe('useLivePrice closed-position gate', () => {
 
     await waitFor(() => expect(result.current.data).toHaveLength(1))
     expect(result.current.data[0].ltp).toBe(1000)
+  })
+
+  it('subscribes only once per unique open symbol and skips closed positions', () => {
+    renderHook(() =>
+      useLivePrice(
+        [
+          { symbol: 'RELIANCE', exchange: 'NSE', quantity: 5 },
+          { symbol: 'RELIANCE', exchange: 'NSE', quantity: 2 },
+          { symbol: 'TCS', exchange: 'NSE', quantity: 0 },
+          { symbol: 'INFY', exchange: 'NSE' },
+        ],
+        { enabled: true, useMultiQuotesFallback: false }
+      )
+    )
+
+    expect(marketDataCapture.symbols).toEqual([
+      { symbol: 'RELIANCE', exchange: 'NSE' },
+      { symbol: 'INFY', exchange: 'NSE' },
+    ])
   })
 
   it('keeps realized P&L for a closed position with string-zero quantity', async () => {

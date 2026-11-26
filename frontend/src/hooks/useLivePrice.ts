@@ -102,11 +102,18 @@ export function useLivePrice<T extends PriceableItem>(
 
   // Extract symbols for WebSocket subscription
   const symbols = useMemo(
-    () =>
-      items.map((item) => ({
-        symbol: item.symbol,
-        exchange: item.exchange,
-      })),
+    () => {
+      const uniqueSymbols = new Map<string, { symbol: string; exchange: string }>()
+      for (const item of items) {
+        // Closed positions keep their realized values and do not need live quotes.
+        if (item.quantity !== undefined && Number(item.quantity) === 0) continue
+        const key = `${item.exchange}:${item.symbol}`
+        if (!uniqueSymbols.has(key)) {
+          uniqueSymbols.set(key, { symbol: item.symbol, exchange: item.exchange })
+        }
+      }
+      return Array.from(uniqueSymbols.values())
+    },
     [items]
   )
 
@@ -119,7 +126,7 @@ export function useLivePrice<T extends PriceableItem>(
   } = useMarketData({
     symbols,
     mode: 'LTP',
-    enabled: enabled && items.length > 0,
+    enabled: enabled && symbols.length > 0,
   })
 
   // Effective live status
@@ -129,15 +136,10 @@ export function useLivePrice<T extends PriceableItem>(
    * Fetch MultiQuotes data from API
    */
   const fetchMultiQuotes = useCallback(async () => {
-    if (!apiKey || items.length === 0 || !useMultiQuotesFallback) return
+    if (!apiKey || symbols.length === 0 || !useMultiQuotesFallback) return
 
     try {
-      const symbolsList = items.map((item) => ({
-        symbol: item.symbol,
-        exchange: item.exchange,
-      }))
-
-      const response = await tradingApi.getMultiQuotes(apiKey, symbolsList)
+      const response = await tradingApi.getMultiQuotes(apiKey, symbols)
 
       if (response.status === 'success' && response.results) {
         const quotesMap = new Map<string, QuotesData>()
@@ -152,12 +154,12 @@ export function useLivePrice<T extends PriceableItem>(
     } catch {
       // Silently fail - MultiQuotes is a fallback mechanism
     }
-  }, [apiKey, items, useMultiQuotesFallback])
+  }, [apiKey, symbols, useMultiQuotesFallback])
 
   // Fetch MultiQuotes on mount and when items change
   // Visibility-aware: pause polling when tab is hidden
   useEffect(() => {
-    if (!enabled || items.length === 0 || !useMultiQuotesFallback) return
+    if (!enabled || symbols.length === 0 || !useMultiQuotesFallback) return
 
     // Don't poll when hidden (if pauseWhenHidden is true)
     if (pauseWhenHidden && !isVisible) return
@@ -175,7 +177,7 @@ export function useLivePrice<T extends PriceableItem>(
     return () => clearInterval(interval)
   }, [
     enabled,
-    items.length,
+    symbols,
     useMultiQuotesFallback,
     fetchMultiQuotes,
     multiQuotesRefreshInterval,
