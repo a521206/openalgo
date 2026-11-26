@@ -1,4 +1,5 @@
 import importlib
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from database.auth_db import get_auth_token_broker
@@ -121,7 +122,15 @@ def get_positionbook_with_auth(
 
     try:
         # Get positions data using broker's implementation
-        positions_data = broker_funcs["get_positions"](auth_token)
+        broker_started = time.perf_counter()
+        try:
+            positions_data = broker_funcs["get_positions"](auth_token)
+        finally:
+            logger.info(
+                "Positionbook broker call broker=%s duration_ms=%.2f",
+                broker,
+                (time.perf_counter() - broker_started) * 1000,
+            )
 
         if "status" in positions_data and positions_data["status"] == "error":
             return (

@@ -1,4 +1,5 @@
 import os
+import time
 
 from flask import jsonify, make_response, request
 from flask_restx import Namespace, Resource
@@ -25,6 +26,7 @@ class Positionbook(Resource):
     @limiter.limit(API_RATE_LIMIT)
     def post(self):
         """Get position book details"""
+        request_started = time.perf_counter()
         try:
             # Validate request data
             positionbook_data = positionbook_schema.load(request.json)
@@ -34,11 +36,25 @@ class Positionbook(Resource):
             # Call the service function to get positionbook data with API key
             success, response_data, status_code = get_positionbook(api_key=api_key)
 
-            return make_response(jsonify(response_data), status_code)
+            response = make_response(jsonify(response_data), status_code)
+            logger.info(
+                "Positionbook request timing total_ms=%.2f status=%d",
+                (time.perf_counter() - request_started) * 1000,
+                status_code,
+            )
+            return response
 
         except ValidationError as err:
+            logger.info(
+                "Positionbook request timing total_ms=%.2f status=400",
+                (time.perf_counter() - request_started) * 1000,
+            )
             return make_response(jsonify({"status": "error", "message": err.messages}), 400)
         except Exception as e:
+            logger.info(
+                "Positionbook request timing total_ms=%.2f status=500",
+                (time.perf_counter() - request_started) * 1000,
+            )
             logger.exception(f"Unexpected error in positionbook endpoint: {e}")
             return make_response(
                 jsonify({"status": "error", "message": "An unexpected error occurred"}), 500
