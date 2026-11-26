@@ -3,11 +3,10 @@
 import csv
 import io
 import json
-
 from datetime import datetime
 
 import pytz
-from flask import Blueprint, Response, jsonify, redirect, render_template, request, session, url_for
+from flask import Blueprint, Response, jsonify, request, session
 from sqlalchemy import func
 
 from database.apilog_db import OrderLog
@@ -207,52 +206,23 @@ def generate_csv(logs):
         raise
 
 
-@log_bp.route("/")
+@log_bp.route("/api/data")
 @check_session_validity
-def view_logs():
-    try:
-        # Get parameters
-        start_date = request.args.get("start_date")
-        end_date = request.args.get("end_date")
-        search_query = request.args.get("search", "").strip()
-        page = int(request.args.get("page", 1))
-        per_page = 20
+def api_logs():
+    """Return filtered logs for the React monitoring page."""
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    search_query = request.args.get("search", "").strip()
+    page = int(request.args.get("page", 1))
 
-        # Get filtered logs
-        logs, total_pages, _ = get_filtered_logs(
-            start_date=start_date,
-            end_date=end_date,
-            search_query=search_query,
-            page=page,
-            per_page=per_page,
-        )
-
-        # If AJAX request, return JSON
-        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
-            return jsonify({"logs": logs, "total_pages": total_pages, "current_page": page})
-
-        logger.info(f"Found {len(logs)} log entries")
-        return render_template(
-            "logs.html",
-            logs=logs,
-            total_pages=total_pages,
-            current_page=page,
-            search_query=search_query,
-            start_date=start_date,
-            end_date=end_date,
-        )
-
-    except Exception as e:
-        logger.exception(f"Error in view_logs: {str(e)}")
-        return render_template(
-            "logs.html",
-            logs=[],
-            total_pages=1,
-            current_page=1,
-            search_query="",
-            start_date=None,
-            end_date=None,
-        )
+    logs, total_pages, _ = get_filtered_logs(
+        start_date=start_date,
+        end_date=end_date,
+        search_query=search_query,
+        page=page,
+        per_page=20,
+    )
+    return jsonify({"logs": logs, "total_pages": total_pages, "current_page": page})
 
 
 @log_bp.route("/export")

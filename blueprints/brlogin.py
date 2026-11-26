@@ -225,7 +225,7 @@ def _broker_callback(broker, para=None):
         # Already logged in to this broker: nothing to do here. A login to
         # another broker goes on: it is the switch the trader confirmed on
         # Select Broker, and it needs a login started there like any other.
-        return redirect(url_for("dashboard_bp.dashboard"))
+        return redirect("/dashboard")
 
     # A POST from OpenAlgo's own login form (PIN, password, TOTP) must carry
     # the page's CSRF token. The broker-site posts are checked below, by the

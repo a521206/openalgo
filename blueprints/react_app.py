@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from flask import Blueprint, abort, request, send_file, send_from_directory
+
 from utils.logging import get_logger
 
 react_bp = Blueprint("react", __name__)
@@ -233,12 +234,12 @@ def react_scalping():
 
 
 # Search pages
-@react_bp.route("/search/token")
+@react_bp.route("/search/token", strict_slashes=False)
 def react_search_token():
     return serve_react_app()
 
 
-@react_bp.route("/search")
+@react_bp.route("/search", strict_slashes=False)
 def react_search():
     return serve_react_app()
 
@@ -264,13 +265,13 @@ def react_trading():
 
 
 # Trading Platforms overview
-@react_bp.route("/platforms")
+@react_bp.route("/platforms", strict_slashes=False)
 def react_platforms():
     return serve_react_app()
 
 
 # TradingView webhook configuration
-@react_bp.route("/tradingview")
+@react_bp.route("/tradingview", strict_slashes=False)
 def react_tradingview():
     return serve_react_app()
 
@@ -307,7 +308,7 @@ def react_portfolio_analyzer():
 
 
 # GoCharting webhook configuration
-@react_bp.route("/gocharting")
+@react_bp.route("/gocharting", strict_slashes=False)
 def react_gocharting():
     return serve_react_app()
 
@@ -469,7 +470,7 @@ def react_sip_backtester_results():
 
 
 # WebSocket market data test page
-@react_bp.route("/websocket/test")
+@react_bp.route("/websocket/test", strict_slashes=False)
 def react_websocket_test():
     return serve_react_app()
 
@@ -497,19 +498,19 @@ def react_websocket_order():
 
 
 # Sandbox configuration
-@react_bp.route("/sandbox")
+@react_bp.route("/sandbox", strict_slashes=False)
 def react_sandbox():
     return serve_react_app()
 
 
 # Sandbox P&L history
-@react_bp.route("/sandbox/mypnl")
+@react_bp.route("/sandbox/mypnl", strict_slashes=False)
 def react_sandbox_mypnl():
     return serve_react_app()
 
 
 # API Request Analyzer
-@react_bp.route("/analyzer")
+@react_bp.route("/analyzer", strict_slashes=False)
 def react_analyzer():
     return serve_react_app()
 

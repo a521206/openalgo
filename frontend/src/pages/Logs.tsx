@@ -62,11 +62,7 @@ export default function LogsPage() {
         if (endDate) params.append('end_date', endDate)
         if (searchQuery) params.append('search', searchQuery)
 
-        const response = await webClient.get<LogsResponse>(`/logs/?${params.toString()}`, {
-          headers: {
-            'X-Requested-With': 'XMLHttpRequest',
-          },
-        })
+        const response = await webClient.get<LogsResponse>(`/logs/api/data?${params.toString()}`)
 
         setLogs(Array.isArray(response.data.logs) ? response.data.logs : [])
         setTotalPages(response.data.total_pages || 1)

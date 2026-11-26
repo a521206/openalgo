@@ -5,7 +5,7 @@ from datetime import datetime
 
 import numpy as np
 import pytz
-from flask import Blueprint, Response, jsonify, render_template, request, session
+from flask import Blueprint, Response, jsonify, request, session
 from sqlalchemy import func
 
 from database.latency_db import OrderLatency, latency_session
@@ -105,7 +105,6 @@ def get_histogram_data(broker=None):
 
         # Create histogram bins
         bin_count = 30  # Number of bins
-        bin_width = (max_rtt - min_rtt) / bin_count if max_rtt > min_rtt else 1
 
         # Create histogram using numpy
         counts, bins = np.histogram(rtts, bins=bin_count, range=(min_rtt, max_rtt))
@@ -172,54 +171,6 @@ def generate_csv(logs):
         )
 
     return output.getvalue()
-
-
-@latency_bp.route("/", methods=["GET"])
-@check_session_validity
-@limiter.limit("60/minute")
-def latency_dashboard():
-    """Display latency monitoring dashboard"""
-    stats = OrderLatency.get_latency_stats()
-    recent_logs = OrderLatency.get_recent_logs(limit=100)
-
-    # Get histogram data for each broker
-    broker_histograms = {}
-    brokers = [b[0] for b in OrderLatency.query.with_entities(OrderLatency.broker).distinct().all()]
-    for broker in brokers:
-        if broker:  # Skip None values
-            broker_histograms[broker] = get_histogram_data(broker)
-
-    # logger.info(f"Broker histograms data: {broker_histograms}")  # Commented out to reduce log verbosity
-
-    # Format timestamps in IST and convert to JSON-serializable format
-    logs_json = []
-    for log in recent_logs:
-        log.formatted_timestamp = format_ist_time(log.timestamp)
-        logs_json.append(
-            {
-                "id": log.id,
-                "order_id": log.order_id,
-                "broker": log.broker,
-                "symbol": log.symbol,
-                "order_type": log.order_type,
-                "rtt_ms": log.rtt_ms,
-                "validation_latency_ms": log.validation_latency_ms,
-                "response_latency_ms": log.response_latency_ms,
-                "overhead_ms": log.overhead_ms,
-                "total_latency_ms": log.total_latency_ms,
-                "status": log.status,
-                "error": log.error,
-                "timestamp": convert_to_ist(log.timestamp).isoformat(),
-            }
-        )
-
-    return render_template(
-        "latency/dashboard.html",
-        stats=stats,
-        logs=recent_logs,
-        logs_json=logs_json,
-        broker_histograms=broker_histograms,
-    )
 
 
 @latency_bp.route("/api/logs", methods=["GET"])

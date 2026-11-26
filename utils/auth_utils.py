@@ -2,7 +2,7 @@ import importlib
 import os
 import re
 import time
-from datetime import datetime, date
+from datetime import date, datetime
 from threading import Thread
 
 import pytz
@@ -10,7 +10,6 @@ from flask import current_app as app
 from flask import g, jsonify, redirect, request, session, url_for
 
 from database.auth_db import get_feed_token as db_get_feed_token
-from utils.ip_helper import get_real_ip
 from database.auth_db import upsert_auth
 from database.master_contract_status_db import (
     get_exchange_stats_from_db,
@@ -23,6 +22,7 @@ from database.master_contract_status_db import (
 )
 from utils import real_threading
 from utils.constants import CRYPTO_BROKERS
+from utils.ip_helper import get_real_ip
 from utils.logging import get_logger
 from utils.session import get_session_expiry_time, mark_signed_in, set_session_login_time
 
@@ -734,7 +734,7 @@ def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, u
     session_id = secrets.token_hex(32)
     session["session_id"] = session_id  # Store in cookie for logout cleanup
 
-    from database.auth_db import register_session, get_active_sessions
+    from database.auth_db import get_active_sessions, register_session
     register_session(
         username=user_session_key,
         session_id=session_id,
@@ -799,7 +799,7 @@ def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, u
                 "redirect": "/dashboard",
             }
         ), 200
-    return redirect(url_for("dashboard_bp.dashboard"))
+    return redirect("/dashboard")
 
 
 def login_error_address(code, broker=None):

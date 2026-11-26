@@ -65,7 +65,6 @@ from blueprints.chartink import chartink_bp  # Import the chartink blueprint
 from blueprints.core import core_bp
 from blueprints.custom_indicators import custom_indicators_bp  # User chart indicators
 from blueprints.custom_straddle import custom_straddle_bp  # Import custom straddle blueprint
-from blueprints.dashboard import dashboard_bp
 from blueprints.flow import flow_bp  # Import the flow blueprint
 from blueprints.gamma_density import gamma_density_bp  # Import the Gamma Density blueprint
 from blueprints.gc_json import gc_json_bp
@@ -86,7 +85,6 @@ from blueprints.oitracker import oitracker_bp  # Import the OI tracker blueprint
 from blueprints.openscript import openscript_bp  # Trader authored OpenScript sources
 from blueprints.openscript_runner import openscript_runner_bp  # Runs one saved strategy
 from blueprints.orders import orders_bp
-from blueprints.platforms import platforms_bp
 from blueprints.playground import playground_bp  # Import the API playground blueprint
 from blueprints.pnltracker import pnltracker_bp  # Import the pnl tracker blueprint
 from blueprints.postback import postback_bp  # Import broker postback (order updates) blueprint
@@ -302,14 +300,12 @@ def create_app():
 
     # Register other blueprints
     app.register_blueprint(auth_bp)
-    app.register_blueprint(dashboard_bp)
     app.register_blueprint(orders_bp)
     app.register_blueprint(search_bp)
     app.register_blueprint(api_key_bp)
     app.register_blueprint(log_bp)
     app.register_blueprint(tv_json_bp)
     app.register_blueprint(gc_json_bp)
-    app.register_blueprint(platforms_bp)
     app.register_blueprint(brlogin_bp)
     app.register_blueprint(core_bp)
     app.register_blueprint(analyzer_bp)

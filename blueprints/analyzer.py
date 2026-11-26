@@ -1,7 +1,6 @@
 import csv
 import io
 import json
-
 from datetime import datetime, timedelta
 
 import pytz
@@ -11,10 +10,8 @@ from flask import (
     flash,
     jsonify,
     redirect,
-    render_template,
     request,
     session,
-    url_for,
 )
 from sqlalchemy import desc, func
 
@@ -177,50 +174,6 @@ def generate_csv(requests):
         return ""
 
 
-@analyzer_bp.route("/")
-@check_session_validity
-def analyzer():
-    """Render the analyzer dashboard"""
-    try:
-        # Get date parameters
-        start_date = request.args.get("start_date")
-        end_date = request.args.get("end_date")
-
-        # Get stats with proper structure
-        stats = get_analyzer_stats()
-        if not isinstance(stats, dict):
-            stats = {
-                "total_requests": 0,
-                "sources": {},
-                "symbols": [],
-                "issues": {
-                    "total": 0,
-                    "by_type": {
-                        "rate_limit": 0,
-                        "invalid_symbol": 0,
-                        "missing_quantity": 0,
-                        "invalid_exchange": 0,
-                        "other": 0,
-                    },
-                },
-            }
-
-        # Get filtered requests
-        requests = get_filtered_requests(start_date, end_date)
-
-        return render_template(
-            "analyzer.html",
-            requests=requests,
-            stats=stats,
-            start_date=start_date,
-            end_date=end_date,
-        )
-    except Exception as e:
-        logger.exception(f"Error rendering analyzer: {str(e)}")
-        flash("Error loading analyzer dashboard", "error")
-        return redirect(url_for("core_bp.home"))
-
-
 @analyzer_bp.route("/api/data")
 @check_session_validity
 def api_get_data():
@@ -328,7 +281,7 @@ def clear_logs():
         logger.exception(f"Error clearing analyzer logs: {str(e)}")
         flash("Error clearing analyzer logs", "error")
 
-    return redirect(url_for("analyzer_bp.analyzer"))
+    return redirect("/analyzer")
 
 
 @analyzer_bp.route("/export", methods=["GET"])
@@ -354,4 +307,4 @@ def export_requests():
     except Exception as e:
         logger.exception(f"Error exporting requests: {str(e)}")
         flash("Error exporting requests", "error")
-        return redirect(url_for("analyzer_bp.analyzer"))
+        return redirect("/analyzer")

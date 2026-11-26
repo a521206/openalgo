@@ -64,13 +64,6 @@ def websocket_dashboard():
     return render_template("websocket/dashboard.html")
 
 
-@websocket_bp.route("/websocket/test")
-@check_session_validity
-def websocket_test():
-    """Render WebSocket test page for RELIANCE and TCS"""
-    return render_template("websocket/test_market_data.html")
-
-
 # REST endpoints for UI (no additional auth needed - page is already protected)
 @websocket_bp.route("/api/websocket/status", methods=["GET"])
 def api_websocket_status():
@@ -464,13 +457,13 @@ def example_usage():
 
     # Example 2: Get LTP directly from cache
     market_service = get_market_data_service()
-    ltp = market_service.get_ltp("RELIANCE", "NSE")
+    market_service.get_ltp("RELIANCE", "NSE")
 
     # Example 3: Subscribe to updates
     def my_callback(data):
         logger.debug(f"Received update: {data}")
 
-    subscriber_id = subscribe_to_market_updates("ltp", my_callback, {"NSE:RELIANCE", "NSE:TCS"})
+    subscribe_to_market_updates("ltp", my_callback, {"NSE:RELIANCE", "NSE:TCS"})
 
     # Example 4: Get market data for a user
     success, data, status = get_market_data(user_id, "RELIANCE", "NSE")

@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 
 import pytz
-from flask import Blueprint, Response, jsonify, render_template, request, session
+from flask import Blueprint, Response, jsonify, request, session
 from sqlalchemy import func
 
 from database.traffic_db import TrafficLog, logs_session
@@ -68,30 +68,6 @@ def generate_csv(logs):
         )
 
     return output.getvalue()
-
-
-@traffic_bp.route("/", methods=["GET"])
-@check_session_validity
-@limiter.limit("60/minute")
-def traffic_dashboard():
-    """Display traffic monitoring dashboard"""
-    stats = TrafficLog.get_stats()
-    recent_logs = TrafficLog.get_recent_logs(limit=100)
-    # Convert TrafficLog objects to dictionaries with IST timestamps
-    logs_data = [
-        {
-            "timestamp": format_ist_time(log.timestamp),
-            "client_ip": log.client_ip,
-            "method": log.method,
-            "path": log.path,
-            "status_code": log.status_code,
-            "duration_ms": round(log.duration_ms, 2),
-            "host": log.host,
-            "error": log.error,
-        }
-        for log in recent_logs
-    ]
-    return render_template("traffic/dashboard.html", stats=stats, logs=logs_data)
 
 
 @traffic_bp.route("/api/logs", methods=["GET"])
