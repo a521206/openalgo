@@ -300,7 +300,9 @@ def process_definedge_allmaster_csv(path):
     """Process DefinedGe allmaster.csv file containing all symbols"""
     try:
         # Read CSV without headers since the file doesn't have proper column names
-        df = pd.read_csv(path, header=None)
+        # Expiry is DDMMYYYY; keep it as text so values such as 01122026
+        # retain the leading zero in the day field.
+        df = pd.read_csv(path, header=None, dtype={5: str})
 
         if df.empty:
             logger.warning("allmaster.csv is empty")
@@ -547,7 +549,12 @@ def process_definedge_allmaster_csv(path):
                 # Convert from DDMMYYYY to DD-MMM-YY
                 from datetime import datetime
 
-                expiry_date = datetime.strptime(str(expiry_str), "%d%m%Y")
+                expiry_value = str(expiry_str).strip()
+                if expiry_value.isdigit():
+                    # Defensive: pandas or callers may already have converted
+                    # a leading-zero DDMMYYYY value to a seven-digit integer.
+                    expiry_value = expiry_value.zfill(8)
+                expiry_date = datetime.strptime(expiry_value, "%d%m%Y")
                 return expiry_date.strftime("%d-%b-%y").upper()
             except Exception:
                 return str(expiry_str)
