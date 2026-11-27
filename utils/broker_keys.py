@@ -43,7 +43,7 @@ from pathlib import Path
 # in a process. Importing it here, before anything below writes a key, makes
 # sure that one-time reload can never land after a broker's keys were applied
 # and quietly put the .env broker's keys back.
-import utils.config  # noqa: F401
+from utils.config import build_external_url, with_url_prefix
 from utils.logging import get_logger
 from utils.real_threading import Lock
 from utils.thread_safe_cache import MISSING, LockedTTLCache
@@ -294,8 +294,7 @@ def broker_exchanges(broker):
 
 def default_redirect_url(broker):
     """The callback address OpenAlgo serves for a broker on this host."""
-    host = (os.getenv("HOST_SERVER") or "http://127.0.0.1:5000").strip().rstrip("/")
-    return f"{host}/{broker}/callback"
+    return build_external_url(f"/{broker}/callback")
 
 
 def env_file_path():
@@ -327,6 +326,8 @@ def env_file_values():
     for field, var in ENV_VARS.items():
         value = file_values[var] if var in file_values else _STARTUP_VALUES.get(var)
         values[field] = (value or "").strip()
+    if values["redirect_url"]:
+        values["redirect_url"] = with_url_prefix(values["redirect_url"])
     return values
 
 
@@ -395,7 +396,7 @@ def resolve(broker):
         api_secret=stored.api_secret,
         api_key_market=stored.api_key_market,
         api_secret_market=stored.api_secret_market,
-        redirect_url=stored.redirect_url or default_redirect_url(broker),
+        redirect_url=with_url_prefix(stored.redirect_url or default_redirect_url(broker)),
     )
 
 

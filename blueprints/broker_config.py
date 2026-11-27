@@ -28,6 +28,7 @@ from flask import Blueprint, jsonify, request, session
 
 from blueprints.broker_credentials import get_env_path, mask_secret
 from limiter import limiter
+from utils.config import with_url_prefix
 from utils.env_check import update_env_values
 from utils.logging import get_logger
 from utils.session import check_signed_in
@@ -94,7 +95,7 @@ def _entry(broker, env_values, env_name, live, saved):
     redirect_url = automatic = hint = None
     if entry["sign_in"] == "redirect":
         automatic = default_redirect_url(broker)
-        redirect_url = stored_redirect or automatic
+        redirect_url = with_url_prefix(stored_redirect) if stored_redirect else automatic
         hint = entry["redirect_hint"] or None
     return {
         "id": broker,

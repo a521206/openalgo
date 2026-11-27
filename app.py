@@ -181,6 +181,18 @@ def create_app():
     if os.getenv("OPENALGO_URL_PREFIX"):
         app.wsgi_app = ProxyFix(app.wsgi_app, x_prefix=1)
 
+    @app.after_request
+    def prefix_redirect_location(response):
+        """Keep root-relative Flask redirects inside a mounted subpath app."""
+        location = response.headers.get("Location", "")
+        is_redirect = response.status_code in {301, 302, 303, 307, 308}
+        is_local_path = location.startswith("/") and not location.startswith("//")
+        if is_redirect and is_local_path:
+            from utils.config import with_url_prefix
+
+            response.headers["Location"] = with_url_prefix(location)
+        return response
+
     # Initialize SocketIO
     socketio.init_app(app)  # Link SocketIO to the Flask app
 
@@ -710,7 +722,9 @@ def create_app():
         """Return the HOST_SERVER configuration for frontend webhook URL generation"""
         from flask import jsonify
 
-        host_server = os.getenv("HOST_SERVER", "http://127.0.0.1:5000")
+        from utils.config import build_external_url
+
+        host_server = build_external_url("/").rstrip("/")
 
         # Determine if webhook URL is externally accessible
         is_localhost = any(

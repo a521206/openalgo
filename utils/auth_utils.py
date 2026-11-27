@@ -443,6 +443,12 @@ def _download_master_contract(broker):
         except Exception:
             total_symbols = None
 
+        if not total_symbols:
+            message = "Master contract download completed without loading any symbols"
+            update_status(broker, "error", message, total_symbols or 0)
+            logger.error(f"{message} for {broker}")
+            return {"status": "error", "message": message}
+
         # Since socketio.emit doesn't return a meaningful value, we check if no exception was raised
         update_status(
             broker, "success", "Master contract download completed successfully", total_symbols

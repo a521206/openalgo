@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -87,10 +88,10 @@ def download_csv_zerodha_data(output_path):
     """
     Downloads the CSV file from Zerodha using Auth Credentials, saves it to the specified path and convert.
     to pandas dataframe using shared httpx client with connection pooling.
-    
+
     Args:
         output_path (str): Path where the CSV file will be saved
-        
+
     Returns:
         pd.DataFrame: DataFrame containing the downloaded instrument data
     """
@@ -468,12 +469,15 @@ def delete_zerodha_temp_data(output_path):
 def master_contract_download():
     logger.info("Downloading Master Contract")
 
-
-    output_path = 'tmp/zerodha.csv'
+    # Each service instance needs its own file. A fixed path lets concurrent
+    # workers overwrite or delete one another's download.
+    temp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'tmp'))
+    os.makedirs(temp_dir, exist_ok=True)
+    fd, output_path = tempfile.mkstemp(prefix='zerodha-', suffix='.csv', dir=temp_dir)
+    os.close(fd)
     try:
         download_csv_zerodha_data(output_path)
         token_df = process_zerodha_csv(output_path)
-        delete_zerodha_temp_data(output_path)
         #token_df['token'] = pd.to_numeric(token_df['token'], errors='coerce').fillna(-1).astype(int)
 
         #token_df = token_df.drop_duplicates(subset='symbol', keep='first')
@@ -487,6 +491,8 @@ def master_contract_download():
     except Exception as e:
         logger.info(f"{str(e)}")
         return socketio.emit('master_contract_download', {'status': 'error', 'message': str(e)})
+    finally:
+        delete_zerodha_temp_data(output_path)
 
 
 def search_symbols(symbol, exchange):

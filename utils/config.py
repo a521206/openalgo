@@ -2,6 +2,7 @@
 
 import functools
 import os
+from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
@@ -59,6 +60,29 @@ def get_host_server() -> str:
     return os.getenv("HOST_SERVER", "http://127.0.0.1:5000")
 
 
+def get_url_prefix() -> str:
+    """Return the normalized reverse-proxy path prefix for this instance."""
+    prefix = os.getenv("OPENALGO_URL_PREFIX", "").strip().strip("/")
+    return f"/{prefix}" if prefix else ""
+
+
+def with_url_prefix(path: str) -> str:
+    """Ensure a local or absolute URL path includes this instance's prefix."""
+    prefix = get_url_prefix()
+    is_absolute = "://" in path
+    if is_absolute:
+        parsed = urlsplit(path)
+    else:
+        local_path = path if path.startswith("/") else f"/{path}"
+        parsed = urlsplit(local_path)
+    path_part = parsed.path or "/"
+    if prefix and path_part != prefix and not path_part.startswith(f"{prefix}/"):
+        path_part = f"{prefix}{path_part}"
+    if is_absolute:
+        return urlunsplit((parsed.scheme, parsed.netloc, path_part, parsed.query, parsed.fragment))
+    return urlunsplit(("", "", path_part, parsed.query, parsed.fragment))
+
+
 @functools.cache
 def get_execution_buffer_options() -> float:
     try:
@@ -102,6 +126,8 @@ def build_external_url(path: str) -> str:
         str: Absolute URL rooted at HOST_SERVER.
     """
     base = get_host_server().strip().rstrip("/")
-    if not path.startswith("/"):
-        path = f"/{path}"
-    return f"{base}{path}"
+    target = with_url_prefix(path)
+    prefix = get_url_prefix()
+    if prefix and base.endswith(prefix) and (target == prefix or target.startswith(f"{prefix}/")):
+        target = target[len(prefix):] or "/"
+    return f"{base}{target}"
