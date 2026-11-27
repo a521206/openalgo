@@ -1,3 +1,4 @@
+import { deploymentPath } from '@/lib/deployment'
 import type {
   AddFreezeQtyRequest,
   AddHolidayRequest,
@@ -212,7 +213,7 @@ export const adminApi = {
    */
   downloadReport: (format: 'md' | 'txt' = 'md'): void => {
     const fmt = format === 'txt' ? 'txt' : 'md'
-    window.location.href = `/admin/api/system/report?format=${fmt}`
+    window.location.href = deploymentPath(`/admin/api/system/report?format=${fmt}`)
   },
 
   // ============================================================================

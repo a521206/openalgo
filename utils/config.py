@@ -6,7 +6,7 @@ import os
 from dotenv import load_dotenv
 
 # Load environment variables from .env file with override=True to ensure values are updated
-load_dotenv(override=True)
+load_dotenv(os.getenv("OPENALGO_ENV_FILE") or None, override=True)
 
 
 def get_broker_api_key() -> str | None:
@@ -59,7 +59,7 @@ def get_host_server() -> str:
     return os.getenv("HOST_SERVER", "http://127.0.0.1:5000")
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def get_execution_buffer_options() -> float:
     try:
         value = float(os.getenv("EXECUTION_BUFFER_OPTIONS", "0.05"))
@@ -68,7 +68,7 @@ def get_execution_buffer_options() -> float:
         return 0.05
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def get_execution_buffer_futures() -> float:
     try:
         value = float(os.getenv("EXECUTION_BUFFER_FUTURES", "0.001"))

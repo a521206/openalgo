@@ -1,3 +1,4 @@
+import { appFetch, deploymentPath } from '@/lib/deployment'
 import {
   AlertCircle,
   ArrowLeft,
@@ -129,7 +130,7 @@ export default function ResetPassword() {
 
     try {
       const csrfToken = await fetchCSRFToken()
-      const response = await fetch('/auth/reset-password', {
+      const response = await appFetch('/auth/reset-password', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -159,7 +160,7 @@ export default function ResetPassword() {
 
     try {
       const csrfToken = await fetchCSRFToken()
-      const response = await fetch('/auth/reset-password', {
+      const response = await appFetch('/auth/reset-password', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -194,7 +195,7 @@ export default function ResetPassword() {
 
     try {
       const csrfToken = await fetchCSRFToken()
-      const response = await fetch('/auth/reset-password', {
+      const response = await appFetch('/auth/reset-password', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -228,7 +229,7 @@ export default function ResetPassword() {
 
     try {
       const csrfToken = await fetchCSRFToken()
-      const response = await fetch('/auth/reset-password', {
+      const response = await appFetch('/auth/reset-password', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -250,7 +251,7 @@ export default function ResetPassword() {
         setSuccess('Password reset successfully! Redirecting to login...')
         showToast.success('Password reset successfully!')
         setTimeout(() => {
-          window.location.href = '/login'
+          window.location.href = deploymentPath('/login')
         }, 2000)
       } else {
         setError(data.message || 'Failed to reset password')

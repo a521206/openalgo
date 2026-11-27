@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import {
   AlertCircle,
   ArrowRight,
@@ -29,7 +30,7 @@ import { useAuthStore } from '@/stores/authStore'
 import { showToast } from '@/utils/toast'
 
 async function fetchCSRFToken(): Promise<string> {
-  const response = await fetch('/auth/csrf-token', {
+  const response = await appFetch('/auth/csrf-token', {
     credentials: 'include',
   })
   const data = await response.json()
@@ -57,7 +58,7 @@ export default function ApiKey() {
   const fetchApiKeyData = async () => {
     setIsLoading(true)
     try {
-      const response = await fetch('/apikey', {
+      const response = await appFetch('/apikey', {
         credentials: 'include',
         headers: {
           Accept: 'application/json',
@@ -101,7 +102,7 @@ export default function ApiKey() {
     try {
       const csrfToken = await fetchCSRFToken()
 
-      const response = await fetch('/apikey', {
+      const response = await appFetch('/apikey', {
         method: 'POST',
         credentials: 'include',
         headers: {
@@ -137,7 +138,7 @@ export default function ApiKey() {
     try {
       const csrfToken = await fetchCSRFToken()
 
-      const response = await fetch('/apikey/mode', {
+      const response = await appFetch('/apikey/mode', {
         method: 'POST',
         credentials: 'include',
         headers: {

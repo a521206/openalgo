@@ -1,3 +1,4 @@
+import { deploymentPath } from '@/lib/deployment'
 /**
  * Health Monitoring API Client
  * Industry-standard health check endpoints
@@ -228,5 +229,5 @@ export async function resolveAlert(alertId: number): Promise<void> {
  * Requires authentication
  */
 export function exportMetricsCSV(hours = 24): string {
-  return `/health/export?hours=${hours}`
+  return deploymentPath(`/health/export?hours=${hours}`)
 }

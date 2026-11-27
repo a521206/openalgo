@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import { create } from 'zustand'
 
 interface BrokerCapabilities {
@@ -26,7 +27,7 @@ export const useBrokerStore = create<BrokerStore>()((set) => ({
   fetchCapabilities: () => {
     inflight ??= (async () => {
       try {
-        const response = await fetch('/api/broker/capabilities', {
+        const response = await appFetch('/api/broker/capabilities', {
           credentials: 'include',
         })
 

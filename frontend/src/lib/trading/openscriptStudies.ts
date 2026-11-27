@@ -34,6 +34,7 @@
  * because the chart only ever judges an alert on a bar's first tick.
  */
 
+import { appFetch } from '@/lib/deployment'
 import type { IndicatorAttachContext } from 'openalgo-charts'
 import type {
   ChartAdapterOptions,
@@ -581,7 +582,7 @@ export async function loadOpenScriptStudies(): Promise<OpenScriptLoad> {
 
   let stored: StoredScript[]
   try {
-    const response = await fetch(INDEX_URL, { headers: { Accept: 'application/json' } })
+    const response = await appFetch(INDEX_URL, { headers: { Accept: 'application/json' } })
     if (!response.ok) return result
     stored = (await response.json()) as StoredScript[]
   } catch {
@@ -602,7 +603,7 @@ export async function loadOpenScriptStudies(): Promise<OpenScriptLoad> {
     compiled.add(`${script.file}@${script.mtime}`)
     try {
       const url = `/openscript/${encodeURIComponent(script.file)}?v=${script.mtime}`
-      const response = await fetch(url)
+      const response = await appFetch(url)
       if (!response.ok) throw new Error('this script could not be read back from the server')
       const text = await response.text()
 

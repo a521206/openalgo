@@ -1,3 +1,4 @@
+import { deploymentPrefix } from '@/lib/deployment'
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { useBrokerStore } from './brokerStore'
@@ -87,7 +88,7 @@ export const useAuthStore = create<AuthStore>()(
       },
     }),
     {
-      name: 'openalgo-auth',
+      name: `openalgo-auth${deploymentPrefix}`,
     }
   )
 )

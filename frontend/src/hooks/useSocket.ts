@@ -1,3 +1,4 @@
+import { deploymentPath } from '@/lib/deployment'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { io, type Socket } from 'socket.io-client'
@@ -149,6 +150,7 @@ export function useSocket() {
     // Use polling transport only - WebSocket upgrade fails with threading async mode
     // Polling is still real-time via HTTP long-polling
     socketRef.current = io(`${protocol}//${host}:${port}`, {
+      path: deploymentPath('/socket.io'),
       transports: ['polling'],
       upgrade: false,
       reconnectionAttempts: 5,

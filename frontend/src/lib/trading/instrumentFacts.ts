@@ -36,6 +36,7 @@
  * caller running live that has reason to prefer it.
  */
 
+import { appFetch } from '@/lib/deployment'
 import type { Instrument } from 'openalgo-script'
 
 /** The engine's record, less the two facts the chart supplies itself. */
@@ -229,7 +230,7 @@ async function request(id: Identity): Promise<Entry | undefined> {
     const query = new URLSearchParams({ symbol: id.symbol, exchange: id.exchange })
     // JSON asked for explicitly, so an expired session answers 401 rather than
     // a redirect that fetch would follow into the login page's HTML.
-    const response = await fetch(`${URL_BASE}?${query}`, {
+    const response = await appFetch(`${URL_BASE}?${query}`, {
       headers: { Accept: 'application/json' },
       signal: controller.signal,
     })

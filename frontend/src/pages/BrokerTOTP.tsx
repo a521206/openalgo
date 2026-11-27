@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import { AlertTriangle, ArrowLeft, ExternalLink, Loader2, Shield } from 'lucide-react'
 import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
@@ -412,7 +413,7 @@ export default function BrokerTOTP() {
       // Use custom callback URL or default pattern
       const callbackUrl = config.callbackUrl || `/${broker}/callback`
 
-      const response = await fetch(callbackUrl, {
+      const response = await appFetch(callbackUrl, {
         method: 'POST',
         body: form,
         credentials: 'include',

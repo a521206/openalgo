@@ -1,3 +1,4 @@
+import { deploymentPath } from '@/lib/deployment'
 import { Component, type ErrorInfo, type ReactNode } from 'react'
 import { tryAutoReloadOnChunkError } from '@/utils/chunkReload'
 import { reportClientError } from '@/utils/errorReporter'
@@ -80,7 +81,7 @@ export class ErrorBoundary extends Component<Props, State> {
           <p className="text-sm text-muted-foreground break-words">{this.state.message}</p>
           <p className="text-xs text-muted-foreground">
             The error has been logged. You can reload the page or visit{' '}
-            <a className="underline" href="/admin/diagnostics">
+            <a className="underline" href={deploymentPath('/admin/diagnostics')}>
               Diagnostics
             </a>{' '}
             to view recent errors.

@@ -1,3 +1,4 @@
+import { deploymentPath } from '@/lib/deployment'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { BookOpen, Info, Loader2, Search, Settings } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
@@ -155,7 +156,7 @@ export default function BrokerSelect() {
       void useBrokerStore.getState().fetchCapabilities()
       return
     }
-    window.location.href = started.url
+    window.location.href = deploymentPath(started.url)
   }
 
   // One broker at a time. Logging in to another is confirmed first; the
@@ -199,7 +200,7 @@ export default function BrokerSelect() {
       await refresh()
       return
     }
-    window.location.href = '/dashboard'
+    window.location.href = deploymentPath('/dashboard')
   }
 
   // Read the broker list again (which broker is logged in, which are saved).

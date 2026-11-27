@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import {
   BarChart3,
   BookOpen,
@@ -68,7 +69,7 @@ interface OpenTab {
 }
 
 async function fetchCSRFToken(): Promise<string> {
-  const response = await fetch('/auth/csrf-token', {
+  const response = await appFetch('/auth/csrf-token', {
     credentials: 'include',
   })
   const data = await response.json()
@@ -227,7 +228,7 @@ export default function Playground() {
 
   useEffect(() => {
     // Fetch host server config
-    fetch('/api/config/host', { credentials: 'include' })
+    appFetch('/api/config/host', { credentials: 'include' })
       .then((res) => res.json())
       .then((data) => {
         if (data.host_server) {
@@ -248,7 +249,7 @@ export default function Playground() {
 
   const loadApiKey = async () => {
     try {
-      const response = await fetch('/playground/api-key', {
+      const response = await appFetch('/playground/api-key', {
         credentials: 'include',
       })
       if (response.ok) {
@@ -262,7 +263,7 @@ export default function Playground() {
 
   const loadEndpoints = async () => {
     try {
-      const response = await fetch('/playground/endpoints', {
+      const response = await appFetch('/playground/endpoints', {
         credentials: 'include',
       })
       if (response.ok) {
@@ -470,7 +471,7 @@ export default function Playground() {
       // Restart the clock here so the displayed time covers only the API
       // request itself, not the CSRF token fetch above.
       startTime = Date.now()
-      const response = await fetch(fetchUrl, options)
+      const response = await appFetch(fetchUrl, options)
       const elapsed = Date.now() - startTime
 
       // Capture headers

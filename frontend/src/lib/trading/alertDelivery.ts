@@ -27,6 +27,7 @@
  * paired" whatever the server actually said.
  */
 
+import { appFetch } from '@/lib/deployment'
 import { notifyIfHidden } from './alertNotify'
 
 /** How a trader asked to be told, stored with the alert itself. */
@@ -190,7 +191,7 @@ const CHANNEL_NAME: Record<OutwardChannel, string> = {
 async function post(path: string, body: Record<string, unknown>): Promise<SendFailure> {
   // A relative URL, because this application is served from a port, a domain, a
   // subdomain and a container, and an absolute one works for whoever wrote it.
-  const res = await fetch(path, {
+  const res = await appFetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

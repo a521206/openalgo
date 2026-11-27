@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 /**
  * The history of what fired, kept on the server rather than in the page.
  *
@@ -55,7 +56,7 @@ async function json(path: string, init?: RequestInit): Promise<unknown> {
   // A relative URL: this application is served from a port, a domain, a
   // subdomain and a container, and an absolute one works only for whoever
   // wrote it.
-  const res = await fetch(path, {
+  const res = await appFetch(path, {
     credentials: 'same-origin',
     ...init,
   })

@@ -9,6 +9,7 @@
  * address itself.
  */
 
+import { appFetch } from '@/lib/deployment'
 import { brokerConfigApi, csrfToken } from '@/api/broker-config'
 
 /** The Broker Configuration page. */
@@ -60,7 +61,7 @@ async function postJson(url: string, payload: unknown) {
     return { ok: false as const, body: { message: 'Could not reach OpenAlgo. Try again.' } }
   }
   try {
-    const res = await fetch(url, {
+    const res = await appFetch(url, {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrf },

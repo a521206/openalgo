@@ -1,3 +1,4 @@
+import { deploymentPath } from '@/lib/deployment'
 import { LogOut } from 'lucide-react'
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
@@ -53,7 +54,7 @@ export function BrokerAuthSignOut() {
       // is accepted by _is_foreign_initiated() because a click from our own
       // page is same-origin.
       logout()
-      window.location.href = '/auth/logout'
+      window.location.href = deploymentPath('/auth/logout')
     }
   }
 

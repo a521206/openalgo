@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import { useEffect, useState } from 'react'
 import { useAuthStore } from '@/stores/authStore'
 import { useBrokerStore } from '@/stores/brokerStore'
@@ -15,7 +16,7 @@ interface SessionStatus {
 }
 
 async function fetchSessionStatus(): Promise<SessionStatus | null> {
-  const response = await fetch('/auth/session-status', { credentials: 'include' })
+  const response = await appFetch('/auth/session-status', { credentials: 'include' })
   if (!response.ok) return null
   return (await response.json()) as SessionStatus
 }

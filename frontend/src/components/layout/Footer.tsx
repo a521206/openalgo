@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import { Github, Monitor } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Badge } from '@/components/ui/badge'
@@ -16,7 +17,7 @@ export function Footer({ className }: FooterProps) {
   useEffect(() => {
     const fetchVersion = async () => {
       try {
-        const response = await fetch('/auth/app-info')
+        const response = await appFetch('/auth/app-info')
         const data = await response.json()
         if (data.status === 'success') {
           setVersion(data.version)

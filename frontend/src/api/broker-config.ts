@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 /**
  * Broker keys, one set per broker, for as many brokers as the trader likes,
  * with exactly one broker logged in at a time, as OpenAlgo Desktop has them.
@@ -96,7 +97,7 @@ export class BrokerConfigError extends Error {
 const UNREACHABLE = 'Could not reach OpenAlgo. Try again.'
 
 export async function csrfToken(): Promise<string> {
-  const res = await fetch('/auth/csrf-token', { credentials: 'include' }).catch(() => null)
+  const res = await appFetch('/auth/csrf-token', { credentials: 'include' }).catch(() => null)
   const body = res?.ok ? await res.json().catch(() => null) : null
   const token = body?.csrf_token
   if (typeof token !== 'string' || !token) throw new BrokerConfigError(UNREACHABLE, 0)
@@ -106,7 +107,7 @@ export async function csrfToken(): Promise<string> {
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   let res: Response
   try {
-    res = await fetch(url, { credentials: 'include', ...init })
+    res = await appFetch(url, { credentials: 'include', ...init })
   } catch {
     throw new BrokerConfigError(UNREACHABLE, 0)
   }

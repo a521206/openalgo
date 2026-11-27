@@ -13,6 +13,7 @@
  * cancel, real-time order stream, REST fallback) is unchanged.
  */
 
+import { appFetch } from '@/lib/deployment'
 import type {
   ChartObjectSnapshot,
   IndicatorBarSource,
@@ -1660,7 +1661,7 @@ export class TradingTerminal {
     path: string,
     body: Record<string, unknown> = {}
   ): Promise<T> {
-    const res = await fetch(`/api/v1/${path}`, {
+    const res = await appFetch(`/api/v1/${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ apikey: this.apiKey, ...body }),

@@ -1,3 +1,4 @@
+import { appFetch, deploymentPath } from '@/lib/deployment'
 import {
   Activity,
   AlertTriangle,
@@ -96,7 +97,7 @@ export default function Analyzer() {
 
       const url = params.toString() ? `/analyzer/api/data?${params}` : '/analyzer/api/data'
 
-      const response = await fetch(url, {
+      const response = await appFetch(url, {
         credentials: 'include',
       })
 
@@ -123,7 +124,7 @@ export default function Analyzer() {
     if (endDate) params.append('end_date', endDate)
 
     const url = params.toString() ? `/analyzer/export?${params}` : '/analyzer/export'
-    window.location.href = url
+    window.location.href = deploymentPath(url)
   }
 
   const viewDetails = (request: ApiRequest) => {

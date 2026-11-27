@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import {
   AlertTriangle,
   ArrowLeft,
@@ -72,7 +73,7 @@ export default function ViewChartinkStrategy() {
   useEffect(() => {
     const fetchHostConfig = async () => {
       try {
-        const response = await fetch('/api/config/host', { credentials: 'include' })
+        const response = await appFetch('/api/config/host', { credentials: 'include' })
         const data = await response.json()
         setHostConfig(data)
       } catch (_error) {

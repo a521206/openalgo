@@ -65,7 +65,7 @@ for _logger in [logging.getLogger()] + [
 try:
     from dotenv import load_dotenv
 
-    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    env_path = os.getenv("OPENALGO_ENV_FILE") or os.path.join(os.path.dirname(__file__), "..", ".env")
     if os.path.exists(env_path):
         load_dotenv(dotenv_path=env_path, override=False)
 except ImportError:

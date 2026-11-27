@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import { useCallback, useEffect, useState } from 'react'
 
 interface MarketTiming {
@@ -29,7 +30,7 @@ interface MarketStatusState {
 
 // Fetch CSRF token for authenticated requests
 async function fetchCSRFToken(): Promise<string> {
-  const response = await fetch('/auth/csrf-token', { credentials: 'include' })
+  const response = await appFetch('/auth/csrf-token', { credentials: 'include' })
   const data = await response.json()
   return data.csrf_token
 }
@@ -76,8 +77,8 @@ export function useMarketStatus() {
         // Fetch market timings and holidays in parallel
         // Note: These endpoints are under the admin blueprint (/admin prefix)
         const [timingsRes, holidaysRes] = await Promise.all([
-          fetch('/admin/api/timings', { headers, credentials: 'include' }),
-          fetch('/admin/api/holidays', { headers, credentials: 'include' }),
+          appFetch('/admin/api/timings', { headers, credentials: 'include' }),
+          appFetch('/admin/api/holidays', { headers, credentials: 'include' }),
         ])
 
         const timingsData = await timingsRes.json()

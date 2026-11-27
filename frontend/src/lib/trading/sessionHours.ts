@@ -13,6 +13,7 @@
  * chart behaved before), and the answer is fetched once per IST day for the
  * whole page rather than per pane, per symbol or per render.
  */
+import { appFetch } from '@/lib/deployment'
 import {
   attachSessionShading,
   type BarsRequest,
@@ -138,7 +139,7 @@ async function getJson(url: string, init: RequestInit): Promise<unknown> {
   const abort = new AbortController()
   const timer = setTimeout(() => abort.abort(), TIMEOUT_MS)
   try {
-    const res = await fetch(url, { ...init, credentials: 'same-origin', signal: abort.signal })
+    const res = await appFetch(url, { ...init, credentials: 'same-origin', signal: abort.signal })
     const body = (await res.json()) as { status?: string; data?: unknown }
     if (!res.ok || body?.status !== 'success' || !Array.isArray(body.data))
       throw new Error(`${url} answered ${res.status}`)

@@ -50,6 +50,13 @@ export default defineConfig({
       },
     },
   },
+  experimental: {
+    // Resolve lazy-loaded dependencies relative to the importing chunk so
+    // the same build works in both Nginx asset locations.
+    renderBuiltUrl(_filename, { hostType }) {
+      if (hostType === 'js') return { relative: true }
+    },
+  },
   build: {
     outDir: 'dist',
     sourcemap: false,

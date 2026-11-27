@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import { BarChart3, BookOpen, FileText, GraduationCap, Search, Zap } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router'
@@ -75,7 +76,7 @@ export default function Dashboard() {
   const fetchFundsData = useCallback(async () => {
     try {
       setIsLoading(true)
-      const response = await fetch('/auth/dashboard-data', {
+      const response = await appFetch('/auth/dashboard-data', {
         credentials: 'include',
       })
 
@@ -126,7 +127,7 @@ export default function Dashboard() {
   // Check master contract status
   const checkMasterContractStatus = useCallback(async () => {
     try {
-      const response = await fetch('/api/master-contract/status', {
+      const response = await appFetch('/api/master-contract/status', {
         credentials: 'include',
         headers: { Accept: 'application/json' },
       })

@@ -1,3 +1,4 @@
+import { deploymentPath } from '@/lib/deployment'
 import {
   AlertTriangle,
   Calendar,
@@ -93,7 +94,7 @@ export default function PythonStrategyIndex() {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000)
 
     // Subscribe to SSE for real-time status updates
-    const eventSource = new EventSource('/python/api/events')
+    const eventSource = new EventSource(deploymentPath('/python/api/events'))
 
     eventSource.onmessage = (event) => {
       try {

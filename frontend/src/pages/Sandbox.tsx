@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import { BarChart3, RotateCcw, Save, Settings } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
@@ -24,7 +25,7 @@ import {
 import { showToast } from '@/utils/toast'
 
 async function fetchCSRFToken(): Promise<string> {
-  const response = await fetch('/auth/csrf-token', {
+  const response = await appFetch('/auth/csrf-token', {
     credentials: 'include',
   })
   const data = await response.json()
@@ -93,7 +94,7 @@ export default function Sandbox() {
 
   const fetchConfigs = async () => {
     try {
-      const response = await fetch('/sandbox/api/configs', {
+      const response = await appFetch('/sandbox/api/configs', {
         credentials: 'include',
       })
       if (response.ok) {
@@ -140,7 +141,7 @@ export default function Sandbox() {
     try {
       const csrfToken = await fetchCSRFToken()
 
-      const response = await fetch('/sandbox/update', {
+      const response = await appFetch('/sandbox/update', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -175,7 +176,7 @@ export default function Sandbox() {
     try {
       const csrfToken = await fetchCSRFToken()
 
-      const response = await fetch('/sandbox/reset', {
+      const response = await appFetch('/sandbox/reset', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

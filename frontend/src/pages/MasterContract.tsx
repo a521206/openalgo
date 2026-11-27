@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import {
   AlertCircle,
   CheckCircle2,
@@ -19,7 +20,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { showToast } from '@/utils/toast'
 
 async function fetchCSRFToken(): Promise<string> {
-  const response = await fetch('/auth/csrf-token', {
+  const response = await appFetch('/auth/csrf-token', {
     credentials: 'include',
   })
   const data = await response.json()
@@ -144,7 +145,7 @@ export default function MasterContract() {
     const controller = new AbortController()
     statusControllerRef.current = controller
     try {
-      const response = await fetch('/api/master-contract/smart-status', {
+      const response = await appFetch('/api/master-contract/smart-status', {
         credentials: 'include',
         signal: controller.signal,
       })
@@ -183,7 +184,7 @@ export default function MasterContract() {
 
   const fetchCacheHealth = useCallback(async () => {
     try {
-      const response = await fetch('/api/cache/health', {
+      const response = await appFetch('/api/cache/health', {
         credentials: 'include',
       })
       if (response.ok) {
@@ -216,7 +217,7 @@ export default function MasterContract() {
     setIsDownloading(true)
     try {
       const csrfToken = await fetchCSRFToken()
-      const response = await fetch('/api/master-contract/download', {
+      const response = await appFetch('/api/master-contract/download', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -249,7 +250,7 @@ export default function MasterContract() {
     setIsReloadingCache(true)
     try {
       const csrfToken = await fetchCSRFToken()
-      const response = await fetch('/api/cache/reload', {
+      const response = await appFetch('/api/cache/reload', {
         method: 'POST',
         headers: {
           'X-CSRFToken': csrfToken,

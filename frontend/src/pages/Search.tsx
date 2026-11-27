@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import {
   ArrowUpDown,
   ChevronLeft,
@@ -119,7 +120,7 @@ export default function Search() {
       if (strike_max) params.append('strike_max', strike_max)
 
       // Use the API search endpoint which returns JSON
-      const response = await fetch(`/search/api/search?${params.toString()}`, {
+      const response = await appFetch(`/search/api/search?${params.toString()}`, {
         credentials: 'include',
       })
 

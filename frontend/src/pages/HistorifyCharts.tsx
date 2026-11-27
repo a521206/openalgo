@@ -11,6 +11,7 @@
  * of the surface: it shows you what you hold, not what you could trade.
  */
 
+import { appFetch } from '@/lib/deployment'
 import { useQuery } from '@tanstack/react-query'
 import { ArrowLeft, RefreshCw } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
@@ -122,7 +123,7 @@ export default function HistorifyCharts() {
   const calendarKey = useQuery({
     queryKey: ['historify', 'calendar-key'],
     queryFn: async ({ signal }) => {
-      const response = await fetch('/api/websocket/apikey', { signal })
+      const response = await appFetch('/api/websocket/apikey', { signal })
       const result = (await response.json()) as { status?: string; api_key?: string }
       if (result.status !== 'success' || !result.api_key) return null
       await prepareSessionHours(result.api_key, {

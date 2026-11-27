@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import {
   Cable,
   Link2,
@@ -19,7 +20,7 @@ import { cn } from '@/lib/utils'
 import { showToast } from '@/utils/toast'
 
 async function fetchCSRFToken(): Promise<string> {
-  const response = await fetch('/auth/csrf-token', { credentials: 'include' })
+  const response = await appFetch('/auth/csrf-token', { credentials: 'include' })
   const data = await response.json()
   return data.csrf_token
 }
@@ -240,7 +241,7 @@ export default function WebSocketOrder() {
 
     try {
       const csrfToken = await getCsrfToken()
-      const configResponse = await fetch('/api/websocket/config', {
+      const configResponse = await appFetch('/api/websocket/config', {
         headers: { 'X-CSRFToken': csrfToken },
         credentials: 'include',
       })
@@ -260,7 +261,7 @@ export default function WebSocketOrder() {
 
         try {
           const authCsrfToken = await getCsrfToken()
-          const apiKeyResponse = await fetch('/api/websocket/apikey', {
+          const apiKeyResponse = await appFetch('/api/websocket/apikey', {
             headers: { 'X-CSRFToken': authCsrfToken },
             credentials: 'include',
           })

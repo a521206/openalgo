@@ -2233,7 +2233,7 @@ async def main():
 
     try:
         # Load environment variables
-        load_dotenv()
+        load_dotenv(os.getenv("OPENALGO_ENV_FILE") or None)
 
         # Get WebSocket configuration from environment variables
         ws_host = os.getenv("WEBSOCKET_HOST", "127.0.0.1")

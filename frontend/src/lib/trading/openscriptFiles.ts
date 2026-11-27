@@ -11,6 +11,7 @@
  * that was never wrong.
  */
 
+import { appFetch } from '@/lib/deployment'
 import { fetchCSRFToken } from '@/api/client'
 
 export interface StoredScript {
@@ -132,7 +133,7 @@ async function readMessage(response: Response, fallback: string): Promise<string
 
 /** Every script the server is holding, newest name order as it lists them. */
 export async function listScripts(signal?: AbortSignal): Promise<StoredScript[]> {
-  const response = await fetch(`${BASE}/index.json`, {
+  const response = await appFetch(`${BASE}/index.json`, {
     headers: { Accept: 'application/json' },
     signal,
   })
@@ -169,7 +170,7 @@ export async function normalise(source: string): Promise<string> {
 
 /** One script's source, in the normal form the editor and the compiler share. */
 export async function readScript(file: string, signal?: AbortSignal): Promise<string> {
-  const response = await fetch(`${BASE}/${encodeURIComponent(file)}?v=${Date.now()}`, { signal })
+  const response = await appFetch(`${BASE}/${encodeURIComponent(file)}?v=${Date.now()}`, { signal })
   if (!response.ok) throw new Error(`${file} could not be opened.`)
   return normalise(await response.text())
 }
@@ -216,7 +217,7 @@ export async function saveScript(
   compiled?: CompileResult,
 ): Promise<StoredScript> {
   const result = compiled ?? (await compileSource(file, source))
-  const response = await fetch(`${BASE}/${encodeURIComponent(file)}`, {
+  const response = await appFetch(`${BASE}/${encodeURIComponent(file)}`, {
     method: 'POST',
     credentials: 'include',
     headers: await writeHeaders(),
@@ -236,7 +237,7 @@ export async function saveScript(
 
 /** Removes one script and the backup taken of it. */
 export async function deleteScript(file: string): Promise<void> {
-  const response = await fetch(`${BASE}/${encodeURIComponent(file)}`, {
+  const response = await appFetch(`${BASE}/${encodeURIComponent(file)}`, {
     method: 'DELETE',
     credentials: 'include',
     headers: await writeHeaders(),

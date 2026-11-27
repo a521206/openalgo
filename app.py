@@ -46,6 +46,7 @@ mimetypes.add_type("application/font-woff2", ".woff2")
 
 from flask import Flask, session
 from flask_wtf.csrf import CSRFProtect  # Import CSRF protection
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from blueprints.admin import admin_bp  # Import the admin blueprint
 from blueprints.agent import agent_bp  # Import the agent blueprint
@@ -173,6 +174,12 @@ logger = get_logger(__name__)
 def create_app():
     # Initialize Flask application
     app = Flask(__name__)
+
+    # Respect an explicitly configured URL prefix when running behind a
+    # reverse proxy under a subpath (for example, /via). Nginx must set
+    # X-Forwarded-Prefix only for that instance's location.
+    if os.getenv("OPENALGO_URL_PREFIX"):
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_prefix=1)
 
     # Initialize SocketIO
     socketio.init_app(app)  # Link SocketIO to the Flask app

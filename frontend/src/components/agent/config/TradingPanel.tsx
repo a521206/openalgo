@@ -21,6 +21,7 @@
  * them.
  */
 
+import { appFetch } from '@/lib/deployment'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { agentErrorMessage, agentQueryKeys, getSettings, updateSettings } from '@/api/agent'
@@ -48,7 +49,7 @@ export function TradingPanel() {
   const analyzer = useQuery({
     queryKey: ['analyzer', 'status'],
     queryFn: async (): Promise<AnalyzerStatus> => {
-      const response = await fetch('/settings/analyze-mode', {
+      const response = await appFetch('/settings/analyze-mode', {
         headers: { 'X-Requested-With': 'XMLHttpRequest' },
       })
       if (!response.ok) return {}

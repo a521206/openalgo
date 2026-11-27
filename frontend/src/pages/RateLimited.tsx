@@ -1,3 +1,4 @@
+import { deploymentPath } from '@/lib/deployment'
 import { Clock, Home, RefreshCw } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
@@ -23,7 +24,7 @@ export default function RateLimited() {
     if (referrer?.includes(window.location.origin)) {
       window.location.href = referrer
     } else {
-      window.location.href = '/dashboard'
+      window.location.href = deploymentPath('/dashboard')
     }
   }
 

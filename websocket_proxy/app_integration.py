@@ -618,7 +618,7 @@ def start_websocket_server(mode: str | None = None):
 
             from .server import WebSocketProxy
 
-            load_dotenv()
+            load_dotenv(os.getenv("OPENALGO_ENV_FILE") or None)
             ws_host = os.getenv("WEBSOCKET_HOST", "127.0.0.1")
             ws_port = int(os.getenv("WEBSOCKET_PORT", "8765"))
 

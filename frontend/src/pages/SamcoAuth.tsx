@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import {
   AlertTriangle,
   ArrowLeft,
@@ -50,7 +51,7 @@ export default function SamcoAuth() {
       const form = new FormData()
       form.append('csrf_token', csrfToken)
 
-      const response = await fetch('/samco/callback', {
+      const response = await appFetch('/samco/callback', {
         method: 'POST',
         body: form,
         credentials: 'include',
@@ -84,7 +85,7 @@ export default function SamcoAuth() {
     setError(null)
 
     try {
-      const response = await fetch('/samco/ip-status', { credentials: 'include' })
+      const response = await appFetch('/samco/ip-status', { credentials: 'include' })
       const data = await response.json()
 
       if (data.status === 'success') {

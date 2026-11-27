@@ -38,10 +38,11 @@
  * subscribes to it and draws the result.
  */
 
+import { appFetch, deploymentPrefix } from '@/lib/deployment'
 import { fetchCSRFToken } from '@/api/client'
 import { AGENT_API_BASE, type AgentFrame, streamAgentFrames } from './stream'
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || ''
+const API_BASE_URL = deploymentPrefix || import.meta.env.VITE_API_URL || ''
 
 /**
  * How long a transcript may go quiet before its bubble is closed.
@@ -713,7 +714,7 @@ export function createVoiceController(options: VoiceControllerOptions = {}): Voi
    */
   async function mint(offer: string): Promise<string> {
     const csrfToken = await fetchCSRFToken()
-    const response = await fetch(`${API_BASE_URL}${AGENT_API_BASE}/voice/session`, {
+    const response = await appFetch(`${API_BASE_URL}${AGENT_API_BASE}/voice/session`, {
       method: 'POST',
       credentials: 'include',
       headers: {
@@ -948,7 +949,7 @@ export function createVoiceController(options: VoiceControllerOptions = {}): Voi
     if (!waiting) return
     try {
       const csrfToken = await fetchCSRFToken()
-      const response = await fetch(`${API_BASE_URL}${AGENT_API_BASE}/voice/approve`, {
+      const response = await appFetch(`${API_BASE_URL}${AGENT_API_BASE}/voice/approve`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },

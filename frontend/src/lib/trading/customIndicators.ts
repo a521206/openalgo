@@ -1,3 +1,4 @@
+import { appFetch, deploymentPath } from '@/lib/deployment'
 /**
  * Loads the user's own indicator modules from `strategies/indicators` and lets
  * them register into the openalgo-charts catalogue.
@@ -295,7 +296,7 @@ function writeManifest(manifest: Manifest): void {
 
 const keyOf = (mod: CustomModule) => `${mod.file}@${mod.mtime}`
 const urlOf = (mod: CustomModule) =>
-  `/custom-indicators/${encodeURIComponent(mod.file)}?v=${mod.mtime}`
+  deploymentPath(`/custom-indicators/${encodeURIComponent(mod.file)}?v=${mod.mtime}`)
 
 /** Ids each module registered during this page's life, by `file@mtime`. */
 const learned: Manifest = {}
@@ -461,7 +462,7 @@ async function readIndex(): Promise<CustomModule[] | null> {
     // login page, which fetch follows to a 200 of HTML. Asking for JSON gets a
     // straight 401 instead, so a logged-out chart fails fast rather than trying
     // to parse a login page as a module index.
-    const res = await fetch(INDEX_URL, {
+    const res = await appFetch(INDEX_URL, {
       credentials: 'same-origin',
       headers: { Accept: 'application/json' },
     })

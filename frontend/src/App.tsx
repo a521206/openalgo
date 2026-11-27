@@ -1,3 +1,4 @@
+import { deploymentPrefix } from '@/lib/deployment'
 import { lazy, Suspense } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import { Providers } from '@/app/providers'
@@ -166,10 +167,14 @@ function PageTitleUpdater() {
   return null
 }
 
+// The /via deployment is mounted under a path prefix by Nginx. BrowserRouter
+// must strip that prefix before matching the app's root-relative routes.
+const routerBasename = deploymentPrefix || '/'
+
 function App() {
   return (
     <Providers>
-      <BrowserRouter>
+      <BrowserRouter basename={routerBasename}>
         <PageTitleUpdater />
         <AuthSync>
           <Suspense fallback={<PageLoader />}>

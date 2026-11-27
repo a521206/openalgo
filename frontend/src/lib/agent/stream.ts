@@ -31,10 +31,11 @@
  * therefore render from one set of types rather than two that drift.
  */
 
+import { appFetch, deploymentPrefix } from '@/lib/deployment'
 import type { ConfirmRequirement, DoneReason, ErrorKind, NoticeLevel, Usage } from '@/api/agent'
 import { fetchCSRFToken } from '@/api/client'
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || ''
+const API_BASE_URL = deploymentPrefix || import.meta.env.VITE_API_URL || ''
 
 /** Every route in `blueprints/agent.py` lives under this prefix. */
 export const AGENT_API_BASE = '/agent/api'
@@ -357,7 +358,7 @@ export async function streamAgentFrames({
 
   let response: Response
   try {
-    response = await fetch(`${API_BASE_URL}${AGENT_API_BASE}${path}`, {
+    response = await appFetch(`${API_BASE_URL}${AGENT_API_BASE}${path}`, {
       method: 'POST',
       credentials: 'include',
       headers: {

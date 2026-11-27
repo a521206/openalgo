@@ -92,7 +92,7 @@ def check_tmp_noexec() -> None:
         return
 
     try:
-        with open('/proc/mounts', 'r') as f:
+        with open('/proc/mounts') as f:
             for line in f:
                 parts = line.split()
                 if len(parts) >= 4 and parts[1] == '/tmp':
@@ -111,11 +111,11 @@ def check_tmp_noexec() -> None:
                         print("   2. Or set NUMBA_DISABLE_JIT=1 in your .env file")
                         print("=" * 70 + "\n")
                     return
-    except (OSError, IOError):
+    except OSError:
         pass  # Can't read /proc/mounts, skip the check
 
 
-def check_env_version_compatibility() -> bool:
+def check_env_version_compatibility(env_path: str | None = None) -> bool:
     """
     Check if the .env file version matches the .sample.env version.
 
@@ -123,7 +123,7 @@ def check_env_version_compatibility() -> bool:
         bool: True if compatible, False if an update is needed.
     """
     base_dir = os.path.dirname(__file__) + "/.."
-    env_path = os.path.join(base_dir, ".env")
+    env_path = env_path or os.path.join(base_dir, ".env")
     sample_env_path = os.path.join(base_dir, ".sample.env")
 
     # Check if both files exist
@@ -180,10 +180,10 @@ def check_env_version_compatibility() -> bool:
         def version_tuple(v: str) -> tuple:
             """
             Convert version string to tuple of integers for comparison.
-            
+
             Args:
                 v (str): Version string (e.g. '1.5.0').
-            
+
             Returns:
                 tuple: Tuple of integers (e.g. (1, 5, 0)).
             """
@@ -328,7 +328,7 @@ def _atomic_rewrite_dotenv(env_path: str, pairs: list) -> None:
             this with a manual-rotation instruction.
     """
     with ENV_WRITE_LOCK:
-        with open(env_path, "r", encoding="utf-8", newline="") as f:
+        with open(env_path, encoding="utf-8", newline="") as f:
             content = f.read()
         for old, new in pairs:
             content = content.replace(old, new)
@@ -686,7 +686,7 @@ def _ensure_fernet_salt(env_path: str) -> None:
 
     # Read the .env so we can decide based on placement, not just env value.
     try:
-        with open(env_path, "r", encoding="utf-8", newline="") as f:
+        with open(env_path, encoding="utf-8", newline="") as f:
             content = f.read()
     except OSError:
         return
@@ -769,6 +769,7 @@ def _ensure_fernet_salt(env_path: str) -> None:
     # confirming the DB doesn't look like a previous-rotation orphan.
     try:
         import base64
+
         from cryptography.fernet import Fernet, InvalidToken
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -944,6 +945,7 @@ def _migrate_fernet_db(env_path: str, pepper: str, new_salt: str) -> None:
     """
     try:
         import base64
+
         from cryptography.fernet import Fernet, InvalidToken
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -1360,18 +1362,17 @@ def load_and_check_env_variables() -> None:
     configure_llvmlite_paths()
 
     # A new install with no .env gets one, made from .sample.env with fresh
-    # security keys, before anything reads it.
+    # security keys, before anything reads it. OPENALGO_ENV_FILE allows a
+    # second service to share this code directory with isolated configuration.
     project_root = os.path.join(os.path.dirname(__file__), "..")
-    create_env_from_sample(
-        os.path.join(project_root, ".env"), os.path.join(project_root, ".sample.env")
-    )
+    env_path = os.environ.get("OPENALGO_ENV_FILE") or os.path.join(project_root, ".env")
+    if not os.environ.get("OPENALGO_ENV_FILE"):
+        create_env_from_sample(env_path, os.path.join(project_root, ".sample.env"))
 
     # Check version compatibility
-    if not check_env_version_compatibility():
+    env_path = os.path.abspath(env_path)
+    if not check_env_version_compatibility(env_path):
         sys.exit(1)
-
-    # Define the path to the .env file in the main application path
-    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
 
     # Check if the .env file exists
     if not os.path.exists(env_path):
@@ -1439,7 +1440,6 @@ def load_and_check_env_variables() -> None:
 
     # Special validation for broker-specific API key formats
     broker_api_key = os.getenv("BROKER_API_KEY", "")
-    broker_api_secret = os.getenv("BROKER_API_SECRET", "")
     redirect_url = os.getenv("REDIRECT_URL", "")
 
     # With no broker in .env, the trader adds broker keys in OpenAlgo after
@@ -1550,7 +1550,7 @@ def load_and_check_env_variables() -> None:
         print("The application cannot start without valid broker configuration.")
         sys.exit(1)
 
-    valid_brokers = set(broker.strip().lower() for broker in valid_brokers_str.split(","))
+    valid_brokers = {broker.strip().lower() for broker in valid_brokers_str.split(",")}
 
     try:
         import re

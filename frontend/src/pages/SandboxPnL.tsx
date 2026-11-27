@@ -1,3 +1,4 @@
+import { appFetch, deploymentPath } from '@/lib/deployment'
 import { Activity, Briefcase, Calendar, Download, Package, Settings } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router'
@@ -97,7 +98,7 @@ export default function SandboxPnL() {
 
   const fetchData = async () => {
     try {
-      const response = await fetch('/sandbox/mypnl/api/data', {
+      const response = await appFetch('/sandbox/mypnl/api/data', {
         credentials: 'include',
       })
       if (response.ok) {
@@ -114,7 +115,7 @@ export default function SandboxPnL() {
 
   const handleExport = (type: 'daily' | 'positions' | 'holdings' | 'trades') => {
     // Trigger download by navigating to the export endpoint
-    window.location.href = `/sandbox/mypnl/export/${type}`
+    window.location.href = deploymentPath(`/sandbox/mypnl/export/${type}`)
   }
 
   if (isLoading) {

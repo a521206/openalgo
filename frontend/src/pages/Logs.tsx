@@ -1,3 +1,4 @@
+import { deploymentPath } from '@/lib/deployment'
 import {
   ArrowDown,
   ArrowLeft,
@@ -106,7 +107,7 @@ export default function LogsPage() {
     if (endDate) params.append('end_date', endDate)
     if (searchQuery) params.append('search', searchQuery)
 
-    window.open(`/logs/export?${params.toString()}`, '_blank')
+    window.open(deploymentPath(`/logs/export?${params.toString()}`), '_blank')
   }
 
   const handleDateChange = () => {

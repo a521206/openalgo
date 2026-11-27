@@ -15,6 +15,7 @@
  * rail are off, as on the other read-only charts.
  */
 
+import { appFetch } from '@/lib/deployment'
 import { type Chart, createChart, type SeriesApi } from 'openalgo-charts'
 import { X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -100,7 +101,7 @@ export default function ChartTest() {
         setResults([])
         return
       }
-      fetch(
+      appFetch(
         `/search/api/search?q=${encodeURIComponent(q)}&exchange=${encodeURIComponent(exchange)}`,
         { credentials: 'include', headers: { Accept: 'application/json' } }
       )
@@ -365,7 +366,7 @@ function LiveChart({
           `/chart/test/api/history?symbol=${encodeURIComponent(symbol)}` +
           `&exchange=${encodeURIComponent(exchange)}&interval=${encodeURIComponent(interval)}` +
           `${date ? `&date=${encodeURIComponent(date)}` : ''}`
-        const res = await fetch(url, { credentials: 'include', headers: { Accept: 'application/json' } })
+        const res = await appFetch(url, { credentials: 'include', headers: { Accept: 'application/json' } })
         const d = await res.json()
         if (disposed || d.status !== 'success') return
         const fetched: Candle[] = d.candles || []
@@ -405,7 +406,7 @@ function LiveChart({
       }, delay)
     }
 
-    fetch(
+    appFetch(
       `/chart/test/api/history?symbol=${encodeURIComponent(symbol)}&exchange=${encodeURIComponent(exchange)}&interval=${encodeURIComponent(interval)}`,
       { credentials: 'include', headers: { Accept: 'application/json' } }
     )

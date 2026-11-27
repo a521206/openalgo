@@ -1,3 +1,4 @@
+import { appFetch, deploymentPath } from '@/lib/deployment'
 import { AlertTriangle, BookOpen, Download, HelpCircle, Home, LogOut } from 'lucide-react'
 import { useState } from 'react'
 import { Link } from 'react-router'
@@ -13,7 +14,7 @@ export default function ServerError() {
     setIsLoggingOut(true)
     try {
       const csrfToken = await fetchCSRFToken()
-      const response = await fetch('/auth/logout', {
+      const response = await appFetch('/auth/logout', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -23,13 +24,13 @@ export default function ServerError() {
       })
 
       if (response.ok) {
-        window.location.href = '/login'
+        window.location.href = deploymentPath('/login')
       } else {
         showToast.error('Failed to logout. Please try again.')
       }
     } catch {
       // If logout fails, redirect to login anyway
-      window.location.href = '/login'
+      window.location.href = deploymentPath('/login')
     } finally {
       setIsLoggingOut(false)
     }

@@ -1,3 +1,4 @@
+import { appFetch, deploymentPath } from '@/lib/deployment'
 import {
   ArrowLeft,
   Eye,
@@ -34,13 +35,13 @@ async function openConfiguredBroker(): Promise<boolean> {
     const broker = configured[0]
     if (list.logged_in === broker.id) {
       if (await resumeBrokerSession()) return false
-      window.location.href = '/dashboard'
+      window.location.href = deploymentPath('/dashboard')
       return true
     }
     if (list.logged_in) return false
     const started = await startBrokerLogin(broker.id)
     if (started.error !== undefined) return false
-    window.location.href = started.url
+    window.location.href = deploymentPath(started.url)
     return true
   } catch {
     return false
@@ -67,7 +68,7 @@ export default function Login() {
     const checkSetup = async () => {
       try {
         // First check if setup is needed
-        const setupResponse = await fetch('/auth/check-setup', {
+        const setupResponse = await appFetch('/auth/check-setup', {
           credentials: 'include',
         })
         const setupData = await setupResponse.json()
@@ -77,7 +78,7 @@ export default function Login() {
         }
 
         // Check if already logged in
-        const sessionResponse = await fetch('/auth/session-status', {
+        const sessionResponse = await appFetch('/auth/session-status', {
           credentials: 'include',
         })
 
@@ -120,7 +121,7 @@ export default function Login() {
 
     try {
       // First, fetch CSRF token
-      const csrfResponse = await fetch('/auth/csrf-token', {
+      const csrfResponse = await appFetch('/auth/csrf-token', {
         credentials: 'include',
       })
 
@@ -139,7 +140,7 @@ export default function Login() {
       formData.append('csrf_token', csrfData.csrf_token)
 
       // Use native fetch like the original template
-      const response = await fetch('/auth/login', {
+      const response = await appFetch('/auth/login', {
         method: 'POST',
         body: formData,
         credentials: 'include',
@@ -195,7 +196,7 @@ export default function Login() {
     setError(null)
 
     try {
-      const csrfResponse = await fetch('/auth/csrf-token', { credentials: 'include' })
+      const csrfResponse = await appFetch('/auth/csrf-token', { credentials: 'include' })
       if (!csrfResponse.ok) {
         setError('Failed to verify TOTP. Please refresh the page.')
         setIsLoading(false)
@@ -203,7 +204,7 @@ export default function Login() {
       }
       const { csrf_token } = await csrfResponse.json()
 
-      const response = await fetch('/auth/login/totp', {
+      const response = await appFetch('/auth/login/totp', {
         method: 'POST',
         credentials: 'include',
         headers: {

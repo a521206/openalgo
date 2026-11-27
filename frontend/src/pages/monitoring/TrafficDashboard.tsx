@@ -1,3 +1,4 @@
+import { deploymentPath } from '@/lib/deployment'
 import { Activity, ArrowLeft, Download, Filter, RefreshCw } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
@@ -97,7 +98,7 @@ export default function TrafficDashboard() {
 
   const handleExport = () => {
     // Open export URL in new tab
-    window.open('/traffic/export', '_blank')
+    window.open(deploymentPath('/traffic/export'), '_blank')
   }
 
   const filteredLogs = logs.filter((log) => {

@@ -5,6 +5,7 @@
  * narrowed to the exchanges the map can place: cash equity and indices.
  */
 
+import { appFetch } from '@/lib/deployment'
 import { Plus } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Input } from '@/components/ui/input'
@@ -58,7 +59,7 @@ export function InstrumentSearch({
       setLoading(true)
       try {
         const params = new URLSearchParams({ q, exchange })
-        const response = await fetch(`/search/api/search?${params}`, {
+        const response = await appFetch(`/search/api/search?${params}`, {
           credentials: 'include',
         })
         const data = await response.json()

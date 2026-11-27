@@ -4,7 +4,6 @@ import os
 from datetime import datetime
 
 import pytz
-
 from dotenv import load_dotenv
 from sqlalchemy import (
     DECIMAL,
@@ -43,7 +42,7 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 # Load environment variables
-load_dotenv()
+load_dotenv(os.getenv("OPENALGO_ENV_FILE") or None)
 
 # Sandbox database URL - separate database for isolation
 # Get from environment variable or use default path in /db directory

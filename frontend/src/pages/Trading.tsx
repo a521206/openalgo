@@ -1,3 +1,4 @@
+import { appFetch, deploymentPath } from '@/lib/deployment'
 import { LayoutGrid, Link2 as LinkIcon } from 'lucide-react'
 import { type ChartObjects, createLinkGroup, type LinkGroup } from 'openalgo-charts'
 import type { WorkspaceDocument, WorkspacePayload } from 'openalgo-charts/workspace'
@@ -904,8 +905,8 @@ function TradingWorkspace({ account }: { account: string | null }) {
     ;(async () => {
       try {
         const [keyRes, cfgRes] = await Promise.all([
-          fetch('/api/websocket/apikey').then((r) => r.json()),
-          fetch('/api/websocket/config').then((r) => r.json()),
+          appFetch('/api/websocket/apikey').then((r) => r.json()),
+          appFetch('/api/websocket/config').then((r) => r.json()),
         ])
         if (!alive) return
         if (keyRes.status !== 'success') {
@@ -1556,7 +1557,7 @@ function TradingWorkspace({ account }: { account: string | null }) {
             {noApiKey ? (
               <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
                 <p className="text-sm text-muted-foreground">No API key found for charting.</p>
-                <a href="/apikey" className="text-sm font-medium text-primary underline">
+                <a href={deploymentPath('/apikey')} className="text-sm font-medium text-primary underline">
                   Generate an API key
                 </a>
               </div>

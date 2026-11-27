@@ -1,3 +1,4 @@
+import { deploymentPath } from '@/lib/deployment'
 // The latency monitor at /logs/latency.
 //
 // Every /api/v1 call is timed. The monitor reports them one group of endpoints
@@ -162,5 +163,5 @@ export const latencyApi = {
   },
 
   /** Where the CSV of one group is downloaded from. */
-  exportUrl: (group: string): string => `/latency/export?group=${encodeURIComponent(group)}`,
+  exportUrl: (group: string): string => deploymentPath(`/latency/export?group=${encodeURIComponent(group)}`),
 }

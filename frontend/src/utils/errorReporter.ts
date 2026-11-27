@@ -16,6 +16,7 @@
  * the rest of this page lifetime to avoid noise.
  */
 
+import { appFetch } from '@/lib/deployment'
 import { tryAutoReloadOnChunkError } from '@/utils/chunkReload'
 
 interface ClientErrorPayload {
@@ -97,7 +98,7 @@ function isSensitiveQueryParameter(name: string): boolean {
 
 async function fetchCSRFTokenSafe(): Promise<string | null> {
   try {
-    const resp = await fetch('/auth/csrf-token', {
+    const resp = await appFetch('/auth/csrf-token', {
       credentials: 'include',
       keepalive: true,
     })
@@ -124,7 +125,7 @@ async function send(payload: ClientErrorPayload): Promise<void> {
   isReporting = true
   try {
     const csrf = await fetchCSRFTokenSafe()
-    const resp = await fetch(ENDPOINT, {
+    const resp = await appFetch(ENDPOINT, {
       method: 'POST',
       credentials: 'include',
       headers: {

@@ -12,6 +12,7 @@
  * is its default zone.
  */
 
+import { appFetch } from '@/lib/deployment'
 import { AlertTriangle, Camera, RefreshCw, TrendingDown, TrendingUp } from 'lucide-react'
 import {
   type Chart,
@@ -31,7 +32,7 @@ import { type AppMode, type ThemeMode, useThemeStore } from '@/stores/themeStore
 import { showToast } from '@/utils/toast'
 
 async function fetchCSRFToken(): Promise<string> {
-  const response = await fetch('/auth/csrf-token', {
+  const response = await appFetch('/auth/csrf-token', {
     credentials: 'include',
   })
   const data = await response.json()
@@ -237,7 +238,7 @@ export default function PnLTracker() {
     try {
       const csrfToken = await fetchCSRFToken()
 
-      const response = await fetch('/pnltracker/api/pnl', {
+      const response = await appFetch('/pnltracker/api/pnl', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

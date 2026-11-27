@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import { Check, ChevronDown, History, Info, Search, Trash2, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
@@ -153,10 +154,10 @@ export default function Token() {
           // include_futures=true so MCX commodities with only live FUT contracts
           // (NATURALGASMINI, COPPER, LEADMINI, ...) appear in the dropdown.
           // Option-chain pages keep the default (options-only) behaviour.
-          fetch(`/search/api/underlyings?exchange=${exchange}&include_futures=true`, {
+          appFetch(`/search/api/underlyings?exchange=${exchange}&include_futures=true`, {
             credentials: 'include',
           }),
-          fetch(`/search/api/expiries?exchange=${exchange}`, { credentials: 'include' }),
+          appFetch(`/search/api/expiries?exchange=${exchange}`, { credentials: 'include' }),
         ])
 
         // Ignore if this is a stale request
@@ -192,7 +193,7 @@ export default function Token() {
 
     const fetchExpiriesForUnderlying = async () => {
       try {
-        const response = await fetch(
+        const response = await appFetch(
           `/search/api/expiries?exchange=${exchange}&underlying=${underlying}`,
           { credentials: 'include' }
         )
@@ -233,7 +234,7 @@ export default function Token() {
         if (strikeMin) params.append('strike_min', strikeMin)
         if (strikeMax) params.append('strike_max', strikeMax)
 
-        const response = await fetch(`/search/api/search?${params}`, {
+        const response = await appFetch(`/search/api/search?${params}`, {
           credentials: 'include',
         })
         const data = await response.json()

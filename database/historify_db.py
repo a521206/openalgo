@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -24,7 +24,8 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 # Load environment variables
-load_dotenv()
+env_file = os.getenv("OPENALGO_ENV_FILE")
+load_dotenv(env_file or None)
 
 # Database path - in /db folder like other OpenAlgo databases
 HISTORIFY_DB_PATH = os.getenv("HISTORIFY_DATABASE_PATH", "db/historify.duckdb")
@@ -81,7 +82,9 @@ def get_db_path() -> str:
     """Get absolute path to the DuckDB database file."""
     if os.path.isabs(HISTORIFY_DB_PATH):
         return HISTORIFY_DB_PATH
-    # Relative to the openalgo directory
+    if env_file:
+        return os.path.join(os.path.dirname(os.path.abspath(env_file)), HISTORIFY_DB_PATH)
+
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_dir, HISTORIFY_DB_PATH)
 
@@ -1926,7 +1929,8 @@ def create_download_job(
                 # Prepare symbols DataFrame for batch insert
                 # Use atomic ID generation within the same transaction
                 if symbols:
-                    symbols_df = pd.DataFrame(
+                    # DuckDB resolves symbols_df from this scope for the SQL below.
+                    symbols_df = pd.DataFrame(  # noqa: F841
                         [
                             {
                                 "job_id": job_id,

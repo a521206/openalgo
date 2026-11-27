@@ -1,10 +1,11 @@
+import { appFetch, deploymentPath, deploymentPrefix } from '@/lib/deployment'
 import axios from 'axios'
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || ''
+const API_BASE_URL = deploymentPrefix || import.meta.env.VITE_API_URL || ''
 
 // Helper to fetch CSRF token
 export async function fetchCSRFToken(): Promise<string> {
-  const response = await fetch('/auth/csrf-token', {
+  const response = await appFetch('/auth/csrf-token', {
     credentials: 'include',
   })
   const data = await response.json()
@@ -45,7 +46,7 @@ apiClient.interceptors.response.use(
   (error) => {
     if (error.response?.status === 401) {
       // Handle unauthorized - redirect to login
-      window.location.href = '/login'
+      window.location.href = deploymentPath('/login')
     }
     return Promise.reject(error)
   }
@@ -142,7 +143,7 @@ webClient.interceptors.response.use(
     const status = error.response?.status
     if (status === 401) {
       // Unauthorized - redirect to login
-      window.location.href = '/login'
+      window.location.href = deploymentPath('/login')
     } else if (status === 403) {
       // Forbidden - user doesn't have permission for this resource
       // Create a more descriptive error for the caller to handle

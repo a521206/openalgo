@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import { Check, Info, Loader2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
@@ -94,7 +95,7 @@ export default function Setup() {
 
     try {
       // First, fetch CSRF token
-      const csrfResponse = await fetch('/auth/csrf-token', {
+      const csrfResponse = await appFetch('/auth/csrf-token', {
         credentials: 'include',
       })
       const csrfData = await csrfResponse.json()
@@ -106,7 +107,7 @@ export default function Setup() {
       form.append('confirm_password', formData.confirmPassword)
       form.append('csrf_token', csrfData.csrf_token)
 
-      const response = await fetch('/setup', {
+      const response = await appFetch('/setup', {
         method: 'POST',
         body: form,
         credentials: 'include',
@@ -123,7 +124,7 @@ export default function Setup() {
         // a raw fetch, not the axios client that adds it via an interceptor.
         try {
           const csrfToken = await fetchCSRFToken()
-          await fetch('/auth/logout', {
+          await appFetch('/auth/logout', {
             method: 'POST',
             headers: { 'X-CSRFToken': csrfToken },
             credentials: 'include',

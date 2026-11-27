@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchRefusalSentence } from '@/lib/serverSentence'
 import type { OptionChainDataIdentity, OptionChainResponse } from '@/types/option-chain'
@@ -107,7 +108,7 @@ export function useOptionChainPolling(
     try {
       abortControllerRef.current = controller
 
-      const response = await fetch('/api/v1/optionchain', {
+      const response = await appFetch('/api/v1/optionchain', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

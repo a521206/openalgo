@@ -1,3 +1,4 @@
+import { appFetch } from '@/lib/deployment'
 import { AlertTriangle, BookOpen, Copy, ExternalLink, RefreshCw } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -74,7 +75,7 @@ export default function TradingView() {
   useEffect(() => {
     const fetchHostConfig = async () => {
       try {
-        const response = await fetch('/api/config/host', { credentials: 'include' })
+        const response = await appFetch('/api/config/host', { credentials: 'include' })
         const data = await response.json()
         setHostConfig(data)
       } catch (_error) {
@@ -88,7 +89,7 @@ export default function TradingView() {
     }
     const fetchApiKey = async () => {
       try {
-        const response = await fetch('/playground/api-key', { credentials: 'include' })
+        const response = await appFetch('/playground/api-key', { credentials: 'include' })
         if (response.ok) {
           const data = await response.json()
           setApiKey(data.api_key || '')
@@ -121,7 +122,7 @@ export default function TradingView() {
         const params = new URLSearchParams({ q: query })
         if (exchange) params.append('exchange', exchange)
 
-        const response = await fetch(`/search/api/search?${params}`, {
+        const response = await appFetch(`/search/api/search?${params}`, {
           credentials: 'include',
         })
         const data = await response.json()

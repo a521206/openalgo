@@ -1,3 +1,4 @@
+import { appFetch, deploymentPath } from '@/lib/deployment'
 import { AlertTriangle, BookOpen, Copy, ExternalLink, Info, RefreshCw } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -72,7 +73,7 @@ export default function GoCharting() {
   useEffect(() => {
     const fetchHostConfig = async () => {
       try {
-        const response = await fetch('/api/config/host', { credentials: 'include' })
+        const response = await appFetch('/api/config/host', { credentials: 'include' })
         const data = await response.json()
         setHostConfig(data)
       } catch (_error) {
@@ -86,7 +87,7 @@ export default function GoCharting() {
     }
     const fetchApiKey = async () => {
       try {
-        const response = await fetch('/playground/api-key', { credentials: 'include' })
+        const response = await appFetch('/playground/api-key', { credentials: 'include' })
         if (response.ok) {
           const data = await response.json()
           setApiKey(data.api_key || '')
@@ -118,7 +119,7 @@ export default function GoCharting() {
         const params = new URLSearchParams({ q: query })
         if (exchange) params.append('exchange', exchange)
 
-        const response = await fetch(`/search/api/search?${params}`, {
+        const response = await appFetch(`/search/api/search?${params}`, {
           credentials: 'include',
         })
         const data = await response.json()
@@ -425,7 +426,7 @@ export default function GoCharting() {
 
               <div className="flex gap-3">
                 <Button asChild variant="outline" size="sm">
-                  <a href="/docs/gocharting_webhook_setup.md" download>
+                  <a href={deploymentPath('/docs/gocharting_webhook_setup.md')} download>
                     Download Guide
                   </a>
                 </Button>
