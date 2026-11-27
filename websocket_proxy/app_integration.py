@@ -295,14 +295,20 @@ def _supervised() -> bool:
 
 def _launch_child():
     """Start the proxy child process and return it, or None if it could not start."""
-    # Find the openalgo project root (parent of websocket_proxy/)
+    # Keep the service's working directory so relative database and temp paths
+    # resolve to this instance. The child still needs the shared code root on
+    # its import path because a subpath instance runs from its own directory.
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    service_root = os.getcwd()
     cmd = list(SPAWN_COMMAND)
-    logger.debug(f"Spawning WebSocket subprocess: {' '.join(cmd)} (cwd={project_root})")
+    logger.debug(f"Spawning WebSocket subprocess: {' '.join(cmd)} (cwd={service_root})")
 
-    env = None
+    env = dict(os.environ)
+    pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        path for path in (project_root, pythonpath) if path
+    )
     if _supervised():
-        env = dict(os.environ)
         env[PARENT_PID_ENV] = str(os.getpid())
 
     try:
@@ -311,7 +317,7 @@ def _launch_child():
         # logging via utils.logging, so file/json log handlers fire too.
         proc = subprocess.Popen(
             cmd,
-            cwd=project_root,
+            cwd=service_root,
             stdout=None,
             stderr=None,
             env=env,

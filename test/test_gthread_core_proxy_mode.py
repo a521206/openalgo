@@ -332,7 +332,7 @@ def test_the_child_is_told_its_parent_only_under_gthread(monkeypatch, proxy_stat
     seen = []
 
     def fake_popen(cmd, **kwargs):
-        seen.append(kwargs.get("env"))
+        seen.append(kwargs)
         return FakeProc()
 
     monkeypatch.setattr(ai.subprocess, "Popen", fake_popen)
@@ -341,8 +341,10 @@ def test_the_child_is_told_its_parent_only_under_gthread(monkeypatch, proxy_stat
     monkeypatch.setattr(runtime, "gthread_active", lambda: True)
     ai._launch_child()
 
-    assert seen[0] is None  # inherits the environment, exactly as before
-    assert seen[1][ai.PARENT_PID_ENV] == str(os.getpid())
+    assert seen[0]["cwd"] == os.getcwd()
+    assert ai.PARENT_PID_ENV not in seen[0]["env"]
+    assert seen[0]["env"]["PYTHONPATH"].split(os.pathsep)[0] == str(REPO)
+    assert seen[1]["env"][ai.PARENT_PID_ENV] == str(os.getpid())
 
 
 def test_terminate_stops_a_child_without_a_green_wait(monkeypatch, proxy_state):
